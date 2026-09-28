@@ -20,6 +20,8 @@ hkdf = "0.12"
 sha2 = "0.10"
 realfft = "3"
 opus = "0.4"
+webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
+webrtc-audio-processing-config = "~2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.4"

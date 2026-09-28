@@ -4,3 +4,4 @@ pub mod vad;
 pub mod scoring;
 pub mod arbitration;
 pub mod crossfade;
+pub mod aec;
