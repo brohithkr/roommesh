@@ -1,10 +1,18 @@
 //! Receiving side of one network audio stream: jitter buffer → Opus (FEC/PLC) → timeline.
 
 use crate::audio::codec::{CodecError, VoiceDecoder};
-use crate::audio::frames::{FRAME_NS, FRAME_SAMPLES, SAMPLE_RATE};
+use crate::audio::frames::{self, FRAME_NS, FRAME_SAMPLES, SAMPLE_RATE};
 use crate::audio::jitter_buffer::{JitterBuffer, JitterStats, Pop, PushResult};
 use crate::audio::timeline::TimelineReader;
 use crate::network::realtime::RtHeader;
+
+/// Opus (VoIP, 48 kHz) encoder lookahead in samples: decoded sample `k` of a packet is the
+/// original sample `k - 312`, i.e. decoded audio lags the packet timestamp by 6.5 ms.
+pub const CODEC_DELAY_SAMPLES: u64 = 312;
+/// [`CODEC_DELAY_SAMPLES`] in ns. Compensated on push so the timeline holds audio at its true
+/// capture/play time (keeps remote mics aligned with the local mic, and the room speaker aligned
+/// with the coordinator's AEC reference).
+pub const CODEC_DELAY_NS: u64 = CODEC_DELAY_SAMPLES * 1_000_000_000 / SAMPLE_RATE as u64;
 
 pub struct StreamReceiver {
     jb: JitterBuffer,
@@ -12,6 +20,9 @@ pub struct StreamReceiver {
     pub timeline: TimelineReader,
     scratch: Vec<f32>,
     last_arrival_ns: u64,
+    /// Decoder priming output still to discard (RFC 7845 pre-skip): the first
+    /// `CODEC_DELAY_SAMPLES` decoded samples of a stream precede its first real sample.
+    pre_skip: usize,
 }
 
 impl StreamReceiver {
@@ -22,6 +33,7 @@ impl StreamReceiver {
             timeline: TimelineReader::new(SAMPLE_RATE, 3.0),
             scratch: vec![0.0; 5760],
             last_arrival_ns: 0,
+            pre_skip: CODEC_DELAY_SAMPLES as usize,
         })
     }
     pub fn push(&mut self, h: RtHeader, payload: Vec<u8>, arrival_ns: u64) -> PushResult {
@@ -43,10 +55,7 @@ impl StreamReceiver {
                 Pop::NotReady => break,
                 Pop::Packet(p) => {
                     let n = self.dec.decode(&p.payload, &mut self.scratch).unwrap_or(0);
-                    if let Some(ts) = map_ts(p.header.timestamp_ns) {
-                        self.timeline
-                            .push(p.header.sample_index, ts, &self.scratch[..n]);
-                    }
+                    self.emit(p.header.sample_index, map_ts(p.header.timestamp_ns), n);
                 }
                 Pop::Missing {
                     seq,
@@ -58,12 +67,24 @@ impl StreamReceiver {
                         .dec
                         .conceal(next.as_deref(), &mut self.scratch[..FRAME_SAMPLES])
                         .unwrap_or(0);
-                    if let Some(ts) = map_ts(timestamp_ns) {
-                        self.timeline.push(sample_index, ts, &self.scratch[..n]);
-                    }
+                    self.emit(sample_index, map_ts(timestamp_ns), n);
                 }
             }
         }
+    }
+
+    /// Pushes `scratch[..n]` (decoded from the packet at `index`, stamped `ts`) to the timeline,
+    /// shifted back by the codec delay and without the stream's priming samples.
+    fn emit(&mut self, index: u64, ts: Option<u64>, n: usize) {
+        let skip = self.pre_skip.min(n);
+        self.pre_skip -= skip;
+        let Some(ts) = ts else { return };
+        if skip == n {
+            return;
+        }
+        let ts = (ts + (skip as f64 * frames::NS_PER_SAMPLE) as u64).saturating_sub(CODEC_DELAY_NS);
+        self.timeline
+            .push(index + skip as u64, ts, &self.scratch[skip..n]);
     }
 }
 
