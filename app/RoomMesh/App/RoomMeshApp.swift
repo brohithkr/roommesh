@@ -4,11 +4,14 @@ import SwiftUI
 struct RoomMeshApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     var body: some Scene {
-        MenuBarExtra("RoomMesh", systemImage: "mic.circle") {
-            Text("RoomMesh core \(coreVersion())")
-            Divider()
-            Button("Quit RoomMesh") { NSApp.terminate(nil) }.keyboardShortcut("q")
+        MenuBarExtra {
+            MenuBarContent().environment(AppModel.shared)
+        } label: {
+            MenuBarIcon().environment(AppModel.shared)
         }
         .menuBarExtraStyle(.menu)
+        Settings {
+            SettingsView().environment(AppModel.shared)
+        }
     }
 }

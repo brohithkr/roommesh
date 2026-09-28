@@ -90,4 +90,10 @@ final class AppModelTests: XCTestCase {
         wait(for: [cleared], timeout: 2)
         XCTAssertNil(model.notice)
     }
+    func testIconSymbols() {
+        XCTAssertEqual(MenuBarIcon.symbol(for: .notConnected), "mic.circle")
+        XCTAssertEqual(MenuBarIcon.symbol(for: .connected), "mic.circle.fill")
+        XCTAssertEqual(MenuBarIcon.symbol(for: .muted), "mic.slash.circle.fill")
+        XCTAssertEqual(MenuBarIcon.symbol(for: .warning), "exclamationmark.circle.fill")
+    }
 }
