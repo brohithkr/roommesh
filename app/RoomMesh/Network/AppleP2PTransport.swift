@@ -56,6 +56,10 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
 
     /// Unidentified inbound connections that may wait for a preamble at once; more are refused.
     static let maxPending = 32
+    /// Inbound realtime connections kept at once; more are refused.
+    static let maxInboundRealtime = 64
+    /// Minimum spacing between same-dialer control-link replacements for one peer.
+    static let minReplacementInterval: UInt64 = NSEC_PER_SEC
     /// An inbound control connection must send its preamble within this many seconds.
     static let preambleTimeout: TimeInterval = 5
     /// An outbound dial that has not reached `.ready` by then is abandoned (the core re-requests).
@@ -89,6 +93,8 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     private var udp: [String: NWConnection] = [:]
     private var inboundUDP: [ObjectIdentifier: NWConnection] = [:]
     private var inboundLastRx: [ObjectIdentifier: UInt64] = [:]
+    /// Time of the last same-dialer replacement per peer (rate limit).
+    private var lastReplacement: [String: UInt64] = [:]
     private var sweepTimer: DispatchSourceTimer?
     private let descLock = NSLock()
     private var interfaceDescription = "Apple peer-to-peer"
@@ -135,6 +141,19 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     }
 
     static func admitsInbound(pendingCount: Int) -> Bool { pendingCount < maxPending }
+    static func admitsInboundRealtime(count: Int) -> Bool { count < maxInboundRealtime }
+
+    /// After a peer's announced link goes away: true if the sink must also get `peerLost`, because
+    /// Bonjour already dropped the peer while the link was up (the core keeps connected peers).
+    static func lostAfterLinkDrop(_ id: String, reportedPeers: Set<String>) -> Bool { !reportedPeers.contains(id) }
+
+    /// Same-dialer replacements (a peer re-dialing) are limited to one per `minInterval` per peer;
+    /// cross-dialer replacements are the deterministic tie-break and always allowed.
+    static func allowsReplacement(sameDialer: Bool, lastReplacement: UInt64?, now: UInt64,
+                                  minInterval: UInt64 = minReplacementInterval) -> Bool {
+        guard sameDialer, let last = lastReplacement, now > last else { return true }
+        return now - last >= minInterval
+    }
 
     /// Peers previously reported present that a restarted browser no longer sees.
     static func vanishedPeers(previous: Set<String>, current: Set<String>) -> Set<String> {
@@ -143,7 +162,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
 
     /// The peer id advertised by a browse result, or nil for ourselves and non-peer services.
     static func peerName(_ endpoint: NWEndpoint, localId: String) -> String? {
-        guard case let .service(name, _, _, _) = endpoint, name != localId, name.count == 16 else { return nil }
+        guard case let .service(name, _, _, _) = endpoint, name != localId, PeerId.isValid(name) else { return nil }
         return name
     }
 
@@ -171,7 +190,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
             udp.values.forEach { $0.cancel() }
             inboundUDP.values.forEach { $0.cancel() }
             links = [:]; pending = [:]; udp = [:]; inboundUDP = [:]; inboundLastRx = [:]
-            backoff = [:]; reportedPeers = []; reconcileAfterRestart = false
+            backoff = [:]; reportedPeers = []; reconcileAfterRestart = false; lastReplacement = [:]
         }
     }
 
@@ -330,7 +349,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     }
 
     /// Runs `body` after `which`'s next backoff delay unless the transport has been stopped meanwhile.
-    private func restartLater(_ which: Recoverable, _ body: @escaping (AppleP2PTransport) -> Void) {
+    private func restartLater(_ which: Recoverable, _ body: @escaping @Sendable (AppleP2PTransport) -> Void) {
         let delay = backoff[which, default: RecoveryBackoff()].nextDelay()
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.running else { return }
@@ -362,7 +381,9 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     }
     private func reportLost(_ name: String) {
         reportedPeers.remove(name)
-        evictRealtime(name) // a restarted peer gets a fresh realtime connection
+        // A restarted peer gets a fresh realtime connection. While a control link is up it keeps the
+        // cache (a Bonjour goodbye often precedes the TCP close); dropping that link evicts it.
+        if links[name] == nil { evictRealtime(name) }
         sink?.peerLost(name)
     }
     /// Fires `onLocalNetworkDenied` only when entering the denied state, not on every retry.
@@ -446,14 +467,21 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
         guard let id = link.peerId else { return false }
         pending[ObjectIdentifier(link)] = nil
         if let existing = links[id], existing !== link {
-            guard Self.preferNew(localId: localId, peerId: id, newOutbound: link.outbound, existingOutbound: existing.outbound) else {
+            let now = DispatchTime.now().uptimeNanoseconds
+            let sameDialer = link.outbound == existing.outbound
+            guard Self.preferNew(localId: localId, peerId: id, newOutbound: link.outbound, existingOutbound: existing.outbound),
+                  Self.allowsReplacement(sameDialer: sameDialer, lastReplacement: lastReplacement[id], now: now) else {
                 link.conn.cancel()
                 return false
             }
+            if sameDialer { lastReplacement[id] = now }
             links[id] = nil
             existing.conn.cancel()
             evictRealtime(id)
-            if existing.announced { sink?.disconnected(id) }
+            if existing.announced {
+                sink?.disconnected(id)
+                if Self.lostAfterLinkDrop(id, reportedPeers: reportedPeers) { sink?.peerLost(id) }
+            }
         }
         links[id] = link
         link.announced = true
@@ -466,9 +494,11 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
         pending[ObjectIdentifier(link)] = nil
         guard let id = link.peerId, links[id] === link else { return }
         links[id] = nil
+        lastReplacement[id] = nil
         if link.announced {
             evictRealtime(id)
             sink?.disconnected(id)
+            if Self.lostAfterLinkDrop(id, reportedPeers: reportedPeers) { sink?.peerLost(id) }
         }
     }
 
@@ -486,7 +516,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     }
 
     private func acceptRealtime(_ conn: NWConnection) {
-        guard running else { conn.cancel(); return }
+        guard running, Self.admitsInboundRealtime(count: inboundUDP.count) else { conn.cancel(); return }
         let key = ObjectIdentifier(conn)
         inboundUDP[key] = conn
         inboundLastRx[key] = DispatchTime.now().uptimeNanoseconds

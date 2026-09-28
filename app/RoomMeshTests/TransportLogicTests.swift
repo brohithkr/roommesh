@@ -87,6 +87,41 @@ final class TransportLogicTests: XCTestCase {
         XCTAssertEqual(AppleP2PTransport.peerName(svc(high), localId: low), high)
         XCTAssertNil(AppleP2PTransport.peerName(svc(low), localId: low), "self")
         XCTAssertNil(AppleP2PTransport.peerName(svc("short"), localId: low), "not a peer id")
+        XCTAssertNil(AppleP2PTransport.peerName(svc("00ABCDEF01234567"), localId: low), "uppercase")
+        XCTAssertNil(AppleP2PTransport.peerName(svc("my macbook pro 1"), localId: low), "16 chars, not hex")
         XCTAssertNil(AppleP2PTransport.peerName(.hostPort(host: "127.0.0.1", port: 1), localId: low))
+    }
+
+    func testPeerIdValidation() {
+        XCTAssertTrue(PeerId.isValid("00abcdef01234567"))
+        XCTAssertFalse(PeerId.isValid("00ABCDEF01234567"))
+        XCTAssertFalse(PeerId.isValid("00abcdef0123456"))
+        XCTAssertFalse(PeerId.isValid("00abcdef012345678"))
+        XCTAssertFalse(PeerId.isValid("０１２３４５６７８９ａｂｃｄｅｆ"))
+        XCTAssertFalse(PeerId.isValid(""))
+    }
+
+    /// A peer whose Bonjour goodbye arrived while its link was up must get peerLost when the link drops.
+    func testLostAfterLinkDrop() {
+        XCTAssertTrue(AppleP2PTransport.lostAfterLinkDrop(high, reportedPeers: []))
+        XCTAssertTrue(AppleP2PTransport.lostAfterLinkDrop(high, reportedPeers: [low]))
+        XCTAssertFalse(AppleP2PTransport.lostAfterLinkDrop(high, reportedPeers: [high]))
+    }
+
+    func testInboundRealtimeCap() {
+        XCTAssertTrue(AppleP2PTransport.admitsInboundRealtime(count: 0))
+        XCTAssertTrue(AppleP2PTransport.admitsInboundRealtime(count: 63))
+        XCTAssertFalse(AppleP2PTransport.admitsInboundRealtime(count: 64))
+    }
+
+    func testReplacementRateLimit() {
+        let s = NSEC_PER_SEC
+        // Cross-dialer replacements (the tie-break) are never rate limited.
+        XCTAssertTrue(AppleP2PTransport.allowsReplacement(sameDialer: false, lastReplacement: 10 * s, now: 10 * s))
+        // Same-dialer replacements: at most one per second per peer.
+        XCTAssertTrue(AppleP2PTransport.allowsReplacement(sameDialer: true, lastReplacement: nil, now: 10 * s))
+        XCTAssertFalse(AppleP2PTransport.allowsReplacement(sameDialer: true, lastReplacement: 10 * s, now: 10 * s + s / 2))
+        XCTAssertTrue(AppleP2PTransport.allowsReplacement(sameDialer: true, lastReplacement: 10 * s, now: 11 * s))
+        XCTAssertTrue(AppleP2PTransport.allowsReplacement(sameDialer: true, lastReplacement: 20 * s, now: 10 * s), "clock older than record")
     }
 }

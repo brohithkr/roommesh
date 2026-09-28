@@ -56,6 +56,14 @@ struct FrameDecoder {
     }
 }
 
+/// Peer ids are exactly 16 lowercase ASCII hex digits (`0-9a-f`).
+enum PeerId {
+    static func isValid(_ id: String) -> Bool { isValid(bytes: id.utf8) }
+    static func isValid<C: Collection>(bytes: C) -> Bool where C.Element == UInt8 {
+        bytes.count == 16 && bytes.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+    }
+}
+
 /// First frame on every dialed control connection: identifies the dialer to the acceptor.
 enum Preamble {
     static let prefix = "RMHELLO1:"
@@ -67,7 +75,7 @@ enum Preamble {
         let head = Data(prefix.utf8)
         guard frame.count == head.count + 16, frame.starts(with: head) else { return nil }
         let id = frame.dropFirst(head.count)
-        guard id.allSatisfy({ (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }) else { return nil }
+        guard PeerId.isValid(bytes: id) else { return nil }
         return String(decoding: id, as: UTF8.self)
     }
 }
