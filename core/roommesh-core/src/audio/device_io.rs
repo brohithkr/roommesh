@@ -3,6 +3,7 @@ use crate::audio::device_clock::DeviceClock;
 use crate::time::now_ns;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 pub const BLOCK_FRAMES: usize = 512;
@@ -310,6 +311,33 @@ enum Cmd {
     StopPlayback,
 }
 
+impl Cmd {
+    /// Which device the command is for (`true`: capture).
+    fn is_capture(&self) -> bool {
+        matches!(self, Cmd::StartCapture(..) | Cmd::StopCapture)
+    }
+    fn is_start(&self) -> bool {
+        matches!(self, Cmd::StartCapture(..) | Cmd::StartPlayback(..))
+    }
+    /// A start with a later stop/start for the same device queued behind it is moot: opening
+    /// it (seconds, for some devices) would only delay the command that replaces it.
+    fn superseded_by(&self, later: &VecDeque<Cmd>) -> bool {
+        self.is_start() && later.iter().any(|c| c.is_capture() == self.is_capture())
+    }
+    fn reject(self, why: &str) {
+        let e = || DeviceError::Backend(why.into());
+        match self {
+            Cmd::StartCapture(_, reply) => {
+                let _ = reply.send(Err(e()));
+            }
+            Cmd::StartPlayback(_, reply) => {
+                let _ = reply.send(Err(e()));
+            }
+            Cmd::StopCapture | Cmd::StopPlayback => {}
+        }
+    }
+}
+
 /// Owns cpal streams on a dedicated thread. Opens can be requested asynchronously
 /// ([`request_capture`](Self::request_capture)) so an audio thread never waits on cpal.
 pub struct DeviceHost {
@@ -322,7 +350,22 @@ pub struct DeviceHost {
 #[allow(unused_assignments)]
 fn device_thread_loop(rx: Receiver<Cmd>, errors: Sender<String>) {
     let (mut cap, mut play): (Option<cpal::Stream>, Option<cpal::Stream>) = (None, None);
-    for cmd in rx {
+    let mut queue = VecDeque::new();
+    loop {
+        if queue.is_empty() {
+            match rx.recv() {
+                Ok(c) => queue.push_back(c),
+                Err(_) => return,
+            }
+        }
+        queue.extend(rx.try_iter());
+        let Some(cmd) = queue.pop_front() else {
+            continue;
+        };
+        if cmd.superseded_by(&queue) {
+            cmd.reject("superseded by a later request");
+            continue;
+        }
         match cmd {
             Cmd::StartCapture(sel, reply) => {
                 cap = None;
@@ -412,6 +455,21 @@ impl DeviceHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_start_is_superseded_by_a_later_command_for_the_same_device() {
+        let start_cap = || Cmd::StartCapture(DeviceSelector::Default, bounded(1).0);
+        let start_play = || Cmd::StartPlayback(DeviceSelector::Default, bounded(1).0);
+        let q = |v: Vec<Cmd>| v.into_iter().collect::<VecDeque<_>>();
+        assert!(start_cap().superseded_by(&q(vec![Cmd::StopCapture])));
+        assert!(start_cap().superseded_by(&q(vec![start_play(), start_cap()])));
+        assert!(!start_cap().superseded_by(&q(vec![Cmd::StopPlayback, start_play()])));
+        assert!(!start_play().superseded_by(&q(vec![])));
+        assert!(!Cmd::StopCapture.superseded_by(&q(vec![Cmd::StopCapture])));
+        // A rejected start answers its requester instead of leaving it waiting.
+        let (tx, rx) = bounded(1);
+        Cmd::StartPlayback(DeviceSelector::Default, tx).reject("superseded");
+        assert!(matches!(rx.try_recv(), Ok(Err(DeviceError::Backend(_)))));
+    }
     #[test]
     fn downmix_averages_channels() {
         let mut out = [0.0f32; 2];

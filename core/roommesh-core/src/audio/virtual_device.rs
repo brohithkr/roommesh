@@ -70,6 +70,11 @@ impl SharedRegion {
                 libc::close(fd);
                 return Err(VirtualDeviceError::Os(e));
             }
+            // Created but not sized yet: the driver is still setting the region up.
+            if st.st_size == 0 {
+                libc::close(fd);
+                return Err(VirtualDeviceError::NotReady);
+            }
             // macOS rounds shm sizes up to a page multiple
             if (st.st_size as usize) < std::mem::size_of::<SharedLayout>() {
                 libc::close(fd);
@@ -422,6 +427,27 @@ mod tests {
             region.header().driver_heartbeat_ns.load(Ordering::Relaxed),
             5
         );
+    }
+    #[test]
+    fn open_reports_an_unsized_region_as_not_ready() {
+        let mut b = [0u8; 4];
+        getrandom::fill(&mut b).expect("rng");
+        let name = format!("/rmtest.{:08x}", u32::from_le_bytes(b));
+        let c = CString::new(name.clone()).unwrap();
+        unsafe {
+            let fd = libc::shm_open(
+                c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600 as libc::c_uint,
+            );
+            assert!(fd >= 0);
+            libc::close(fd);
+        }
+        let r = SharedRegion::open(&name);
+        unsafe {
+            libc::shm_unlink(c.as_ptr());
+        }
+        assert!(matches!(r, Err(VirtualDeviceError::NotReady)));
     }
     #[test]
     fn dropping_mic_writer_zeroes_app_heartbeat() {
