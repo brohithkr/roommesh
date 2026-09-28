@@ -321,7 +321,8 @@ impl CoordinatorPipeline {
             }
         }
         let mics = &self.mics;
-        let sel = self.arbiter.update(now_ns / 1_000_000, &obs, |a, b| {
+        // Output time, not wall time: frames produced in a burst still advance the arbiter's clock.
+        let sel = self.arbiter.update(out_ns / 1_000_000, &obs, |a, b| {
             match (mics.get(&a), mics.get(&b)) {
                 (Some(x), Some(y)) => x.env.correlation(&y.env),
                 _ => 0.0,
@@ -467,10 +468,20 @@ mod tests {
             sel_at(&mut sim, &mut t, 2.0, [0.05, 0.5, 0.08]).primary,
             Some(PeerId(2))
         );
-        assert_eq!(
-            sel_at(&mut sim, &mut t, 4.0, [0.05, 0.08, 0.5]).primary,
-            Some(PeerId(3))
-        );
+        // The talker moves to mic 3 at 2.0 s (mic time): record when the output switches.
+        let moved = t;
+        let mut switched_at = None;
+        let mut last = Selection::default();
+        while (t - T0) as f64 / 1e9 < 4.0 {
+            last = sim.step(t, [0.05, 0.08, 0.5], 0.0, false).selection;
+            if switched_at.is_none() && last.primary == Some(PeerId(3)) {
+                switched_at = Some(t);
+            }
+            t += FRAME_NS;
+        }
+        assert_eq!(last.primary, Some(PeerId(3)));
+        let latency_ms = (switched_at.expect("switched to mic 3") - moved) / 1_000_000;
+        assert!(latency_ms <= 600, "switch to mic 3 took {latency_ms} ms");
         // Talker bursts are 150 ms voiced / 100 ms silent and output lags the mics by
         // mic_latency (70 ms), so a single frame can land in a gap: check one full period.
         let mut energy = 0.0f32;

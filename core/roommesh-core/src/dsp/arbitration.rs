@@ -15,12 +15,14 @@ pub struct ArbitrationConfig {
     /// How long a primary mic may be missing from the observations (late packets, a brief
     /// dropout) before it is replaced. The selection is held unchanged meanwhile.
     pub primary_absence_grace_ms: u64,
+    /// A pending switch candidate is dropped when it has not led by `switch_margin` for this long.
+    pub candidate_stale_ms: u64,
 }
 impl Default for ArbitrationConfig {
     fn default() -> Self {
         Self { switch_margin: 0.15, confirm_ms: 150, min_hold_ms: 600, allow_multi: false,
                multi_threshold: 0.6, multi_max_corr: 0.5, secondary_hangover_ms: 300,
-               primary_absence_grace_ms: 150 }
+               primary_absence_grace_ms: 150, candidate_stale_ms: 250 }
     }
 }
 
@@ -44,7 +46,8 @@ pub struct Arbiter {
     primary_since: u64,
     /// When the current primary was first missing from the observations.
     primary_absent_since: Option<u64>,
-    candidate: Option<(PeerId, u64)>,
+    /// Pending switch: (peer, first led by the margin at, last led by the margin at).
+    candidate: Option<(PeerId, u64, u64)>,
     secondary: Option<(PeerId, u64)>,
 }
 
@@ -86,9 +89,10 @@ impl Arbiter {
                 match challenger {
                     Some(c) if c.speaking && c.score > cur.score + self.cfg.switch_margin => {
                         let since = match self.candidate {
-                            Some((cp, s)) if cp == c.peer => s,
-                            _ => { self.candidate = Some((c.peer, now_ms)); now_ms }
+                            Some((cp, s, _)) if cp == c.peer => s,
+                            _ => now_ms,
                         };
+                        self.candidate = Some((c.peer, since, now_ms));
                         let confirmed = now_ms.saturating_sub(since) >= self.cfg.confirm_ms;
                         let held = now_ms.saturating_sub(self.primary_since) >= self.cfg.min_hold_ms;
                         if confirmed && held {
@@ -98,10 +102,18 @@ impl Arbiter {
                             if self.secondary.is_some_and(|s| s.0 == c.peer) { self.secondary = None; }
                         }
                     }
-                    // Keep a pending candidate through brief dips (pauses between syllables) as
-                    // long as the current mic has not regained the lead.
-                    Some(c) if self.candidate.is_some_and(|(cp, _)| cp == c.peer) && c.score >= cur.score => {}
-                    _ => self.candidate = None,
+                    // Keep a pending candidate through dips (pauses between syllables, onsets
+                    // where another mic briefly tops it) while the current mic has not pulled
+                    // ahead of it by the margin and it led recently.
+                    _ => {
+                        let margin = self.cfg.switch_margin;
+                        let keep = self.candidate.is_some_and(|(cp, _, last)| {
+                            cp != p
+                                && now_ms.saturating_sub(last) < self.cfg.candidate_stale_ms
+                                && find(cp).is_some_and(|o| o.score + margin >= cur.score)
+                        });
+                        if !keep { self.candidate = None; }
+                    }
                 }
             }
         }
@@ -184,6 +196,22 @@ mod tests {
             t += 40;
         }
         assert_eq!(arb.selection().primary, Some(C));
+    }
+    #[test]
+    fn candidate_kept_within_margin_but_dropped_when_stale() {
+        let mut arb = Arbiter::new(ArbitrationConfig::default());
+        run(&mut arb, 0, 1000, &[o(B, 0.9), o(C, 0.1)]);
+        let lead = [o(B, 0.4), o(C, 0.9)];
+        let near = [o(B, 0.5), o(C, 0.45)]; // C within the margin of B, not leading
+        run(&mut arb, 1010, 1080, &lead);
+        run(&mut arb, 1090, 1120, &near);
+        assert_eq!(run(&mut arb, 1130, 1160, &lead).primary, Some(C), "kept through the dip");
+        let mut arb = Arbiter::new(ArbitrationConfig::default());
+        run(&mut arb, 0, 1000, &[o(B, 0.9), o(C, 0.1)]);
+        run(&mut arb, 1010, 1080, &lead);
+        run(&mut arb, 1090, 1340, &near); // 250 ms without leading: stale
+        assert_eq!(run(&mut arb, 1350, 1450, &lead).primary, Some(B), "confirmation restarted");
+        assert_eq!(run(&mut arb, 1460, 1500, &lead).primary, Some(C));
     }
     #[test]
     fn minimum_hold_time_respected() {
