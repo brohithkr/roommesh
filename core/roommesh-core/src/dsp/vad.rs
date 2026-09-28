@@ -46,8 +46,18 @@ impl Vad {
     pub fn process(&mut self, frame: &[f32]) -> VadResult {
         let level_db = measure(frame).rms_db;
         if !level_db.is_finite() {
-            // Garbage/non-finite input: report a sane "silence" reading without perturbing any
-            // tracked state (noise floor, probability, hangover, frame count).
+            // Garbage/non-finite input: decay speech_prob/hangover exactly as a genuine
+            // deep-silence frame would (see the `level_db < -75.0` floor below), so a broken or
+            // glitching source doesn't get stuck reporting "speaking" forever. Never touch the
+            // noise floor estimate, though -- it has nothing sane to learn from this frame.
+            self.prob *= 0.6;
+            if !self.prob.is_finite() { self.prob = 0.0; }
+            if self.prob > 0.6 {
+                self.speech = true;
+                self.hangover = 15;
+            } else if self.prob < 0.4 {
+                if self.hangover > 0 { self.hangover -= 1; } else { self.speech = false; }
+            }
             return VadResult {
                 speech_prob: self.prob,
                 is_speech: self.speech,
@@ -147,13 +157,31 @@ mod tests {
         let nan_frame = vec![f32::NAN; 480];
         let r = v.process(&nan_frame);
         assert!(r.speech_prob.is_finite());
-        assert_eq!(r.speech_prob, prev.speech_prob);
-        assert_eq!(r.is_speech, prev.is_speech);
+        // A non-finite frame decays speech_prob toward silence (like a genuine quiet frame)
+        // rather than leaving it frozen; it must never increase it.
+        assert!(r.speech_prob <= prev.speech_prob);
         assert_eq!(r.level_db, -120.0);
         assert_eq!(r.snr_db, 0.0);
+        assert_eq!(r.noise_floor_db, prev.noise_floor_db, "must never move the noise floor");
         // Subsequent normal frames still behave sanely: state was not corrupted.
         let after = v.process(&noise(&mut rng, -40.0));
         assert!(after.speech_prob.is_finite());
         assert!(!after.is_speech);
+    }
+    #[test]
+    fn non_finite_frames_decay_speech_state_without_touching_noise_floor() {
+        let mut v = Vad::new();
+        let mut rng = Rng(7);
+        for _ in 0..100 { v.process(&noise(&mut rng, -50.0)); }
+        let last_speech = (0..100).map(|f| v.process(&voiced(f, &mut rng, -50.0))).last().unwrap();
+        assert!(last_speech.is_speech, "should be speaking before the glitch");
+        let noise_floor = last_speech.noise_floor_db;
+        let mut r = last_speech;
+        for _ in 0..30 {
+            r = v.process(&[f32::NAN; 480]);
+            assert!(r.speech_prob.is_finite());
+            assert_eq!(r.noise_floor_db, noise_floor, "non-finite frames must never move the noise floor");
+        }
+        assert!(!r.is_speech, "a broken source must not be reported as speaking forever");
     }
 }

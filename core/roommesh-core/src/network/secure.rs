@@ -14,6 +14,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const FRAME_HELLO: u8 = 0x01;
 pub const FRAME_SEALED: u8 = 0x02;
+/// Plaintext nudge asking the recipient to (re)send its opening Hello. Sent only by the higher
+/// `PeerId` of a pair (which never opens with a Hello itself) and answered only by the lower
+/// `PeerId` -- see `network::control::ControlChannel`.
+pub const FRAME_HELLO_REQUEST: u8 = 0x03;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
@@ -39,7 +43,16 @@ pub enum SecureError {
 
 pub fn decode_hello(frame: &[u8]) -> Result<Hello, SecureError> {
     if frame.first() != Some(&FRAME_HELLO) { return Err(SecureError::Malformed); }
-    let (hello, rest) = postcard::take_from_bytes(&frame[1..]).map_err(|_| SecureError::Malformed)?;
+    let body = &frame[1..];
+    // `protocol_version` is `Hello`'s first field, so peek it with a standalone decode before
+    // attempting to decode the whole struct: a different protocol version may use a different
+    // wire shape entirely (fields added/removed/reordered), which would otherwise surface as an
+    // opaque "malformed frame" instead of the actionable version mismatch.
+    let (version, _) = postcard::take_from_bytes::<u16>(body).map_err(|_| SecureError::Malformed)?;
+    if version != crate::room::state::PROTOCOL_VERSION {
+        return Err(SecureError::Version(version));
+    }
+    let (hello, rest) = postcard::take_from_bytes(body).map_err(|_| SecureError::Malformed)?;
     if !rest.is_empty() { return Err(SecureError::Malformed); }
     Ok(hello)
 }
@@ -293,5 +306,16 @@ mod tests {
         let mut frame = a.hello();
         frame.push(0xAB);
         assert_eq!(decode_hello(&frame), Err(SecureError::Malformed));
+    }
+    #[test]
+    fn decode_hello_reports_version_mismatch_even_if_wire_format_differs() {
+        // Simulate a peer on an older protocol version whose `Hello` has a completely different
+        // (incompatible) tail after `protocol_version` -- decode_hello must still report the
+        // version mismatch cleanly rather than a generic Malformed error from failing to parse
+        // the rest of the (differently-shaped) struct.
+        let mut frame = vec![FRAME_HELLO];
+        frame.extend(postcard::to_allocvec(&1u16).unwrap()); // old protocol_version = 1
+        frame.extend([0xde, 0xad, 0xbe, 0xef, 0xff, 0xff]);
+        assert_eq!(decode_hello(&frame), Err(SecureError::Version(1)));
     }
 }

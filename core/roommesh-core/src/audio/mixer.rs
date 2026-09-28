@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 pub struct Mixer { fade_samples: usize, gains: BTreeMap<PeerId, FadeGain>, norm: LinearRamp }
 
 /// Soft-knee limiter: passes `|x| <= 0.9` through unchanged, and above that asymptotically
-/// approaches (but never reaches) +/-1.0 via a rational knee. Never produces NaN or infinity:
-/// a non-finite input returns 0.0.
+/// approaches +/-1.0 via a rational knee -- for any input representable in f32 this stays
+/// strictly below 1.0 in exact arithmetic, but f32 rounding makes `1.0 / (1.0 + z)` underflow to
+/// exactly 0.0 for huge or infinite `z`, so very large finite inputs (and +/-infinity) saturate
+/// to exactly +/-1.0 rather than merely approaching it. Never produces NaN: a NaN input returns
+/// 0.0.
 pub fn soft_clip(x: f32) -> f32 {
     const T: f32 = 0.9;
     if x.is_nan() { return 0.0; }

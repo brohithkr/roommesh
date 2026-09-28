@@ -2,7 +2,10 @@
 use crate::ids::{Epoch, PeerId, RoomId};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Bumped whenever the control-channel wire format changes in a way that isn't
+/// forward/backward compatible (e.g. `secure::Hello` gaining/losing/reordering fields).
+/// Version 2: `Hello` gained `reply_to`.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Capabilities {

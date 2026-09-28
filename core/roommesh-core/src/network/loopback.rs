@@ -28,11 +28,18 @@ fn key(a: PeerId, b: PeerId) -> (PeerId, PeerId) {
 
 pub struct LoopbackNetwork {
     inner: Mutex<Inner>,
+    /// Held only while actually calling `TransportSink::send` for a batch of collected events
+    /// (see `flush`). `inner`'s lock is never held during a send (a sink is allowed to block --
+    /// see `TransportSink`'s doc), but without some ordering, two threads racing to flush their
+    /// own batches could interleave arbitrarily even though each batch was computed under a
+    /// single, consistent snapshot of `inner`. Serializing flushes in lock-acquisition order
+    /// keeps a single, predictable global delivery order across threads.
+    emit: Mutex<()>,
 }
 
 impl LoopbackNetwork {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { inner: Mutex::new(Inner::default()) })
+        Arc::new(Self { inner: Mutex::new(Inner::default()), emit: Mutex::new(()) })
     }
 
     pub fn transport(self: &Arc<Self>, me: PeerId, sink: TransportSink) -> Arc<LoopbackTransport> {
@@ -42,12 +49,12 @@ impl LoopbackNetwork {
 
     /// Looks up a node's sink (a cheap clone of the channel sender) without sending anything.
     /// Callers collect the (sink, event) pairs they need to emit while holding `inner`'s lock,
-    /// then send them only after the lock is released -- see the module-level note on why we
-    /// never call `TransportSink::send` while holding the lock.
+    /// then hand them to `flush` only after the lock is released.
     fn sink(inner: &Inner, to: PeerId) -> Option<TransportSink> {
         inner.nodes.get(&to).map(|n| n.sink.clone())
     }
-    fn flush(sends: Vec<(TransportSink, TransportEvent)>) {
+    fn flush(&self, sends: Vec<(TransportSink, TransportEvent)>) {
+        let _order = self.emit.lock();
         for (s, ev) in sends {
             let _ = s.send(ev);
         }
@@ -64,7 +71,7 @@ impl LoopbackNetwork {
             }
             sends
         };
-        Self::flush(sends);
+        self.flush(sends);
     }
     pub fn heal(&self, a: PeerId, b: PeerId) {
         self.inner.lock().blocked.remove(&key(a, b));
@@ -91,7 +98,7 @@ impl LoopbackNetwork {
             g.nodes.remove(&peer);
             sends
         };
-        Self::flush(sends);
+        self.flush(sends);
     }
 }
 
@@ -125,7 +132,7 @@ impl PeerTransport for LoopbackTransport {
             }
             sends
         };
-        LoopbackNetwork::flush(sends);
+        self.net.flush(sends);
     }
     fn stop(&self) {
         let mut g = self.net.inner.lock();
@@ -146,7 +153,7 @@ impl PeerTransport for LoopbackTransport {
             if let Some(s) = LoopbackNetwork::sink(&g, peer) { sends.push((s, TransportEvent::Connected(self.me))); }
             sends
         };
-        LoopbackNetwork::flush(sends);
+        self.net.flush(sends);
     }
     fn disconnect(&self, peer: PeerId) {
         let sends = {
@@ -158,7 +165,7 @@ impl PeerTransport for LoopbackTransport {
             }
             sends
         };
-        LoopbackNetwork::flush(sends);
+        self.net.flush(sends);
     }
     fn send_control(&self, peer: PeerId, frame: Vec<u8>) {
         let send = {
@@ -170,17 +177,14 @@ impl PeerTransport for LoopbackTransport {
         }
     }
     fn send_realtime(&self, peer: PeerId, packet: Vec<u8>) {
-        // Requires the peer node to still exist (in addition to the partition check): a link is
-        // not required since realtime packets may legitimately arrive before `connect` completes
-        // on a lossy/unreliable transport, but a node that was removed (`LoopbackNetwork::remove`,
-        // simulating a crash) can never receive anything again.
+        // A link is not required (realtime packets may legitimately arrive before `connect`
+        // completes on a lossy/unreliable transport); only the partition check applies here.
+        // `sink()` already returns `None` when the peer node doesn't exist (e.g. it was removed
+        // via `LoopbackNetwork::remove`, simulating a crash), so no separate existence check is
+        // needed.
         let send = {
             let g = self.net.inner.lock();
-            if g.blocked.contains(&key(self.me, peer)) || !g.nodes.contains_key(&peer) {
-                None
-            } else {
-                LoopbackNetwork::sink(&g, peer)
-            }
+            if g.blocked.contains(&key(self.me, peer)) { None } else { LoopbackNetwork::sink(&g, peer) }
         };
         if let Some(s) = send {
             let _ = s.send(TransportEvent::Realtime(packet));

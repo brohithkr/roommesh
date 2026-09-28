@@ -12,6 +12,14 @@ pub struct LocalAdvertisement {
 /// Implementations must be idempotent: `connect` to an already connected/connecting peer is a
 /// no-op, and simultaneous dials must collapse to one connection (keep the one dialed by the
 /// lower PeerId).
+///
+/// Event ordering invariant: for a given connection, `TransportEvent::Connected(p)` is always
+/// delivered before any `TransportEvent::Control { peer: p, .. }` (or `Realtime`) frame that
+/// arrived over the connection it announces -- the control layer relies on this to know when a
+/// peer's Hello/HELLO_REQUEST traffic corresponds to a connection it's aware of. If an
+/// underlying connection is replaced (a reconnect, a network path switch that isn't seamless at
+/// the transport layer, ...), that must be reported as a `Disconnected(p)` followed by a fresh
+/// `Connected(p)` on *both* ends, never a silent substitution.
 pub trait PeerTransport: Send + Sync {
     /// Advertise the local peer and browse for others (Bonjour `_roomaudio._tcp`/`_udp`).
     fn start(&self, advert: LocalAdvertisement);

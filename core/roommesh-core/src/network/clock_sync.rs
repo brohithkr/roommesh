@@ -36,6 +36,11 @@ impl ClockEstimator {
         // before it received the request) is causally impossible; such a sample is corrupt
         // (clock stepped backwards, malformed packet) and would poison the RTT/offset fit.
         if s.t4 < s.t1 || s.t3 < s.t2 { return; }
+        // The round trip (t4 - t1) must be at least the coordinator's own processing time
+        // (t3 - t2): the remaining time is network transit, which can't be negative. Without
+        // this check a corrupt sample would silently clamp to rtt=0 below instead of being
+        // rejected outright.
+        if (s.t4 - s.t1) < (s.t3 - s.t2) { return; }
         let (t1, t2, t3, t4) = (s.t1 as f64, s.t2 as f64, s.t3 as f64, s.t4 as f64);
         let rtt = ((t4 - t1) - (t3 - t2)).max(0.0);
         let offset = ((t2 - t1) + (t3 - t4)) / 2.0;
@@ -134,6 +139,9 @@ mod tests {
         let mut est = ClockEstimator::new();
         est.add_sample(ClockSample { t1: 100, t2: 50, t3: 60, t4: 50 }); // t4 < t1
         est.add_sample(ClockSample { t1: 0, t2: 50, t3: 40, t4: 100 }); // t3 < t2
+        // Round trip (t4 - t1 = 5) shorter than the coordinator's own processing time
+        // (t3 - t2 = 20): the remaining network transit time would have to be negative.
+        est.add_sample(ClockSample { t1: 0, t2: 100, t3: 120, t4: 5 });
         assert!(est.min_rtt_ns().is_none());
         assert!(!est.is_synced());
     }
