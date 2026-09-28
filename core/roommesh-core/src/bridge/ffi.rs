@@ -281,7 +281,18 @@ fn capabilities(driver_installed: bool) -> Capabilities {
 }
 
 /// Implemented in Swift by `AppleP2PTransport` (Network.framework, peer-to-peer enabled).
-/// Calls arrive on Rust threads; implementations must be thread-safe and must not block.
+///
+/// Threading contract (violations deadlock or stall audio):
+/// - Calls arrive on Rust threads (the control and DSP threads among them). Implementations
+///   must be thread-safe and must never block: enqueue the work (`queue.async`) and return.
+/// - Never call a Result-returning `RoomMeshCore` command synchronously from a callback; such a
+///   call from the core's control thread fails at once with `FfiError.Timeout`.
+/// - `send_realtime` is also called re-entrantly from inside `on_realtime_packet` (clock pongs
+///   are answered on the thread delivering the ping), i.e. on your own delivery queue: never
+///   `queue.sync` onto that queue (or any queue you might be called on).
+/// - `start()` and `stop()` run on the thread that called `RoomMeshCore.start()` / `.stop()`.
+/// - Dropping the last `RoomMeshCore` reference stops the control thread and joins the DSP
+///   thread; don't release it from a transport callback.
 #[uniffi::export(foreign)]
 pub trait FfiTransport: Send + Sync {
     fn start(&self, peer_id: String, name: String, protocol_version: u16);
@@ -294,7 +305,13 @@ pub trait FfiTransport: Send + Sync {
     fn description(&self) -> String;
 }
 
-/// Implemented in Swift; events are delivered on a Rust thread (hop to the main actor).
+/// Implemented in Swift. Events are delivered in order on the core's control thread.
+///
+/// Threading contract: `on_event` must never block — hand the event to a serial queue / the
+/// main actor and return — and must never call a Result-returning `RoomMeshCore` command
+/// synchronously (it would fail at once with `FfiError.Timeout`: the control thread that runs
+/// commands is the one delivering the event). Query methods (`get_room_state`, ...) are fine.
+/// Never `queue.sync` onto a queue that may itself be waiting on the core.
 #[uniffi::export(foreign)]
 pub trait FfiEventListener: Send + Sync {
     fn on_event(&self, event: FfiEvent);
@@ -332,6 +349,8 @@ impl EventSink for EventAdapter {
     }
 }
 
+/// The core. Dropping the last reference stops its control thread and joins its DSP thread
+/// (see [`FfiTransport`] and [`FfiEventListener`] for the callback contracts).
 #[derive(uniffi::Object)]
 pub struct RoomMeshCore {
     core: Core,
