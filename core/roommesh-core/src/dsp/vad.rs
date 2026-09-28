@@ -1,0 +1,125 @@
+//! Lightweight VAD: SNR against a tracked noise floor + spectral flatness + speech-band ratio,
+//! smoothed into a probability with hysteresis and hangover. Tuned for 48 kHz 10 ms frames.
+use crate::dsp::level::measure;
+use realfft::num_complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
+use std::sync::Arc;
+
+const FFT_LEN: usize = 512;
+const BIN_HZ: f32 = 48_000.0 / FFT_LEN as f32;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VadResult {
+    pub speech_prob: f32,
+    pub is_speech: bool,
+    pub level_db: f32,
+    pub noise_floor_db: f32,
+    pub snr_db: f32,
+}
+
+pub struct Vad {
+    fft: Arc<dyn RealToComplex<f32>>,
+    window: Vec<f32>,
+    input: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    noise_floor_db: f32,
+    prob: f32,
+    hangover: u32,
+    frames: u64,
+    speech: bool,
+}
+
+impl Default for Vad { fn default() -> Self { Self::new() } }
+
+impl Vad {
+    pub fn new() -> Self {
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_LEN);
+        let input = fft.make_input_vec();
+        let spectrum = fft.make_output_vec();
+        let window = (0..480).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / 479.0).cos()).collect();
+        Self { fft, window, input, spectrum, noise_floor_db: -60.0, prob: 0.0, hangover: 0, frames: 0, speech: false }
+    }
+
+    pub fn process(&mut self, frame: &[f32]) -> VadResult {
+        let level_db = measure(frame).rms_db;
+        for (i, x) in self.input.iter_mut().enumerate() {
+            *x = if i < frame.len() && i < 480 { frame[i] * self.window[i] } else { 0.0 };
+        }
+        let _ = self.fft.process(&mut self.input, &mut self.spectrum);
+        let lo = (300.0 / BIN_HZ) as usize;
+        let voice_hi = (3400.0 / BIN_HZ) as usize;
+        let flat_hi = (4000.0 / BIN_HZ) as usize;
+        let power: Vec<f32> = self.spectrum.iter().map(|c| c.norm_sqr() + 1e-12).collect();
+        let band = &power[lo..=flat_hi];
+        let geo = (band.iter().map(|p| p.ln()).sum::<f32>() / band.len() as f32).exp();
+        let arith = band.iter().sum::<f32>() / band.len() as f32;
+        let flatness = (geo / arith).clamp(0.0, 1.0);
+        let total: f32 = power[1..].iter().sum();
+        let band_ratio = power[lo..=voice_hi].iter().sum::<f32>() / total;
+
+        if self.frames == 0 {
+            self.noise_floor_db = level_db;
+        } else if level_db < self.noise_floor_db {
+            self.noise_floor_db += 0.2 * (level_db - self.noise_floor_db);
+        } else {
+            let rise: f32 = if self.speech { 0.005 } else { 0.05 };
+            self.noise_floor_db += rise.min(level_db - self.noise_floor_db);
+        }
+        self.noise_floor_db = self.noise_floor_db.max(-100.0);
+        let snr_db = level_db - self.noise_floor_db;
+
+        let mut logit = 0.4 * (snr_db - 8.0) + 6.0 * (0.35 - flatness) + 3.0 * (band_ratio - 0.5);
+        if level_db < -75.0 { logit = -10.0; }
+        let inst = 1.0 / (1.0 + (-logit).exp());
+        self.prob = 0.6 * self.prob + 0.4 * inst;
+        if self.prob > 0.6 {
+            self.speech = true;
+            self.hangover = 15;
+        } else if self.prob < 0.4 {
+            if self.hangover > 0 { self.hangover -= 1; } else { self.speech = false; }
+        }
+        self.frames += 1;
+        VadResult { speech_prob: self.prob, is_speech: self.speech, level_db, noise_floor_db: self.noise_floor_db, snr_db }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Rng(u64);
+    impl Rng { fn uni(&mut self) -> f32 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; (self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0 } }
+    fn amp(db: f32) -> f32 { 10f32.powf(db / 20.0) * 3f32.sqrt() }
+    fn noise(rng: &mut Rng, db: f32) -> Vec<f32> { (0..480).map(|_| rng.uni() * amp(db)).collect() }
+    fn voiced(frame: usize, rng: &mut Rng, noise_db: f32) -> Vec<f32> {
+        (0..480).map(|k| {
+            let t = (frame * 480 + k) as f32 / 48_000.0;
+            let env = 0.55 + 0.45 * (2.0 * std::f32::consts::PI * 4.0 * t).sin();
+            let v: f32 = (1..=10).map(|h| (2.0 * std::f32::consts::PI * 140.0 * h as f32 * t).sin() / h as f32).sum();
+            0.08 * env * v + rng.uni() * amp(noise_db)
+        }).collect()
+    }
+    #[test]
+    fn silence_is_not_speech() {
+        let mut v = Vad::new();
+        for _ in 0..100 { let r = v.process(&[0.0; 480]); assert!(r.speech_prob.is_finite()); assert!(!r.is_speech); }
+    }
+    #[test]
+    fn stationary_noise_is_not_speech() {
+        let mut v = Vad::new();
+        let mut rng = Rng(42);
+        let res: Vec<VadResult> = (0..200).map(|_| v.process(&noise(&mut rng, -40.0))).collect();
+        assert_eq!(res[100..].iter().filter(|r| r.is_speech).count(), 0);
+    }
+    #[test]
+    fn voiced_signal_detected_then_released() {
+        let mut v = Vad::new();
+        let mut rng = Rng(7);
+        for _ in 0..100 { v.process(&noise(&mut rng, -50.0)); }
+        let speech: Vec<VadResult> = (0..100).map(|f| v.process(&voiced(f, &mut rng, -50.0))).collect();
+        let frac = speech[10..].iter().filter(|r| r.is_speech).count() as f32 / 90.0;
+        assert!(frac > 0.8, "speech fraction {frac}");
+        assert!(speech[50].snr_db > 15.0);
+        let after: Vec<VadResult> = (0..100).map(|_| v.process(&noise(&mut rng, -50.0))).collect();
+        assert!(after[70..].iter().all(|r| !r.is_speech));
+    }
+}
