@@ -352,8 +352,10 @@ fn counter_nonce(c: u64) -> Nonce {
 fn rt_nonce(h: &RtHeader) -> Nonce {
     let mut n = [0u8; 12];
     n[0] = h.kind as u8;
-    // Low 3 bytes of the epoch (LE): without this, sequence numbers restart at epoch 0 on every
-    // coordinator handover would reuse (key, nonce) pairs from the previous epoch.
+    // Low 3 bytes of the epoch (LE). Nonce uniqueness does not rest on this: every sender takes
+    // its sequence numbers from counters that live as long as the audio runtime (or the Core,
+    // for clock pongs) and never restart on an epoch change (see `engine::runtime`'s module
+    // docs), and each connection has its own keys. The epoch is extra separation only.
     n[1..4].copy_from_slice(&h.epoch.0.to_le_bytes()[..3]);
     n[4..8].copy_from_slice(&h.stream.0.to_le_bytes());
     n[8..12].copy_from_slice(&h.sequence.to_le_bytes());
