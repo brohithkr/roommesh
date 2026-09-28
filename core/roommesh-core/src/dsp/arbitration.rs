@@ -12,11 +12,15 @@ pub struct ArbitrationConfig {
     pub multi_threshold: f32,
     pub multi_max_corr: f32,
     pub secondary_hangover_ms: u64,
+    /// How long a primary mic may be missing from the observations (late packets, a brief
+    /// dropout) before it is replaced. The selection is held unchanged meanwhile.
+    pub primary_absence_grace_ms: u64,
 }
 impl Default for ArbitrationConfig {
     fn default() -> Self {
         Self { switch_margin: 0.15, confirm_ms: 150, min_hold_ms: 600, allow_multi: false,
-               multi_threshold: 0.6, multi_max_corr: 0.5, secondary_hangover_ms: 300 }
+               multi_threshold: 0.6, multi_max_corr: 0.5, secondary_hangover_ms: 300,
+               primary_absence_grace_ms: 150 }
     }
 }
 
@@ -38,13 +42,15 @@ pub struct Arbiter {
     cfg: ArbitrationConfig,
     primary: Option<PeerId>,
     primary_since: u64,
+    /// When the current primary was first missing from the observations.
+    primary_absent_since: Option<u64>,
     candidate: Option<(PeerId, u64)>,
     secondary: Option<(PeerId, u64)>,
 }
 
 impl Arbiter {
     pub fn new(cfg: ArbitrationConfig) -> Self {
-        Self { cfg, primary: None, primary_since: 0, candidate: None, secondary: None }
+        Self { cfg, primary: None, primary_since: 0, primary_absent_since: None, candidate: None, secondary: None }
     }
     pub fn set_config(&mut self, cfg: ArbitrationConfig) { self.cfg = cfg; }
     pub fn selection(&self) -> Selection {
@@ -52,12 +58,21 @@ impl Arbiter {
     }
 
     pub fn update(&mut self, now_ms: u64, obs: &[MicObservation], corr: impl Fn(PeerId, PeerId) -> f32) -> Selection {
+        let find = |p: PeerId| obs.iter().find(|o| o.peer == p);
+        if self.primary.is_some_and(|p| find(p).is_none()) {
+            let since = *self.primary_absent_since.get_or_insert(now_ms);
+            if now_ms.saturating_sub(since) < self.cfg.primary_absence_grace_ms {
+                // Brief absence: hold the selection rather than cut to another mic mid-word.
+                if !obs.is_empty() { self.update_secondary(now_ms, obs, &corr); }
+                return self.selection();
+            }
+            self.primary = None;
+        }
+        self.primary_absent_since = None;
         if obs.is_empty() {
             *self = Self::new(self.cfg.clone());
             return self.selection();
         }
-        let find = |p: PeerId| obs.iter().find(|o| o.peer == p);
-        if self.primary.is_some_and(|p| find(p).is_none()) { self.primary = None; }
         match self.primary {
             None => {
                 let best = obs.iter().max_by(by_score).unwrap();
@@ -179,11 +194,24 @@ mod tests {
         assert_eq!(run(&mut arb, 600, 610, &obs).primary, Some(C));
     }
     #[test]
-    fn vanished_primary_replaced_immediately() {
+    fn vanished_primary_replaced_after_grace() {
         let mut arb = Arbiter::new(ArbitrationConfig::default());
         arb.update(0, &[o(B, 0.9), o(C, 0.5)], no_corr);
-        assert_eq!(arb.update(10, &[o(C, 0.5)], no_corr).primary, Some(C));
-        assert_eq!(arb.update(20, &[], no_corr), Selection::default());
+        assert_eq!(arb.update(10, &[o(C, 0.5)], no_corr).primary, Some(B), "held during grace");
+        assert_eq!(arb.update(150, &[o(C, 0.5)], no_corr).primary, Some(B));
+        assert_eq!(arb.update(160, &[o(C, 0.5)], no_corr).primary, Some(C), "replaced after 150 ms");
+        assert_eq!(arb.update(170, &[], no_corr).primary, Some(C), "empty obs also held");
+        assert_eq!(arb.update(320, &[], no_corr), Selection::default());
+    }
+    #[test]
+    fn primary_survives_brief_absence() {
+        let mut arb = Arbiter::new(ArbitrationConfig::default());
+        run(&mut arb, 0, 1000, &[o(B, 0.9), o(C, 0.5)]);
+        // B's packets are late for 100 ms: C is the only observation but must not take over.
+        assert_eq!(run(&mut arb, 1010, 1110, &[o(C, 0.9)]).primary, Some(B));
+        assert_eq!(run(&mut arb, 1120, 1200, &[o(B, 0.9), o(C, 0.5)]).primary, Some(B));
+        // The absence timer restarts after B came back.
+        assert_eq!(run(&mut arb, 1210, 1350, &[o(C, 0.9)]).primary, Some(B));
     }
     #[test]
     fn simultaneous_talkers_only_when_enabled_and_uncorrelated() {

@@ -18,8 +18,14 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoordinatorConfig {
+    /// An output frame for time `t` uses mic audio captured at `t - mic_latency_ns` from every
+    /// mic. Must cover a remote mic's worst normal path: 10 ms framing + network + jitter
+    /// buffering + the 6.5 ms codec delay (default 70 ms).
     pub mic_latency_ns: u64,
+    /// Far-end captured at `c` is scheduled to play on the room speaker at `c + playout_delay_ns`.
     pub playout_delay_ns: u64,
+    /// The AEC reference is read `reference_lead_ns` after the mic capture time, keeping the
+    /// canceller causal despite small scheduling errors.
     pub reference_lead_ns: u64,
     pub use_webrtc_aec: bool,
     pub noise_suppression: bool,
@@ -29,7 +35,7 @@ pub struct CoordinatorConfig {
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
-            mic_latency_ns: 60_000_000,
+            mic_latency_ns: 70_000_000,
             playout_delay_ns: 80_000_000,
             reference_lead_ns: 20_000_000,
             use_webrtc_aec: true,
@@ -466,7 +472,7 @@ mod tests {
             Some(PeerId(3))
         );
         // Talker bursts are 150 ms voiced / 100 ms silent and output lags the mics by
-        // mic_latency (60 ms), so a single frame can land in a gap: check one full period.
+        // mic_latency (70 ms), so a single frame can land in a gap: check one full period.
         let mut energy = 0.0f32;
         for _ in 0..25 {
             let out = sim.step(t, [0.05, 0.08, 0.5], 0.0, false);
