@@ -30,12 +30,15 @@ private:
     UInt32 channels_;
 };
 
-// Tracks whether IO is running on a device (published for diagnostics).
+// Tracks whether IO is running on a device (published for diagnostics), and
+// for the mic device, releases a disconnecting client's per-client replay
+// guard slot (see SharedRegion::ReleaseClientSlot).
 class IOStateHandler : public aspl::ControlRequestHandler {
 public:
     IOStateHandler(std::shared_ptr<SharedRegion> r, bool mic) : region_(std::move(r)), mic_(mic) {}
     OSStatus OnStartIO() override;
     void OnStopIO() override;
+    void OnRemoveClient(std::shared_ptr<aspl::Client> client) override;
 private:
     std::shared_ptr<SharedRegion> region_;
     bool mic_;

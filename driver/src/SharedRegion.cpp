@@ -115,6 +115,13 @@ bool SharedRegion::Create(const char* name) {
     layout_->header.sample_rate = kSampleRate;
     layout_->header.ring_frames = kRingFrames;
     layout_->header.generation.store(HostNowNs(), std::memory_order_release);
+    // A SharedRegion instance that's reused across more than one shm region
+    // (e.g. a driver re-init calling Create() again) must not carry any
+    // mic-side bookkeeping - an offset, a client's high-water mark, an
+    // in-progress trim window - into this brand new region, whose
+    // write_pos starts back at 0 and has no relationship to whatever this
+    // object last saw.
+    ResetMicTrackingState();
     return true;
 }
 
@@ -123,20 +130,76 @@ void SharedRegion::Destroy() {
     if (!name_.empty()) shm_unlink(name_.c_str());
 }
 
-SharedRegion::ClientServedEnd* SharedRegion::FindOrCreateClientSlot(uint32_t clientId) {
+SharedRegion::ClientServedEnd* SharedRegion::FindOrCreateClientSlot(uint32_t clientId, uint64_t nowNs) {
     // First pass: this client may already have a slot.
     for (auto& slot : micClientServed_) {
-        if (slot.clientId.load(std::memory_order_relaxed) == clientId) return &slot;
+        if (slot.clientId.load(std::memory_order_relaxed) == clientId) {
+            slot.lastSeenNs.store(nowNs, std::memory_order_relaxed);
+            return &slot;
+        }
     }
     // Second pass: claim a free slot. A plain linear scan + CAS is fine
     // here - this only runs when a new client shows up (rare relative to
     // the steady-state ReadMic call rate), and kMaxTrackedMicClients is
-    // small.
+    // small. Reset servedEnd so a slot a new client claims can never
+    // observe a stale high-water mark left over from nothing (a freshly
+    // constructed/reset slot already has servedEnd 0, but this also covers
+    // ReleaseClientSlot leaving a slot's servedEnd non-zero if it's ever
+    // reordered relative to clearing clientId - see ReleaseClientSlot).
     for (auto& slot : micClientServed_) {
         uint32_t expected = kNoClient;
-        if (slot.clientId.compare_exchange_strong(expected, clientId, std::memory_order_relaxed)) return &slot;
+        if (slot.clientId.compare_exchange_strong(expected, clientId, std::memory_order_relaxed)) {
+            slot.servedEnd.store(0, std::memory_order_relaxed);
+            slot.lastSeenNs.store(nowNs, std::memory_order_relaxed);
+            return &slot;
+        }
     }
-    return nullptr;  // table full; this client's reads simply aren't guarded (see header comment)
+    // Fallback: every slot is claimed, but one may belong to a client that
+    // disconnected through a path that never reached ReleaseClientSlot
+    // (see IOStateHandler::OnRemoveClient). A slot idle for over
+    // kClientSlotIdleNs is eligible to be reclaimed by a new client -
+    // this is a heuristic safety net, not the primary release mechanism.
+    for (auto& slot : micClientServed_) {
+        const uint64_t seen = slot.lastSeenNs.load(std::memory_order_relaxed);
+        if (nowNs <= seen + kClientSlotIdleNs) continue;
+        uint32_t expected = slot.clientId.load(std::memory_order_relaxed);
+        if (expected == kNoClient) continue;  // someone else's release/claim race; try the next slot
+        if (slot.clientId.compare_exchange_strong(expected, clientId, std::memory_order_relaxed)) {
+            slot.servedEnd.store(0, std::memory_order_relaxed);
+            slot.lastSeenNs.store(nowNs, std::memory_order_relaxed);
+            return &slot;
+        }
+    }
+    return nullptr;  // table full of still-active clients; this client's reads simply aren't guarded (see header comment)
+}
+
+void SharedRegion::ReleaseClientSlot(uint32_t clientId) {
+    for (auto& slot : micClientServed_) {
+        if (slot.clientId.load(std::memory_order_relaxed) == clientId) {
+            // Clear servedEnd before the clientId, so a concurrent
+            // FindOrCreateClientSlot that's about to claim this now-freed
+            // slot can never observe the old clientId's high-water mark.
+            slot.servedEnd.store(0, std::memory_order_relaxed);
+            slot.clientId.store(kNoClient, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+void SharedRegion::ResetMicTrackingState() {
+    micState_.store(0, std::memory_order_relaxed);
+    maxFramesSeen_.store(0, std::memory_order_relaxed);
+    underrunStreak_.store(0, std::memory_order_relaxed);
+    underrunDeficit_.store(0, std::memory_order_relaxed);
+    lastMicW_.store(0, std::memory_order_relaxed);
+    silenceFloor_.store(0, std::memory_order_relaxed);
+    marginWindowStartNs_.store(0, std::memory_order_relaxed);
+    marginWindowMinGap_.store(0, std::memory_order_relaxed);
+    for (auto& slot : micClientServed_) {
+        slot.servedEnd.store(0, std::memory_order_relaxed);
+        slot.lastSeenNs.store(0, std::memory_order_relaxed);
+        slot.clientId.store(kNoClient, std::memory_order_relaxed);
+    }
 }
 
 void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs, uint32_t clientId) {
@@ -276,7 +339,7 @@ void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint6
     // personally saw it - see the silence branch above). Never read at or
     // past `w`, since nothing has been written there yet.
     const uint64_t upos = static_cast<uint64_t>(pos);
-    ClientServedEnd* clientSlot = FindOrCreateClientSlot(clientId);
+    ClientServedEnd* clientSlot = FindOrCreateClientSlot(clientId, nowNs);
     const uint64_t clientServedEnd = clientSlot ? clientSlot->servedEnd.load(std::memory_order_relaxed) : 0;
     const uint64_t floor = std::max(clientServedEnd, silenceFloor_.load(std::memory_order_relaxed));
     const uint64_t realStart = std::max(upos, floor);
@@ -294,13 +357,26 @@ void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint6
     // client that has since disconnected, or against a write edge that had
     // temporarily surged ahead. If the margin between the write edge and
     // what's actually being served (the gap) stays *persistently* above
-    // readBehind + 480 - not just a one-off - for about half a second,
-    // trim the anchor forward, once, back to the normal depth. The
-    // positions being skipped over were never served to anyone (the gap
-    // was never small enough to reach them), so this is not a replay, just
-    // shedding latency the anchor no longer needs to carry.
+    // the normal steady-state end-gap plus 480 - not just a one-off - for
+    // about half a second, trim the anchor forward, once, back to the
+    // normal depth. The positions being skipped over were never served to
+    // anyone (the gap was never small enough to reach them), so this is
+    // not a replay, just shedding latency the anchor no longer needs to
+    // carry.
+    //
+    // `gap` and `normalEndGap` are both *end*-gaps (write edge minus the
+    // end of what this cycle serves, i.e. w - (upos + frames)) - readBehind
+    // itself is a *start*-gap (w - upos at the instant of a fresh resync).
+    // Comparing gap directly against readBehind + 480 mixes the two scales
+    // and is off by `frames`: for a 1024-frame reader that's over double
+    // the intended slack, so the trim would almost never fire. normalEndGap
+    // (readBehind - frames) is what `gap` actually settles to in steady
+    // state right after a resync, so comparing against normalEndGap + 480
+    // measures the intended ~480-frame surplus, on the same scale, for any
+    // frame size.
     const int64_t gap = static_cast<int64_t>(w) - static_cast<int64_t>(upos + frames);
-    const int64_t trimThreshold = static_cast<int64_t>(readBehind) + 480;
+    const int64_t normalEndGap = static_cast<int64_t>(readBehind) - static_cast<int64_t>(frames);
+    const int64_t trimThreshold = normalEndGap + 480;
     if (!resync && gap > trimThreshold) {
         const uint64_t windowStart = marginWindowStartNs_.load(std::memory_order_relaxed);
         if (windowStart == 0) {
@@ -311,7 +387,13 @@ void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint6
             if (nowNs - windowStart >= 500'000'000ull) {
                 const uint64_t minGap = marginWindowMinGap_.load(std::memory_order_relaxed);
                 if (static_cast<int64_t>(minGap) > trimThreshold) {
-                    const int64_t trimmedOff = static_cast<int64_t>(w - readBehind) - st;
+                    // Shift the offset forward by exactly the sustained
+                    // surplus (minGap - normalEndGap), landing the new
+                    // end-gap at normalEndGap - the normal depth - rather
+                    // than recomputing from w - readBehind (which would
+                    // re-derive a start-gap and reintroduce the same
+                    // start/end mismatch this fix corrects).
+                    const int64_t trimmedOff = off + (static_cast<int64_t>(minGap) - normalEndGap);
                     micState_.store(PackMicState(true, trimmedOff), std::memory_order_relaxed);
                     underrunStreak_.store(0, std::memory_order_relaxed);
                     underrunDeficit_.store(0, std::memory_order_relaxed);

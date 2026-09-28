@@ -710,6 +710,65 @@ static void endAlignedMultiClientNoReplayTest() {
     }
 }
 
+// Fix (1) (client slots never released): before ReleaseClientSlot, a
+// per-client table slot claimed by a HAL client that then disconnects was
+// never freed - after kMaxTrackedMicClients (16) distinct clients over
+// coreaudiod's lifetime, the guard "fails open" (FindOrCreateClientSlot
+// returns nullptr) for every new client from then on, silently disabling
+// the replay guard for all of them. Simulate more than 16 clients
+// connecting, reading once, and disconnecting in sequence - mirroring what
+// IOStateHandler::OnRemoveClient now does via ReleaseClientSlot - then a
+// brand new client hits a large backward sampleTime jump (a resync landing
+// back on already-served audio). It must still be fully guarded: zero
+// replayed samples, regardless of how many clients came and went before it.
+static void clientSlotsReleasedNoLeakTest() {
+    for (int priorClients : {15, 16, 20}) {
+        const std::string name = "/rmslots." + std::to_string(priorClients) + "." + std::to_string(getpid());
+        SharedRegion r;
+        assert(r.Create(name.c_str()));
+        SharedLayout* l = r.layout();
+        const uint64_t now = 25'000'000'000;
+
+        writeMicIndexed(l, 6000, now);
+        float out[512];
+
+        // `priorClients` HAL clients come and go, one at a time.
+        for (int id = 100; id < 100 + priorClients; id++) {
+            r.ReadMic(1000, out, 512, now, static_cast<uint32_t>(id));
+            r.ReleaseClientSlot(static_cast<uint32_t>(id));
+        }
+
+        // A brand new client (never seen before) reads steadily...
+        const uint32_t me = 999;
+        double maxServed = -1;
+        double sampleTime = 2000;
+        auto checkAndTrack = [&](double pos) {
+            for (uint32_t i = 0; i < 512; i++) {
+                if (out[i] == 0.f) continue;
+                const double p = pos + i;
+                assert(out[i] == static_cast<float>(p));
+                assert(p >= maxServed);  // never replay an already-served position
+                if (p + 1 > maxServed) maxServed = p + 1;
+            }
+        };
+        for (int c = 0; c < 4; c++) {
+            writeMicIndexed(l, 512, now);
+            r.ReadMic(sampleTime, out, 512, now, me);
+            checkAndTrack(sampleTime + r.DebugMicOffset());
+            sampleTime += 512;
+        }
+        // ...then takes a large backward sampleTime jump, forcing a resync
+        // that lands back on a range it already read. With slots properly
+        // released, `me` gets its own clean slot regardless of how many
+        // clients came before it, and the guard must mask that overlap:
+        // zero replay.
+        r.ReadMic(-1'000'000, out, 512, now, me);
+        checkAndTrack(-1'000'000 + r.DebugMicOffset());
+
+        r.Destroy();
+    }
+}
+
 // Fix (3): a resync can legitimately land the anchor deeper than the
 // current steady-state readBehind - e.g. against a write edge that had
 // briefly raced ahead without quite crossing the "burst" resync bound
@@ -718,55 +777,84 @@ static void endAlignedMultiClientNoReplayTest() {
 // one-off), the anchor should be trimmed forward, once, back to the normal
 // depth after about half a second of simulated host time - the skipped
 // positions were never served to anyone, so this isn't a replay.
-static void anchorDepthForwardTrimTest() {
-    const std::string name = "/rmtest.trim." + std::to_string(getpid());
+//
+// Re-review: the trim must compare like with like. `gap` here is an
+// *end*-gap (write edge minus the end of what a cycle serves,
+// w - (pos + frames)); readBehind is a *start*-gap (w - pos right at a
+// fresh resync). The steady-state end-gap right after any resync is
+// normalEndGap = readBehind - frames, which - since readBehind is always
+// exactly frames + kMicLatencyFrames for a single client - works out to a
+// frame-size-independent kMicLatencyFrames (960) here. Comparing `gap`
+// against readBehind + 480 (mixing the two scales) would be off by
+// `frames`, so for a 1024-frame reader the effective slack more than
+// doubles and the trim almost never fires; comparing against
+// normalEndGap + 480 is the intended, scale-consistent threshold.
+static void anchorDepthForwardTrimTest(uint32_t frames, int64_t extraJump) {
+    const std::string name =
+        "/rmtrim." + std::to_string(frames) + "." + std::to_string(extraJump) + "." + std::to_string(getpid());
     SharedRegion r;
     assert(r.Create(name.c_str()));
     SharedLayout* l = r.layout();
-    uint64_t now = 24'000'000'000;
-    const uint32_t frames = 512;
-    const uint64_t nsPerCycle = static_cast<uint64_t>(frames) * (1'000'000'000ull / 48000);  // ~10.67ms
+    uint64_t now = 26'000'000'000;
+    const uint64_t nsPerCycle = static_cast<uint64_t>(frames) * (1'000'000'000ull / 48000);
 
     writeMic(l, 1.f, 4800, now);
-    float out[frames];
+    std::vector<float> out(frames);
     double sampleTime = 1000;
 
-    r.ReadMic(sampleTime, out, frames, now);  // first sync: readBehind = 1472, gap = 960
+    r.ReadMic(sampleTime, out.data(), frames, now);  // first sync: end-gap settles at normalEndGap
     for (float f : out) assert(f == 1.f);
     const int64_t offset0 = r.DebugMicOffset();
 
-    // Inflate the gap into the "gray zone" above readBehind+480 (1952) but
-    // safely under the burst-resync bound readBehind+1440 (2912): write
-    // 1240 frames more than the normal per-cycle amount once, pushing gap
-    // from the steady 960 to 2200, without itself triggering any existing
-    // resync condition.
-    writeMic(l, 1.f, frames + 1240, now);
+    // Inflate the end-gap by `extraJump` frames in one shot - comfortably
+    // under the "burst" resync bound (start-gap > readBehind + 1440) but,
+    // for extraJump in {900, 1200}, above normalEndGap (960) + 480 (1440).
+    writeMic(l, 1.f, frames + static_cast<uint32_t>(extraJump), now);
     sampleTime += frames;
-    r.ReadMic(sampleTime, out, frames, now);
+    r.ReadMic(sampleTime, out.data(), frames, now);
     for (float f : out) assert(f == 1.f);
     assert(r.DebugMicOffset() == offset0);  // confirms the bump alone didn't resync
 
-    // Hold that excess gap steady (writer and reader both advancing by
-    // `frames` per cycle from here, so the ~2200-frame gap neither grows
-    // nor shrinks) for a bit over 600ms of simulated host time.
-    const int cycles = static_cast<int>((600'000'000ull + nsPerCycle - 1) / nsPerCycle);
+    // Hold that excess steady for a bit over 700ms of simulated host time,
+    // with a small (deterministic, zero-mean every 2 cycles) sawtooth
+    // jitter on the writer's per-cycle amount - the trim must survive
+    // ordinary write-timing jitter rather than needing a perfectly flat
+    // gap to ever fire.
+    const int cycles = static_cast<int>((700'000'000ull + nsPerCycle - 1) / nsPerCycle);
+    int resyncs = 0;
+    int64_t lastOffset = offset0;
     for (int cycle = 0; cycle < cycles; cycle++) {
-        writeMic(l, 1.f, frames, now);
+        const int32_t jitter = (cycle % 2 == 0) ? 48 : -48;
+        writeMic(l, 1.f, static_cast<uint32_t>(static_cast<int64_t>(frames) + jitter), now);
         sampleTime += frames;
         now += nsPerCycle;
-        r.ReadMic(sampleTime, out, frames, now);
+        r.ReadMic(sampleTime, out.data(), frames, now);
         for (float f : out) assert(f == 1.f);  // never underruns while/after trimming
+        const int64_t offset = r.DebugMicOffset();
+        if (offset != lastOffset) resyncs++;
+        lastOffset = offset;
     }
 
-    // The anchor must have been trimmed forward, once, back to the normal
-    // depth - not left sitting on the ~2200-frame surplus forever.
-    assert(r.DebugMicOffset() != offset0);
+    // The anchor must have been trimmed forward - exactly once, not
+    // repeatedly thrashing - back to (near) the normal depth, not left
+    // sitting on the extraJump-frame surplus forever.
+    assert(resyncs == 1);
+    const int64_t readBehind = static_cast<int64_t>(readBehindFor(frames));
+    const int64_t normalEndGap = readBehind - static_cast<int64_t>(frames);
     const uint64_t w = l->mic.h.write_pos.load();
-    const double posAfter = sampleTime + static_cast<double>(r.DebugMicOffset());
+    const double posAfter = sampleTime + static_cast<double>(lastOffset);
     const int64_t gapAfter = static_cast<int64_t>(w) - static_cast<int64_t>(posAfter) - static_cast<int64_t>(frames);
-    assert(gapAfter >= 0 && gapAfter <= static_cast<int64_t>(readBehindFor(frames)) + 480);
+    assert(gapAfter >= 0 && gapAfter <= normalEndGap + 480);
 
     r.Destroy();
+}
+
+static void anchorDepthForwardTrimSuiteTest() {
+    for (uint32_t frames : {512u, 1024u}) {
+        for (int64_t extraJump : {900, 1200}) {
+            anchorDepthForwardTrimTest(frames, extraJump);
+        }
+    }
 }
 
 // Fix (4): the app stores app_heartbeat_ns = 0 the instant it stops being
@@ -845,7 +933,8 @@ int main() {
     handoffNeverReplaysPreviousSessionTest();
     quickRestartNoReplayTest();
     endAlignedMultiClientNoReplayTest();
-    anchorDepthForwardTrimTest();
+    clientSlotsReleasedNoLeakTest();
+    anchorDepthForwardTrimSuiteTest();
     largeReaderStableNoResyncTest();
     heartbeatZeroSilenceTest();
 

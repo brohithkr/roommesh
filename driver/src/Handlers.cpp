@@ -12,12 +12,12 @@ void MicIOHandler::OnReadClientInput(const std::shared_ptr<aspl::Client>& client
                                      Float64, Float64 timestamp, void* bytes, UInt32 bytesCount) {
     // The client ID keys ReadMic's per-client replay guard (see
     // SharedRegion.hpp) so that one attached client's progress can never
-    // mask another's. Fall back to 0 if the HAL ever hands us a null
-    // client - that just means this read isn't individually guarded,
-    // which is the same fail-open behavior as the tracking table filling
-    // up (see kMaxTrackedMicClients).
+    // mask another's. Fall back to kDefaultClientId if the HAL ever hands
+    // us a null client - that just means this read isn't individually
+    // guarded, which is the same fail-open behavior as the tracking table
+    // filling up (see kMaxTrackedMicClients).
     region_->ReadMic(timestamp, static_cast<float*>(bytes), bytesCount / sizeof(float), HostNowNs(),
-                     client ? client->GetClientID() : 0);
+                     client ? client->GetClientID() : SharedRegion::kDefaultClientId);
 }
 
 void SpeakerIOHandler::OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& stream, Float64, Float64,
@@ -40,6 +40,16 @@ OSStatus IOStateHandler::OnStartIO() {
 }
 void IOStateHandler::OnStopIO() {
     if (auto* l = region_->layout()) (mic_ ? l->header.mic_clients : l->header.speaker_clients).store(0);
+}
+
+void IOStateHandler::OnRemoveClient(std::shared_ptr<aspl::Client> client) {
+    // Release this client's per-client replay-guard slot (see
+    // SharedRegion::ReleaseClientSlot) so a long-running coreaudiod process
+    // doesn't permanently lose a slot to every client that has ever
+    // connected and later disconnected (Meet, Zoom, etc. starting and
+    // stopping over the machine's uptime) - without this, the table
+    // eventually fills and new clients' reads stop being guarded at all.
+    if (mic_ && client) region_->ReleaseClientSlot(client->GetClientID());
 }
 
 OSStatus DriverInit::OnInitialize() {

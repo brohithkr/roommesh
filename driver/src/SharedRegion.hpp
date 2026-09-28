@@ -22,11 +22,19 @@ public:
     int LastErrno() const { return lastErrno_; }
     const char* LastStep() const { return lastStep_; }
 
+    // Sentinel clientId for ReadMic callers that don't track individual HAL
+    // clients (tests, or any single-client caller). A dedicated value
+    // rather than a plausible-looking real ID (e.g. 0) so it can never
+    // collide with - and share replay-guard state with - an actual
+    // aspl::Client::GetClientID().
+    static constexpr uint32_t kDefaultClientId = 0xFFFFFFFEu;
+
     // Serve `frames` mono samples for the RoomMesh Microphone IO cycle at device sample time
     // `sampleTime`, for the client identified by `clientId` (from aspl::Client::GetClientID();
-    // defaults to 0 for callers - tests, or a driver build with only one client - that don't
-    // distinguish clients). Every client in the same cycle passes the same sampleTime and
-    // receives the same audio.
+    // defaults to kDefaultClientId - a value no real aspl client ID collides with - for
+    // callers, such as tests or a driver build with only one client, that don't distinguish
+    // clients). Every client in the same cycle passes the same sampleTime and receives the
+    // same audio.
     //
     // Reads at least max(kMicLatencyFrames, maxFramesSeen_ + kMicLatencyFrames) frames behind the
     // app's write edge (see ReadMic's `readBehind` in SharedRegion.cpp; maxFramesSeen_ is a
@@ -46,7 +54,7 @@ public:
     // personally received it. An anchor that ends up deeper than necessary (e.g. after a
     // resync computed against a since-departed larger client's margin) is trimmed forward,
     // once, after it's held a persistent margin surplus for about half a second.
-    void ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs, uint32_t clientId = 0);
+    void ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs, uint32_t clientId = kDefaultClientId);
     // Store the mixed RoomMesh Speaker output (interleaved `channels`) downmixed to mono.
     void WriteSpeaker(const float* interleaved, uint32_t frames, uint32_t channels, uint64_t nowNs);
     void Heartbeat(uint64_t nowNs);
@@ -63,6 +71,20 @@ public:
     // forcing a fresh resync also avoids the extra silence a stale offset would otherwise cost
     // before the guard's high-water mark naturally caught back up).
     void ResetIOStats();
+
+    // Releases this client's per-client replay-guard slot (see
+    // micClientServed_ below), if it has one. Call from
+    // IOStateHandler::OnRemoveClient (the mic's ControlRequestHandler) when
+    // a HAL client disconnects, so the table doesn't permanently lose a
+    // slot to every client that has ever connected over coreaudiod's
+    // lifetime - a long-running coreaudiod process can see far more than
+    // kMaxTrackedMicClients distinct clients over time (Meet, Zoom, etc.
+    // starting and stopping), and without this, the table eventually fills
+    // and every *new* client's reads silently stop being guarded at all
+    // (fail open). Clears servedEnd before releasing the clientId, so a
+    // slot a new client immediately claims can never observe a stale
+    // high-water mark left over from whoever held it before.
+    void ReleaseClientSlot(uint32_t clientId);
 
     // Test-only introspection: the current sampleTime -> ring-position mapping
     // ReadMic is using (see micState_ below). Exposed so tests can assert that
@@ -146,23 +168,42 @@ private:
     // per-client sampleTime cadences, sharing one anchor). Sized generously
     // for how many processes could plausibly read "RoomMesh Microphone" at
     // once; look-up is a short linear scan (realtime-safe: no locks, no
-    // allocation). If every slot is ever in use by a still-active client
-    // and a new one shows up, that new client's reads simply aren't
-    // guarded (fail open to serving audio rather than wrongly silencing or
-    // wrongly guarding an unrelated client) - `kMaxTrackedMicClients` is
-    // set well above any realistic number of simultaneous consumers of
-    // this virtual device.
+    // allocation).
+    //
+    // Slots are released explicitly (see ReleaseClientSlot(), called from
+    // IOStateHandler::OnRemoveClient) rather than only ever being claimed -
+    // without that, a long-running coreaudiod process would eventually see
+    // more than kMaxTrackedMicClients distinct clients over its lifetime
+    // and permanently run out of slots. As a fallback (in case some client
+    // disconnects through a path that doesn't reach OnRemoveClient), a slot
+    // idle for over ~1s is also eligible to be reclaimed by a new client.
+    // If every slot is nonetheless in use by a still-active client and a
+    // new one shows up, that new client's reads simply aren't guarded
+    // (fail open to serving audio rather than wrongly silencing or wrongly
+    // guarding an unrelated client) - kMaxTrackedMicClients is set well
+    // above any realistic number of simultaneous consumers of this virtual
+    // device, so this should never be reached in practice.
     static constexpr uint32_t kNoClient = 0xFFFFFFFFu;
     static constexpr int kMaxTrackedMicClients = 16;
+    static constexpr uint64_t kClientSlotIdleNs = 1'000'000'000ull;
     struct ClientServedEnd {
         std::atomic<uint32_t> clientId{kNoClient};
         std::atomic<uint64_t> servedEnd{0};
+        std::atomic<uint64_t> lastSeenNs{0};
     };
     ClientServedEnd micClientServed_[kMaxTrackedMicClients];
-    // Finds this client's slot, claiming a free one on first use. Returns
-    // nullptr if the table is full and clientId isn't already tracked (see
+    // Finds this client's slot, claiming a free (or long-idle) one on first
+    // use and resetting its servedEnd to 0. Returns nullptr if the table is
+    // full of still-active clients and clientId isn't already tracked (see
     // kMaxTrackedMicClients above).
-    ClientServedEnd* FindOrCreateClientSlot(uint32_t clientId);
+    ClientServedEnd* FindOrCreateClientSlot(uint32_t clientId, uint64_t nowNs);
+    // Resets every mic-side tracking field (micState_ through
+    // micClientServed_) to its fresh-construction state. Called from
+    // Create() so a SharedRegion reused across more than one shm region
+    // (e.g. a driver re-init) never carries stale bookkeeping - an offset,
+    // a client's high-water mark, an in-progress trim window - into a
+    // brand new region whose write_pos starts back at 0.
+    void ResetMicTrackingState();
 
     // One-time forward anchor trim (see ReadMic): tracks how long the
     // margin between the write edge and what's actually being served has
