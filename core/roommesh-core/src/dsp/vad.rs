@@ -22,6 +22,8 @@ pub struct Vad {
     window: Vec<f32>,
     input: Vec<f32>,
     spectrum: Vec<Complex<f32>>,
+    /// Reusable scratch buffer for per-bin power, sized to `spectrum` and refilled each call.
+    power: Vec<f32>,
     noise_floor_db: f32,
     prob: f32,
     hangover: u32,
@@ -36,12 +38,24 @@ impl Vad {
         let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_LEN);
         let input = fft.make_input_vec();
         let spectrum = fft.make_output_vec();
+        let power = vec![0.0f32; spectrum.len()];
         let window = (0..480).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / 479.0).cos()).collect();
-        Self { fft, window, input, spectrum, noise_floor_db: -60.0, prob: 0.0, hangover: 0, frames: 0, speech: false }
+        Self { fft, window, input, spectrum, power, noise_floor_db: -60.0, prob: 0.0, hangover: 0, frames: 0, speech: false }
     }
 
     pub fn process(&mut self, frame: &[f32]) -> VadResult {
         let level_db = measure(frame).rms_db;
+        if !level_db.is_finite() {
+            // Garbage/non-finite input: report a sane "silence" reading without perturbing any
+            // tracked state (noise floor, probability, hangover, frame count).
+            return VadResult {
+                speech_prob: self.prob,
+                is_speech: self.speech,
+                level_db: -120.0,
+                noise_floor_db: self.noise_floor_db,
+                snr_db: 0.0,
+            };
+        }
         for (i, x) in self.input.iter_mut().enumerate() {
             *x = if i < frame.len() && i < 480 { frame[i] * self.window[i] } else { 0.0 };
         }
@@ -49,7 +63,8 @@ impl Vad {
         let lo = (300.0 / BIN_HZ) as usize;
         let voice_hi = (3400.0 / BIN_HZ) as usize;
         let flat_hi = (4000.0 / BIN_HZ) as usize;
-        let power: Vec<f32> = self.spectrum.iter().map(|c| c.norm_sqr() + 1e-12).collect();
+        for (p, c) in self.power.iter_mut().zip(self.spectrum.iter()) { *p = c.norm_sqr() + 1e-12; }
+        let power = &self.power;
         let band = &power[lo..=flat_hi];
         let geo = (band.iter().map(|p| p.ln()).sum::<f32>() / band.len() as f32).exp();
         let arith = band.iter().sum::<f32>() / band.len() as f32;
@@ -72,6 +87,7 @@ impl Vad {
         if level_db < -75.0 { logit = -10.0; }
         let inst = 1.0 / (1.0 + (-logit).exp());
         self.prob = 0.6 * self.prob + 0.4 * inst;
+        if !self.prob.is_finite() { self.prob = 0.0; }
         if self.prob > 0.6 {
             self.speech = true;
             self.hangover = 15;
@@ -121,5 +137,23 @@ mod tests {
         assert!(speech[50].snr_db > 15.0);
         let after: Vec<VadResult> = (0..100).map(|_| v.process(&noise(&mut rng, -50.0))).collect();
         assert!(after[70..].iter().all(|r| !r.is_speech));
+    }
+    #[test]
+    fn non_finite_frame_is_handled_without_corrupting_state() {
+        let mut v = Vad::new();
+        let mut rng = Rng(3);
+        for _ in 0..20 { v.process(&noise(&mut rng, -40.0)); }
+        let prev = v.process(&noise(&mut rng, -40.0));
+        let nan_frame = vec![f32::NAN; 480];
+        let r = v.process(&nan_frame);
+        assert!(r.speech_prob.is_finite());
+        assert_eq!(r.speech_prob, prev.speech_prob);
+        assert_eq!(r.is_speech, prev.is_speech);
+        assert_eq!(r.level_db, -120.0);
+        assert_eq!(r.snr_db, 0.0);
+        // Subsequent normal frames still behave sanely: state was not corrupted.
+        let after = v.process(&noise(&mut rng, -40.0));
+        assert!(after.speech_prob.is_finite());
+        assert!(!after.is_speech);
     }
 }

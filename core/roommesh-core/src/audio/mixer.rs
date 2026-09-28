@@ -7,17 +7,18 @@ use std::collections::BTreeMap;
 
 pub struct Mixer { fade_samples: usize, gains: BTreeMap<PeerId, FadeGain>, norm: LinearRamp }
 
+/// Soft-knee limiter: passes `|x| <= 0.9` through unchanged, and above that asymptotically
+/// approaches (but never reaches) +/-1.0 via a rational knee. Never produces NaN or infinity:
+/// a non-finite input returns 0.0.
 pub fn soft_clip(x: f32) -> f32 {
     const T: f32 = 0.9;
+    if x.is_nan() { return 0.0; }
     let a = x.abs();
     if a <= T {
         x
     } else {
-        // Rational (x / (1 + x)) knee rather than tanh: tanh((a - T) / (1 - T)) rounds to
-        // exactly 1.0f32 for any a beyond ~T + 4*(1-T), which would make this saturate to
-        // exactly unity instead of staying strictly below it.
         let z = (a - T) / (1.0 - T);
-        x.signum() * (T + (1.0 - T) * (z / (1.0 + z)))
+        x.signum() * (T + (1.0 - T) * (1.0 - 1.0 / (1.0 + z)))
     }
 }
 
@@ -34,17 +35,25 @@ impl Mixer {
         self.norm.set_target(1.0 / (sel.count().max(1) as f32).sqrt());
     }
     pub fn mix(&mut self, inputs: &BTreeMap<PeerId, Vec<f32>>, out: &mut [f32]) {
-        out.fill(0.0);
-        for (i, o) in out.iter_mut().enumerate() {
-            let n = self.norm.next();
-            let mut acc = 0.0;
-            for (peer, g) in self.gains.iter_mut() {
-                let gv = g.next();
-                if gv > 0.0 {
-                    if let Some(x) = inputs.get(peer).and_then(|v| v.get(i)) { acc += gv * n * x; }
+        // Accumulate each gain's contribution over the whole frame before touching the
+        // normalization ramp: `n` is the same per output sample regardless of how many peers
+        // contribute to it, so `sum_peers(gv * x) * n == sum_peers(gv * n * x)` and the result is
+        // identical to applying `n` per-peer, just computed with the loops the other way around.
+        if self.gains.is_empty() {
+            out.fill(0.0);
+        } else {
+            for (gi, (peer, g)) in self.gains.iter_mut().enumerate() {
+                let input = inputs.get(peer);
+                for (i, o) in out.iter_mut().enumerate() {
+                    let gv = g.next();
+                    let contrib = if gv > 0.0 { input.and_then(|v| v.get(i)).map_or(0.0, |x| gv * x) } else { 0.0 };
+                    if gi == 0 { *o = contrib; } else { *o += contrib; }
                 }
             }
-            *o = soft_clip(acc);
+        }
+        for o in out.iter_mut() {
+            let n = self.norm.next();
+            *o = soft_clip(*o * n);
         }
         self.gains.retain(|_, g| !g.is_silent());
     }
@@ -108,5 +117,13 @@ mod tests {
     fn soft_clip_bounds_output() {
         assert!(soft_clip(5.0) < 1.0);
         assert_eq!(soft_clip(0.5), 0.5);
+    }
+    #[test]
+    fn soft_clip_handles_non_finite() {
+        assert!(soft_clip(f32::INFINITY).is_finite());
+        assert!(soft_clip(f32::INFINITY) <= 1.0);
+        assert!(soft_clip(f32::NEG_INFINITY).is_finite());
+        assert!(soft_clip(f32::NEG_INFINITY) >= -1.0);
+        assert_eq!(soft_clip(f32::NAN), 0.0);
     }
 }

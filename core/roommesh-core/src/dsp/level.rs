@@ -37,12 +37,16 @@ impl EnvelopeTracker {
     pub fn correlation(&self, other: &EnvelopeTracker) -> f32 {
         let n = self.hist.len().min(other.hist.len());
         if n < 5 { return 0.0; }
-        let a: Vec<f32> = self.hist.iter().rev().take(n).copied().collect();
-        let b: Vec<f32> = other.hist.iter().rev().take(n).copied().collect();
-        let (ma, mb) = (a.iter().sum::<f32>() / n as f32, b.iter().sum::<f32>() / n as f32);
+        // Iterate the two VecDeques' tails directly (no intermediate Vec allocations); `pairs()`
+        // is a cheap closure so we can make the same zipped iterator twice, once for the means
+        // and once for the (co)variances.
+        let pairs = || self.hist.iter().rev().take(n).zip(other.hist.iter().rev().take(n));
+        let (mut sa, mut sb) = (0.0f32, 0.0f32);
+        for (&x, &y) in pairs() { sa += x; sb += y; }
+        let (ma, mb) = (sa / n as f32, sb / n as f32);
         let (mut sab, mut saa, mut sbb) = (0.0f32, 0.0f32, 0.0f32);
-        for i in 0..n {
-            let (da, db) = (a[i] - ma, b[i] - mb);
+        for (&x, &y) in pairs() {
+            let (da, db) = (x - ma, y - mb);
             sab += da * db; saa += da * da; sbb += db * db;
         }
         if saa <= 1e-9 || sbb <= 1e-9 { 0.0 } else { sab / (saa.sqrt() * sbb.sqrt()) }

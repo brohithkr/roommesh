@@ -60,15 +60,14 @@ impl TimelineReader {
                 }
             }
             Some(expected) if idx < expected => {
+                // A genuine stream restart (index reset alongside a time jump) is already caught
+                // above by the timestamp-discontinuity check, which resets `next_index` to `None`
+                // before we ever reach this arm. What's left here is a plain overlap: trim the
+                // already-seen prefix and splice the rest onto the existing segment.
                 let overlap = (expected - idx) as usize;
                 if overlap >= data.len() { return; }
-                if expected - idx > self.max_samples as u64 { // stream restarted from scratch
-                    self.reset();
-                    self.base_index = idx;
-                } else {
-                    data = &data[overlap..];
-                    idx = expected;
-                }
+                data = &data[overlap..];
+                idx = expected;
             }
             _ => {}
         }
@@ -76,9 +75,10 @@ impl TimelineReader {
         self.fit.push(first_index as f64 - oi as f64, timestamp_ns as f64 - ot as f64);
         self.buf.extend(data.iter().copied());
         self.next_index = Some(idx + data.len() as u64);
-        while self.buf.len() > self.max_samples {
-            self.buf.pop_front();
-            self.base_index += 1;
+        if self.buf.len() > self.max_samples {
+            let drop = self.buf.len() - self.max_samples;
+            self.buf.drain(..drop);
+            self.base_index += drop as u64;
         }
     }
 
