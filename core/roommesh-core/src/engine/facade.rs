@@ -445,7 +445,6 @@ impl ControlLoop {
             }
             TransportEvent::Control { peer, frame } => match self.control.on_frame(peer, &frame) {
                 Ok(out) => {
-                    let restarting = out.reply.is_some();
                     if let Some(r) = out.reply {
                         self.transport.send_control(peer, r);
                     }
@@ -465,14 +464,18 @@ impl ControlLoop {
                         Some(ControlEvent::Message { from, msg }) => {
                             self.engine.on_message(now, from, msg)
                         }
+                        // A legitimate in-band re-open (HELLO_REQUEST we answered, or a peer
+                        // that's still connected but restarted): notify the engine only, the
+                        // connection itself is fine (or already being re-handshaked over).
                         Some(ControlEvent::SessionDown(p)) => {
                             self.engine.on_session_down(now, p);
-                            // Crypto desync: tear the connection down so both sides start over.
-                            // A HELLO_REQUEST answered with a fresh Hello (`restarting`) is
-                            // already re-handshaking over this connection — keep it.
-                            if !restarting {
-                                self.transport.disconnect(p);
-                            }
+                        }
+                        // Crypto desync with no re-open in progress: the connection itself is
+                        // suspect, so tear it down too and let a fresh `on_connected` start a
+                        // clean handshake.
+                        Some(ControlEvent::SessionFailed(p)) => {
+                            self.engine.on_session_down(now, p);
+                            self.transport.disconnect(p);
                         }
                         None => {}
                     }
