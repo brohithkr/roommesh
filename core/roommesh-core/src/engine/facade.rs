@@ -27,9 +27,9 @@ use crate::engine::runtime::{
 };
 use crate::ids::{Epoch, PeerId, StreamId};
 use crate::network::clock_sync::ClockSample;
-use crate::network::control::{ControlChannel, ControlEvent, RtSessions};
+use crate::network::control::{ControlChannel, ControlError, ControlEvent, RtSessions};
 use crate::network::realtime::{decode_packet, decode_times, encode_times, PacketKind, RtHeader};
-use crate::network::secure::RtCipher;
+use crate::network::secure::{RtCipher, SecureError};
 use crate::network::transport::{LocalAdvertisement, PeerTransport, TransportEvent};
 use crate::room::engine::{Command, Output, RoomConfig, RoomEngine, RoomError};
 use crate::room::events::*;
@@ -51,6 +51,10 @@ const QUALITY_MS: u64 = 1_000;
 const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// Minimum spacing between two `connect` calls to the same peer.
 const CONNECT_INTERVAL_MS: u64 = 2_000;
+/// A peer whose handshake failed on the protocol version is not dialed for this long, doubling
+/// per failed retry up to the max (see [`VersionBackoff`]).
+const VERSION_BACKOFF_MIN_MS: u64 = 60_000;
+const VERSION_BACKOFF_MAX_MS: u64 = 600_000;
 /// How long `Core::command` waits for the control thread's answer.
 const COMMAND_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(500)
@@ -197,6 +201,34 @@ impl ReplayWindow {
     }
 }
 
+/// Redial backoff for a peer that runs an incompatible RoomMesh (its handshake failed on the
+/// protocol version): without it, the handshake watchdog and the engine's redials would retry
+/// it every few seconds forever. Only our own dials are held back; its dials to us still run
+/// the handshake (it may have been updated), and a session that comes up clears the backoff.
+#[derive(Default)]
+struct VersionBackoff {
+    until_ms: u64,
+    delay_ms: u64,
+}
+
+impl VersionBackoff {
+    /// Records a version failure at `now`. The delay doubles only for a failure after the
+    /// previous backoff ran out (a retry that failed again), not for more failures within it.
+    fn failed(&mut self, now: u64) {
+        self.delay_ms = if self.delay_ms == 0 {
+            VERSION_BACKOFF_MIN_MS
+        } else if now >= self.until_ms {
+            (self.delay_ms * 2).min(VERSION_BACKOFF_MAX_MS)
+        } else {
+            return;
+        };
+        self.until_ms = now + self.delay_ms;
+    }
+    fn blocks(&self, now: u64) -> bool {
+        now < self.until_ms
+    }
+}
+
 impl Core {
     pub fn new(
         cfg: CoreConfig,
@@ -237,6 +269,7 @@ impl Core {
             runtime_tx: runtime.sender(),
             runtime_shared: runtime_shared.clone(),
             last_connect: HashMap::new(),
+            version_backoff: HashMap::new(),
             last_tick_ms: 0,
             last_quality: HashMap::new(),
             last_quality_ms: 0,
@@ -492,6 +525,8 @@ struct ControlLoop {
     runtime_tx: RuntimeSender,
     runtime_shared: Arc<RuntimeShared>,
     last_connect: HashMap<PeerId, u64>,
+    /// Peers running an incompatible protocol version (see [`VersionBackoff`]).
+    version_backoff: HashMap<PeerId, VersionBackoff>,
     last_tick_ms: u64,
     last_quality: HashMap<PeerId, ConnectionQuality>,
     last_quality_ms: u64,
@@ -601,6 +636,7 @@ impl ControlLoop {
                     }
                     match out.event {
                         Some(ControlEvent::SessionUp { peer, name, sas }) => {
+                            self.version_backoff.remove(&peer);
                             self.engine.on_session_up(now, peer, name, sas);
                         }
                         Some(ControlEvent::Message {
@@ -639,9 +675,33 @@ impl ControlLoop {
                         None => {}
                     }
                 }
+                Err(ControlError::Secure(SecureError::Version(v))) => {
+                    self.incompatible(now, peer, v)
+                }
                 Err(e) => log::warn!("control frame from {peer}: {e}"),
             },
             TransportEvent::Realtime(_) => {} // handled on the caller's thread
+        }
+    }
+
+    /// `peer`'s handshake failed on its protocol version `version`: back off redialing it, and
+    /// tell the user once (until a session with it comes up).
+    fn incompatible(&mut self, now: u64, peer: PeerId, version: u16) {
+        log::warn!(
+            "{peer} speaks protocol version {version}, we speak {PROTOCOL_VERSION}; backing off"
+        );
+        let first = !self.version_backoff.contains_key(&peer);
+        self.version_backoff.entry(peer).or_default().failed(now);
+        if first {
+            let name = self
+                .engine
+                .nearby_peers()
+                .into_iter()
+                .find(|n| n.id == peer && !n.name.is_empty())
+                .map_or_else(|| "A nearby Mac".to_string(), |n| n.name);
+            self.sink.on_event(RoomEvent::Error {
+                message: format!("{name} runs an incompatible RoomMesh version"),
+            });
         }
     }
 
@@ -717,7 +777,8 @@ impl ControlLoop {
                     let due = self
                         .last_connect
                         .get(&p)
-                        .is_none_or(|t| now.saturating_sub(*t) >= CONNECT_INTERVAL_MS);
+                        .is_none_or(|t| now.saturating_sub(*t) >= CONNECT_INTERVAL_MS)
+                        && !self.version_backoff.get(&p).is_some_and(|b| b.blocks(now));
                     if due {
                         self.last_connect.insert(p, now);
                         self.transport.connect(p);
@@ -1321,6 +1382,86 @@ mod tests {
         wait("window pruned on session down", 3, || {
             !a.core.cache.ping_replay.lock().contains_key(&PeerId(2))
         });
+    }
+
+    #[test]
+    fn version_backoff_grows_per_failed_retry_up_to_ten_minutes() {
+        let mut b = VersionBackoff::default();
+        assert!(!b.blocks(0));
+        b.failed(1_000);
+        assert_eq!(b.until_ms, 61_000);
+        b.failed(30_000); // e.g. its own dial, within the backoff: unchanged
+        assert_eq!(b.until_ms, 61_000);
+        assert!(b.blocks(60_999) && !b.blocks(61_000));
+        b.failed(70_000);
+        assert_eq!(b.until_ms, 70_000 + 120_000);
+        let mut t = 200_000;
+        for _ in 0..10 {
+            b.failed(t);
+            t = b.until_ms;
+        }
+        assert_eq!(b.delay_ms, VERSION_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn incompatible_peer_is_reported_once_and_not_redialed() {
+        use crate::network::secure::{Hello, FRAME_HELLO};
+        let net = LoopbackNetwork::new();
+        let a = node(&net, 5, Box::new(NullAudio));
+        let (tx, rx) = unbounded();
+        let old = net.transport(PeerId(1), tx);
+        old.start(LocalAdvertisement {
+            peer_id: PeerId(1),
+            name: "Old Mac".into(),
+            protocol_version: PROTOCOL_VERSION + 1,
+        });
+        wait("A discovers the old Mac", 3, || {
+            a.core.nearby().iter().any(|n| n.id == PeerId(1))
+        });
+        let bad_hello = || {
+            let h = Hello {
+                protocol_version: PROTOCOL_VERSION + 1,
+                peer_id: PeerId(1),
+                name: "Old Mac".into(),
+                public_key: [7; 32],
+                reply_to: None,
+            };
+            let mut f = vec![FRAME_HELLO];
+            f.extend(postcard::to_allocvec(&h).unwrap());
+            f
+        };
+        let reports = || {
+            a.events
+                .0
+                .lock()
+                .iter()
+                .filter(|e| {
+                    matches!(e, RoomEvent::Error { message }
+                        if message == "Old Mac runs an incompatible RoomMesh version")
+                })
+                .count()
+        };
+        // It dials us twice and fails the handshake on the version both times.
+        old.connect(PeerId(5));
+        old.send_control(PeerId(5), bad_hello());
+        wait("the version failure is reported", 3, || reports() == 1);
+        old.disconnect(PeerId(5));
+        old.connect(PeerId(5));
+        old.send_control(PeerId(5), bad_hello());
+        std::thread::sleep(Duration::from_millis(300));
+        old.disconnect(PeerId(5));
+        assert_eq!(reports(), 1, "reported once");
+        // We don't dial it, even with a message queued for it.
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = rx.try_iter().count();
+        a.core
+            .command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        a.core.command(Command::Invite(PeerId(1))).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!rx
+            .try_iter()
+            .any(|e| e == TransportEvent::Connected(PeerId(5))));
     }
 
     #[test]
