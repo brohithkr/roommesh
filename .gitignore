@@ -1,0 +1,9 @@
+.DS_Store
+core/target/
+driver/build/
+app/build/
+app/RoomMesh.xcodeproj/
+app/RoomMesh/RustBridge/Generated/
+app/Frameworks/
+dist/
+*.xcuserstate
