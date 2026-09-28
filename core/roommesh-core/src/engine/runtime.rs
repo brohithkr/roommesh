@@ -37,9 +37,9 @@ use crate::network::transport::PeerTransport;
 use crate::room::events::LocalRoles;
 use crate::room::protocol::PeerReport;
 use crate::time::now_ns;
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Select, Sender, TryRecvError};
 use parking_lot::Mutex;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +81,11 @@ const PLAYBACK_QUEUE_MARGIN_NS: u64 = 15_000_000;
 /// Clock-ping interval while unsynced / once synced.
 const PING_FAST_NS: u64 = 50_000_000;
 const PING_SLOW_NS: u64 = 250_000_000;
+/// Outstanding clock pings remembered for pong matching (replay protection), and how long.
+const MAX_OUTSTANDING_PINGS: usize = 32;
+const PING_TTL_NS: u64 = 1_000_000_000;
+/// Capacity of the lossy realtime-packet queue into the DSP thread.
+const PACKET_QUEUE: usize = 4096;
 /// A far-end chunk whose time disagrees with the previous chunk's end by more than this is a
 /// discontinuity (playback paused/restarted, reader resynced).
 const FAREND_JUMP_NS: u64 = 20_000_000;
@@ -194,6 +199,9 @@ impl AudioBackend for NullAudio {
     }
 }
 
+/// Messages into the DSP thread. `Packet` and `Pong` are realtime traffic and travel on a
+/// bounded, lossy queue; every other message is control and travels on a separate unbounded
+/// queue that the DSP thread drains first, so it is never dropped (see [`AudioRuntime::send`]).
 pub enum RuntimeMsg {
     Roles(LocalRoles),
     Settings(AudioSettings),
@@ -207,8 +215,37 @@ pub enum RuntimeMsg {
     Pong {
         sample: ClockSample,
         from: PeerId,
+        /// Sequence number of the ping this pong answers (echoed in the pong payload).
+        ping_seq: u32,
     },
     Shutdown,
+}
+
+impl RuntimeMsg {
+    /// Realtime traffic (lossy under overload) rather than control.
+    fn is_realtime(&self) -> bool {
+        matches!(self, RuntimeMsg::Packet { .. } | RuntimeMsg::Pong { .. })
+    }
+}
+
+/// Cloneable sending side of an [`AudioRuntime`]: routes control messages to the lossless
+/// queue and realtime traffic to the bounded lossy one.
+#[derive(Clone)]
+pub struct RuntimeSender {
+    control: Sender<RuntimeMsg>,
+    packets: Sender<RuntimeMsg>,
+}
+
+impl RuntimeSender {
+    /// Never blocks. Control messages are never dropped (while the DSP thread lives); a
+    /// realtime message is dropped when its queue is full.
+    pub fn send(&self, m: RuntimeMsg) {
+        if m.is_realtime() {
+            let _ = self.packets.try_send(m);
+        } else {
+            let _ = self.control.send(m);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,7 +274,7 @@ pub struct RuntimeShared {
 }
 
 pub struct AudioRuntime {
-    tx: Sender<RuntimeMsg>,
+    tx: RuntimeSender,
     shared: Arc<RuntimeShared>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -251,7 +288,8 @@ impl AudioRuntime {
         events: Sender<RuntimeEvent>,
         settings: AudioSettings,
     ) -> Self {
-        let (tx, rx) = bounded::<RuntimeMsg>(4096);
+        let (ctl_tx, ctl_rx) = unbounded::<RuntimeMsg>();
+        let (pkt_tx, pkt_rx) = bounded::<RuntimeMsg>(PACKET_QUEUE);
         let shared = Arc::new(RuntimeShared::default());
         let dsp = Dsp::new(
             local,
@@ -266,20 +304,24 @@ impl AudioRuntime {
             .name("roommesh-dsp".into())
             .spawn(move || {
                 raise_thread_qos();
-                dsp.run(rx)
+                dsp.run(ctl_rx, pkt_rx)
             })
             .expect("spawn dsp");
         Self {
-            tx,
+            tx: RuntimeSender {
+                control: ctl_tx,
+                packets: pkt_tx,
+            },
             shared,
             join: Some(join),
         }
     }
-    /// Never blocks: a message is dropped if the queue is full (4096 entries).
+    /// Never blocks. Control messages are lossless; a realtime packet or pong is dropped if
+    /// its queue is full (4096 entries).
     pub fn send(&self, m: RuntimeMsg) {
-        let _ = self.tx.try_send(m);
+        self.tx.send(m);
     }
-    pub fn sender(&self) -> Sender<RuntimeMsg> {
+    pub fn sender(&self) -> RuntimeSender {
         self.tx.clone()
     }
     pub fn shared(&self) -> Arc<RuntimeShared> {
@@ -289,9 +331,7 @@ impl AudioRuntime {
         self.stop();
     }
     fn stop(&mut self) {
-        let _ = self
-            .tx
-            .send_timeout(RuntimeMsg::Shutdown, Duration::from_secs(3));
+        self.tx.send(RuntimeMsg::Shutdown);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -540,6 +580,9 @@ struct Dsp {
     mic_seq: u32,
     farend_seq: u32,
     next_ping_ns: u64,
+    /// Pings awaiting their pong: (sequence, t1). A pong is accepted only for an outstanding
+    /// ping with the same t1, once (replayed or forged-late pongs are ignored).
+    outstanding_pings: VecDeque<(u32, u64)>,
     vdev: VdevMonitor,
     capture: Slot<Capture, CaptureHandle>,
     playback: Slot<Playback, PlaybackHandle>,
@@ -593,6 +636,7 @@ impl Dsp {
             mic_seq: 0,
             farend_seq: 0,
             next_ping_ns: 0,
+            outstanding_pings: VecDeque::new(),
             vdev: VdevMonitor::new(),
             capture: Slot::new(),
             playback: Slot::new(),
@@ -614,26 +658,38 @@ impl Dsp {
         self.enabled && self.roles.room_id.is_some()
     }
 
-    fn run(mut self, rx: Receiver<RuntimeMsg>) {
-        loop {
-            match rx.recv_timeout(TICK) {
-                Ok(m) => {
-                    if !self.handle(m) {
-                        break;
-                    }
-                    let mut shutdown = false;
-                    while let Ok(m) = rx.try_recv() {
-                        if !self.handle(m) {
-                            shutdown = true;
-                            break;
+    /// `control`: lossless control queue, always drained before `packets` (realtime traffic).
+    fn run(mut self, control: Receiver<RuntimeMsg>, packets: Receiver<RuntimeMsg>) {
+        'run: loop {
+            // Wake on either queue or the tick; messages are then handled in priority order.
+            {
+                let mut sel = Select::new();
+                sel.recv(&control);
+                sel.recv(&packets);
+                let _ = sel.ready_timeout(TICK);
+            }
+            loop {
+                // Control first: a role/settings change queued behind packets applies before
+                // them, and between any two packets.
+                loop {
+                    match control.try_recv() {
+                        Ok(m) => {
+                            if !self.handle(m) {
+                                break 'run;
+                            }
                         }
-                    }
-                    if shutdown {
-                        break;
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break 'run,
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                match packets.try_recv() {
+                    Ok(m) => {
+                        if !self.handle(m) {
+                            break 'run;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
             self.step(now_ns());
         }
@@ -671,14 +727,34 @@ impl Dsp {
                 }
                 _ => {}
             },
-            RuntimeMsg::Pong { sample, from } => {
-                if self.roles.coordinator == Some(from) {
+            RuntimeMsg::Pong {
+                sample,
+                from,
+                ping_seq,
+            } => {
+                if self.roles.coordinator == Some(from)
+                    && self.take_ping(ping_seq, sample.t1, sample.t4)
+                {
                     self.clock.add_sample(sample);
                 }
             }
             RuntimeMsg::Shutdown => return false,
         }
         true
+    }
+
+    /// Consumes the outstanding ping `seq` if it was sent at `t1` and has not expired.
+    /// `t4`: when the pong arrived (local clock).
+    fn take_ping(&mut self, seq: u32, t1: u64, t4: u64) -> bool {
+        match self.outstanding_pings.iter().position(|&(s, _)| s == seq) {
+            Some(i)
+                if self.outstanding_pings[i].1 == t1 && t4.saturating_sub(t1) <= PING_TTL_NS =>
+            {
+                self.outstanding_pings.remove(i);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn apply_settings(&mut self, s: AudioSettings) {
@@ -746,6 +822,7 @@ impl Dsp {
         if (old.coordinator, old.epoch) != (new.coordinator, new.epoch) {
             self.clock.reset();
             self.next_ping_ns = 0;
+            self.outstanding_pings.clear();
             let authority = new.coordinator.unwrap_or(self.local);
             if let Some(sp) = self.speaker.as_mut() {
                 sp.set_authority(new.epoch, authority);
@@ -998,6 +1075,12 @@ impl Dsp {
             timestamp_ns: now,
             frame_count: 0,
         };
+        self.outstanding_pings
+            .retain(|&(_, t1)| now.saturating_sub(t1) <= PING_TTL_NS);
+        if self.outstanding_pings.len() >= MAX_OUTSTANDING_PINGS {
+            self.outstanding_pings.pop_front();
+        }
+        self.outstanding_pings.push_back((h.sequence, now));
         send_rt(
             &self.transport,
             &self.sessions,
@@ -1540,5 +1623,166 @@ mod tests {
         // A repeated SetEnabled(true) is a no-op (no reopen).
         d.handle(RuntimeMsg::SetEnabled(true));
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    /// Blocks the DSP thread inside its first virtual-device open until released.
+    struct GatedVdev {
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+    impl AudioBackend for GatedVdev {
+        fn start_capture(&mut self, _: &DeviceSelector) -> Result<CaptureHandle, DeviceError> {
+            Err(DeviceError::NotFound)
+        }
+        fn stop_capture(&mut self) {}
+        fn start_playback(&mut self, _: &DeviceSelector) -> Result<PlaybackHandle, DeviceError> {
+            Err(DeviceError::NotFound)
+        }
+        fn stop_playback(&mut self) {}
+        fn open_virtual_device(&mut self) -> Result<Arc<SharedRegion>, VirtualDeviceError> {
+            let _ = self.entered.try_send(());
+            let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+            Err(VirtualDeviceError::NotFound(libc::ENOENT))
+        }
+    }
+
+    #[test]
+    fn control_messages_survive_a_full_packet_queue() {
+        let (entered_tx, entered) = bounded(1);
+        let (release, release_rx) = bounded(1);
+        let (rt, _ev) = spawn_with(
+            1,
+            Box::new(GatedVdev {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            no_aec(),
+        );
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("DSP thread reached the device open");
+        // The DSP thread is stuck: overflow the packet queue, then queue control behind it.
+        for i in 0..(PACKET_QUEUE as u32 + 1000) {
+            rt.send(RuntimeMsg::Packet {
+                header: RtHeader {
+                    kind: PacketKind::Mic,
+                    epoch: Epoch(1),
+                    stream: StreamId::MIC,
+                    sender: PeerId(2),
+                    sequence: i,
+                    sample_index: 0,
+                    timestamp_ns: 0,
+                    frame_count: 480,
+                },
+                payload: vec![],
+                arrival_ns: 0,
+            });
+        }
+        rt.send(RuntimeMsg::SetEnabled(true));
+        rt.send(RuntimeMsg::Roles(roles(1, 1, 1)));
+        release.send(()).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !rt.shared().is_coordinator.load(Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < end,
+                "roles/enable queued behind a full packet queue were lost"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        rt.shutdown();
+    }
+
+    fn pong(t1: u64, seq: u32, from: u64, late_ns: u64) -> RuntimeMsg {
+        RuntimeMsg::Pong {
+            sample: ClockSample {
+                t1,
+                t2: t1 + MS,
+                t3: t1 + MS + 100_000,
+                t4: t1 + 2 * MS + late_ns,
+            },
+            from: PeerId(from),
+            ping_seq: seq,
+        }
+    }
+
+    /// Steps a non-coordinator Dsp so it sends `n` clock pings; returns their (seq, t1).
+    fn send_pings(d: &mut Dsp, t0: u64, n: u64) -> Vec<(u32, u64)> {
+        (0..n)
+            .map(|i| {
+                let t = t0 + i * PING_FAST_NS;
+                d.step(t);
+                *d.outstanding_pings.back().expect("ping sent")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pongs_are_accepted_once_and_only_for_outstanding_pings() {
+        let (mut d, _ev) = dsp(2, Box::new(NullAudio));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        let pings = send_pings(&mut d, t0, 4);
+        assert_eq!(pings.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        let (s0, t1) = pings[0];
+        // Wrong t1, unknown sequence, or not from the coordinator: ignored.
+        d.handle(pong(t1 + 1, s0, 1, 0));
+        d.handle(pong(t1, 99, 1, 0));
+        d.handle(pong(t1, s0, 3, 0));
+        assert!(
+            d.clock.min_rtt_ns().is_none(),
+            "no sample may be accepted yet"
+        );
+        for &(s, t) in &pings[..3] {
+            d.handle(pong(t, s, 1, 0));
+        }
+        assert!(d.clock.min_rtt_ns().is_some());
+        // Replays of consumed pings don't count as samples (4 are needed to sync).
+        for &(s, t) in &pings[..3] {
+            d.handle(pong(t, s, 1, 0));
+        }
+        assert!(!d.clock.is_synced(), "a replayed pong was accepted");
+        let (s3, t3) = pings[3];
+        d.handle(pong(t3, s3, 1, 0));
+        assert!(d.clock.is_synced());
+    }
+
+    #[test]
+    fn expired_pongs_are_ignored_and_outstanding_pings_are_bounded() {
+        let (mut d, _ev) = dsp(2, Box::new(NullAudio));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        let pings = send_pings(&mut d, t0, 4);
+        for &(s, t) in &pings[..3] {
+            d.handle(pong(t, s, 1, 0));
+        }
+        let (s3, t3) = pings[3];
+        d.handle(pong(t3, s3, 1, PING_TTL_NS));
+        assert!(
+            !d.clock.is_synced(),
+            "a pong older than the TTL was accepted"
+        );
+        // Unanswered pings: at most MAX_OUTSTANDING_PINGS, none older than the TTL.
+        let (mut d, _ev) = dsp(2, Box::new(NullAudio));
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        let mut t = t0;
+        for _ in 0..40 {
+            t += 5 * MS; // faster than the TTL can expire them
+            d.next_ping_ns = 0;
+            d.step(t);
+        }
+        assert_eq!(d.outstanding_pings.len(), MAX_OUTSTANDING_PINGS);
+        assert_eq!(
+            d.outstanding_pings.front().unwrap().0,
+            40 - MAX_OUTSTANDING_PINGS as u32
+        );
+        d.next_ping_ns = 0;
+        d.step(t + 2 * PING_TTL_NS);
+        assert_eq!(d.outstanding_pings.len(), 1, "expired pings are pruned");
+        // A role change (new coordinator/epoch) forgets them all.
+        d.handle(RuntimeMsg::Roles(roles(3, 3, 2)));
+        assert!(d.outstanding_pings.is_empty());
     }
 }

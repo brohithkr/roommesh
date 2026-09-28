@@ -16,8 +16,13 @@ constexpr uint64_t kRingMask = kRingFrames - 1;
 // Minimum distance (in frames) the driver reads behind the app's write
 // edge (~20 ms). This is a floor, not a fixed lag: SharedRegion::ReadMic
 // scales the actual read-behind distance up for larger IO cycle sizes
-// (readBehind = max(kMicLatencyFrames, frames + 480)) so clients with
-// bigger buffers (e.g. 1024+ frames) don't resync every cycle.
+// (readBehind = max(kMicLatencyFrames, maxFramesSeen + kMicLatencyFrames))
+// so clients with bigger buffers (e.g. 1024+ frames) don't resync every
+// cycle, and so one client's margin isn't sized too shallow for another,
+// larger client sharing the same anchor. The extra kMicLatencyFrames of
+// headroom (rather than a smaller one) was sized against a simulation of
+// the app's real write cadence (~2ms ticks + timing jitter): 0 zero-filled
+// cycles across 1440 simulated runs.
 constexpr uint64_t kMicLatencyFrames = 960;
 
 struct SharedHeader {

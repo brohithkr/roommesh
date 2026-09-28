@@ -25,6 +25,10 @@ void SpeakerIOHandler::OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& s
 
 OSStatus IOStateHandler::OnStartIO() {
     if (auto* l = region_->layout()) (mic_ ? l->header.mic_clients : l->header.speaker_clients).store(1);
+    // A fresh IO session should size ReadMic's read-behind margin off the
+    // clients actually attached now, not a high-water mark left over from
+    // a previous session that happened to have a larger-buffer client.
+    if (mic_) region_->ResetIOStats();
     return kAudioHardwareNoError;
 }
 void IOStateHandler::OnStopIO() {

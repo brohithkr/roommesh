@@ -2,14 +2,18 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 using namespace roommesh;
 
-// Mirrors SharedRegion::ReadMic's readBehind = max(kMicLatencyFrames, frames + 480).
+// Mirrors SharedRegion::ReadMic's readBehind = max(kMicLatencyFrames, maxFramesSeen + kMicLatencyFrames).
+// Each test below uses a fresh SharedRegion with only one client frame size in play (unless
+// noted), so maxFramesSeen == that call's own `frames` and this simplifies to a per-frames value.
 static uint64_t readBehindFor(uint32_t frames) {
-    return std::max<uint64_t>(kMicLatencyFrames, static_cast<uint64_t>(frames) + 480);
+    return std::max<uint64_t>(kMicLatencyFrames, static_cast<uint64_t>(frames) + kMicLatencyFrames);
 }
 
 static void writeMic(SharedLayout* l, float v, uint32_t n, uint64_t now) {
@@ -28,6 +32,18 @@ static void writeMicIndexed(SharedLayout* l, uint32_t n, uint64_t now) {
     for (uint32_t i = 0; i < n; i++) l->mic.samples[(w + i) & kRingMask] = static_cast<float>(w + i);
     l->mic.h.write_pos.store(w + n);
     l->header.app_heartbeat_ns.store(now);
+}
+
+// Fill the entire mic ring with a distinct sentinel value before any real
+// writes. Create() already zero-fills the region, which means a bug that
+// served unwritten/stale ring memory instead of an explicit zero for
+// positions at or beyond the write edge could go unnoticed - it would read
+// back as 0.f either way. Overwriting with a value no test ever writes or
+// expects (9.f) closes that blind spot: any leak of stale ring memory into
+// the output shows up as a distinct, unmistakable 9.f rather than silently
+// matching an "expected" zero.
+static void sentinelFillRing(SharedLayout* l) {
+    for (uint64_t i = 0; i < kRingFrames; i++) l->mic.samples[i] = 9.f;
 }
 
 // Writing more than kRingFrames total keeps the ring's monotonic write_pos
@@ -54,8 +70,6 @@ static void ringWrapAroundTest() {
     float out[512];
     r.ReadMic(static_cast<double>(total), out, 512, now);
     for (float f : out) assert(f == 0.42f);
-    // readBehind for a 512-frame IO cycle is max(960, 512+480) = 992, not
-    // the bare kMicLatencyFrames (fix 2: read-behind scales with IO size).
     assert(l->mic.h.read_pos.load() == total - readBehindFor(512) + 512);
 
     r.Destroy();
@@ -70,24 +84,36 @@ static void backwardSampleTimeJumpTest() {
     SharedRegion r;
     assert(r.Create(name.c_str()));
     SharedLayout* l = r.layout();
+    sentinelFillRing(l);
     const uint64_t now = 6'000'000'000;
 
     writeMic(l, 0.6f, 4800, now);  // w = 4800
     float out[512];
-    // readBehind = max(960, 512+480) = 992; establishes sync: offset = (4800-992)-1000 = 2808
+    // readBehind = max(960, 512+960) = 1472; establishes sync: offset = (4800-1472)-1000 = 2328
     r.ReadMic(1000, out, 512, now);
     for (float f : out) assert(f == 0.6f);
+    const int64_t offset0 = r.DebugMicOffset();
     const uint64_t readPosAfterFirst = l->mic.h.read_pos.load();
     assert(readPosAfterFirst == 4800 - readBehindFor(512) + 512);
 
     // sampleTime jumps far backward; with the old offset this would compute
     // a deeply negative pos (w - pos >> readBehind + 1440), which must
-    // trigger a resync back to near the write edge rather than reading
-    // garbage or an out-of-range index.
+    // trigger a resync via the "w far ahead of pos" bound rather than
+    // silently reading garbage or an out-of-range index.
     r.ReadMic(-1'000'000, out, 512, now);
-    for (float f : out) assert(f == 0.6f);
-    // The resynced position lands back at the same w - readBehind
-    // edge as before, so read_pos must not have moved backward.
+    // The resync recomputes off from the *current* (very negative) sampleTime
+    // against the same w, so the resulting position happens to land back on
+    // exactly the same [3328, 3840) range this reader already served above
+    // (offset0's pos). Fix (1)'s servedRealEnd_ guard must recognize that
+    // range as already-delivered and zero-fill it rather than replay it -
+    // re-serving the same 512 samples a second time would be exactly the
+    // kind of buzz this guard exists to prevent.
+    assert(r.DebugMicOffset() != offset0);  // a resync did happen (the offset itself changed)
+    for (float f : out) assert(f == 0.f);
+    for (float f : out) assert(f != 9.f);  // not stale/unwritten ring memory either
+    // Nothing new was actually served (it was all masked), so read_pos must
+    // not have moved backward, but also gains nothing beyond what fix (1)'s
+    // bookkeeping already advanced it to.
     assert(l->mic.h.read_pos.load() == readPosAfterFirst);
 
     r.Destroy();
@@ -106,37 +132,40 @@ static void underrunZeroFillTest() {
     SharedRegion r;
     assert(r.Create(name.c_str()));
     SharedLayout* l = r.layout();
+    sentinelFillRing(l);
     const uint64_t now = 7'000'000'000;
 
     writeMic(l, 0.3f, 4800, now);  // w = 4800
     float out[512];
-    // readBehind = max(960, 512+480) = 992; establishes sync: offset = (4800-992)-1000 = 2808
+    // readBehind = max(960, 512+960) = 1472; establishes sync: offset = (4800-1472)-1000 = 2328
     r.ReadMic(1000, out, 512, now);
     for (float f : out) assert(f == 0.3f);
     const int64_t offset0 = r.DebugMicOffset();
     const uint64_t readPosAfterFirst = l->mic.h.read_pos.load();
     assert(readPosAfterFirst == 4800 - readBehindFor(512) + 512);
 
-    // No further writes happen. sampleTime 1600 -> pos = 1600+2808 = 4408,
+    // No further writes happen. sampleTime 2200 -> pos = 2200+2328 = 4528,
     // which is still inside the written range (< w = 4800) but pos+frames =
-    // 4920 > w: a mild underrun. 392 frames exist (4408..4799); 120 don't.
-    // This is nowhere near either resync threshold (pos > w+readBehind, or
-    // w - pos > readBehind+1440), so the anchor must not move.
-    r.ReadMic(1600, out, 512, now);
+    // 5040 > w: a mild, one-cycle underrun. 272 frames exist (4528..4799);
+    // 240 don't. This is nowhere near either static resync threshold
+    // (pos > w+readBehind, or w - pos > readBehind+1440) and is only the
+    // first underrun cycle (fix 1 requires 3 consecutive, or >960 frames
+    // accumulated, before forcing a resync), so the anchor must not move.
+    r.ReadMic(2200, out, 512, now);
     assert(r.DebugMicOffset() == offset0);  // anchor did not re-anchor backward
-    for (uint32_t i = 0; i < 392; i++) assert(out[i] == 0.3f);  // real, previously-written audio
-    for (uint32_t i = 392; i < 512; i++) assert(out[i] == 0.f);  // zero-filled tail, not replayed audio
-    assert(l->mic.h.read_pos.load() == 4408 + 512);
+    for (uint32_t i = 0; i < 272; i++) assert(out[i] == 0.3f);  // real, previously-written audio
+    for (uint32_t i = 272; i < 512; i++) assert(out[i] == 0.f);  // zero-filled tail, not replayed audio
+    assert(l->mic.h.read_pos.load() == 4528 + 512);
 
     r.Destroy();
 }
 
-// Fix (1): after an app stall, a burst of queued writes can land all at
-// once and push the write edge far ahead of where a still-"synced" reader
-// is tracking. That gap must not be allowed to persist and add unbounded
-// latency: ReadMic must resync once the reader falls more than
-// readBehind + 1440 frames behind the write edge, not only near the full
-// ring size (the previous bound).
+// Fix (1), original scenario: after an app stall, a burst of queued writes
+// can land all at once and push the write edge far ahead of where a
+// still-"synced" reader is tracking. That gap must not be allowed to
+// persist and add unbounded latency: ReadMic must resync once the reader
+// falls more than readBehind + 1440 frames behind the write edge, not only
+// near the full ring size (the previous bound).
 static void burstAfterStallBoundedLatencyTest() {
     const std::string name = "/rmtest.burst." + std::to_string(getpid());
     SharedRegion r;
@@ -146,21 +175,21 @@ static void burstAfterStallBoundedLatencyTest() {
 
     writeMic(l, 0.1f, 4800, now);  // w = 4800
     float out[512];
-    // readBehind = 992; establishes sync: offset = (4800-992)-1000 = 2808
+    // readBehind = 1472; establishes sync: offset = (4800-1472)-1000 = 2328
     r.ReadMic(1000, out, 512, now);
     for (float f : out) assert(f == 0.1f);
 
     // Burst: 10000 more frames land in one shot (queued audio flushed right
     // after a stall). w jumps from 4800 to 14800 - far beyond
-    // readBehind(992)+1440 = 2432, but still well short of the old bound
+    // readBehind(1472)+1440 = 2912, but still well short of the old bound
     // (kRingFrames - 4800 = 27968), so the old code would never resync here
     // and would leave the reader ~10000 frames (~208 ms) behind forever.
     writeMic(l, 0.9f, 10000, now);  // w = 14800
 
     // Continue the reader's sampleTime exactly as if nothing had happened.
     r.ReadMic(1512, out, 512, now);
-    // With the stale offset this would read pos = 1512+2808 = 4320, i.e.
-    // 14800-4320 = 10480 frames behind the new write edge - beyond the
+    // With the stale offset this would read pos = 1512+2328 = 3840, i.e.
+    // 14800-3840 = 10960 frames behind the new write edge - beyond the
     // readBehind+1440 bound, so it must resync back near the edge instead
     // and serve the fresh (0.9) audio.
     for (float f : out) assert(f == 0.9f);
@@ -172,54 +201,259 @@ static void burstAfterStallBoundedLatencyTest() {
     r.Destroy();
 }
 
-// Fix (2): a reader with a larger IO cycle (e.g. 1024 frames) must not
-// resync every cycle just because kMicLatencyFrames (960) is close to its
-// buffer size - readBehind scales to frames + 480 instead. This simulates
-// the app's write cadence as an uneven ("sawtooth") sequence of small
-// writes against a steady 1024-frame reader and checks that, after the
-// initial sync, the mic offset never changes (zero resyncs) and every
-// sample read matches exactly what was written - no zero-fill glitches, no
-// stale replay - even though the write/read cycle boundaries never align.
-static void largeReaderStableNoResyncTest() {
-    const std::string name = "/rmtest.stable." + std::to_string(getpid());
+// Fix (1) helper, reused by the three sustained-underrun tests below.
+// Verifies every non-zero sample in `out` (for a call that read at absolute
+// position `pos`) is exactly the value that position's writer stored there
+// (catching stale/wrong reads), and - the actual point of these tests -
+// that no absolute position is ever served as real audio more than once
+// (catching a replay/buzz from re-anchoring backward over already-served
+// audio). Pass the same (mutable) `maxRealServed` across every call in a
+// test to track the high-water mark over time.
+static void checkNoReplay(const float* out, uint32_t frames, double pos, double& maxRealServed) {
+    for (uint32_t i = 0; i < frames; i++) {
+        if (out[i] == 0.f) continue;
+        const double p = pos + i;
+        assert(out[i] == static_cast<float>(p));
+        assert(p >= maxRealServed);  // never replay an already-served position
+        if (p + 1 > maxRealServed) maxRealServed = p + 1;
+    }
+}
+
+// Fix (1), runtime re-review scenario (a): the app's write grid fills
+// skipped slots with silence, so write_pos only ever *freezes* during a
+// genuine stall (e.g. the app's thread briefly starved) - and while its
+// heartbeat is still fresh (< 200ms), a sustained underrun against that
+// frozen edge must NOT force a resync. Re-anchoring to w - readBehind while
+// w is frozen would land the new anchor on audio already served earlier in
+// this very test (since the reader was, until the stall, sitting exactly
+// readBehind behind the edge) and replay it - a stutter. The reader should
+// just ride out a growing, ordinary zero-filled underrun instead, resyncing
+// only once the writer actually resumes or the heartbeat times out.
+static void frozenWriteEdgeNoReplayTest() {
+    const std::string name = "/rmtest.frozen." + std::to_string(getpid());
     SharedRegion r;
     assert(r.Create(name.c_str()));
     SharedLayout* l = r.layout();
-    const uint64_t now = 12'000'000'000;
+    const uint64_t now = 16'000'000'000;
+    const uint32_t frames = 512;
 
-    // Pre-buffer so the first ReadMic call has a runway to sync against.
-    writeMicIndexed(l, 4800, now);
-
-    const uint32_t frames = 1024;
+    writeMicIndexed(l, 4800, now);  // w = 4800; runway, and sets app_heartbeat_ns = now.
     float out[frames];
     double sampleTime = 1000;
+    double maxRealServed = -1;
 
-    // readBehind = max(960, 1024+480) = 1504.
-    r.ReadMic(sampleTime, out, frames, now);
+    r.ReadMic(sampleTime, out, frames, now);  // first sync
     const int64_t offset0 = r.DebugMicOffset();
-    for (uint32_t i = 0; i < frames; i++) assert(out[i] == static_cast<float>(sampleTime + offset0 + i));
+    checkNoReplay(out, frames, sampleTime + offset0, maxRealServed);
 
-    // Chunk sizes vary cycle to cycle (simulating the app's write-timing
-    // jitter/sawtooth) but always sum to 1024 - the same as `frames` - so
-    // the write edge stays a constant readBehind ahead of the reader
-    // throughout, the way a real app writing at the nominal sample rate
-    // would (only the timing within each ~10ms slot saws back and forth,
-    // not the long-run throughput).
-    const uint32_t chunkPattern[4][2] = {{480, 544}, {500, 524}, {450, 574}, {520, 504}};
-    for (int cycle = 0; cycle < 200; cycle++) {
-        const uint32_t* pair = chunkPattern[cycle % 4];
-        writeMicIndexed(l, pair[0], now);
-        writeMicIndexed(l, pair[1], now);
-
+    // The writer stalls: no more writes (write_pos frozen at 4800). Host
+    // time still advances a little each cycle (as it would in practice),
+    // but by only ~2ms/cycle, so after 9 cycles the stall is ~18ms old -
+    // comfortably under the 200ms heartbeat timeout. By cycle 3-4 the
+    // underrun would cross both sustained-underrun thresholds (3
+    // consecutive cycles, and > kMicLatencyFrames accumulated shortfall) if
+    // they weren't gated on the write edge actually advancing.
+    for (int cycle = 0; cycle < 9; cycle++) {
         sampleTime += frames;
-        r.ReadMic(sampleTime, out, frames, now);
-
-        assert(r.DebugMicOffset() == offset0);  // no resync after the first sync
-        const double pos = sampleTime + offset0;
-        for (uint32_t i = 0; i < frames; i++) assert(out[i] == static_cast<float>(pos + i));
+        const uint64_t cycleNow = now + static_cast<uint64_t>(cycle + 1) * 2'000'000;
+        r.ReadMic(sampleTime, out, frames, cycleNow);
+        assert(r.DebugMicOffset() == offset0);  // never re-anchors while w is frozen
+        checkNoReplay(out, frames, sampleTime + offset0, maxRealServed);
     }
 
     r.Destroy();
+}
+
+// Fix (1), positive case: the gate added for scenario (a) must not disable
+// the sustained-underrun mechanism entirely - it should still resync once a
+// *genuinely* slow (as opposed to frozen) writer leaves the reader
+// persistently underrunning against a live edge. Here the writer keeps
+// write_pos advancing every cycle, just far more slowly (32 frames/cycle)
+// than the reader is consuming (512 frames/cycle), so the shortfall grows
+// each cycle until it crosses the accumulated-deficit threshold.
+static void sustainedUnderrunWithAdvancingWriterResyncsTest() {
+    const std::string name = "/rmtest.slow." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    const uint64_t now = 18'000'000'000;
+    const uint32_t frames = 512;
+
+    writeMicIndexed(l, 4800, now);  // w = 4800
+    float out[frames];
+    double sampleTime = 1000;
+    double maxRealServed = -1;
+
+    r.ReadMic(sampleTime, out, frames, now);  // first sync
+    checkNoReplay(out, frames, sampleTime + r.DebugMicOffset(), maxRealServed);
+
+    int resyncs = 0;
+    int firstResyncCycle = -1;
+    for (int cycle = 0; cycle < 8; cycle++) {
+        writeMicIndexed(l, 32, now);  // write edge crawls forward - never frozen
+        sampleTime += frames;
+        const int64_t before = r.DebugMicOffset();
+        r.ReadMic(sampleTime, out, frames, now);
+        const int64_t after = r.DebugMicOffset();
+        if (after != before) {
+            resyncs++;
+            if (firstResyncCycle < 0) firstResyncCycle = cycle;
+        }
+        checkNoReplay(out, frames, sampleTime + after, maxRealServed);
+    }
+
+    assert(resyncs >= 1);  // recovered rather than underrunning forever against a live edge
+    assert(firstResyncCycle >= 0 && firstResyncCycle <= 5);  // within a handful of cycles
+
+    r.Destroy();
+}
+
+// Fix (1)/(2), runtime re-review scenario (b): the "reader far ahead of the
+// write edge" resync bound was loosened from a readBehind-scaled threshold
+// to a fixed ~200ms (kMicAheadResyncFrames = 9600) window, since the app's
+// write grid refills skipped slots with silence and catches write_pos back
+// up on its own. A reader only modestly ahead of the edge - well beyond the
+// old, tighter bound, but still under 9600 frames - must not resync.
+static void readerBrieflyAheadNoResyncTest() {
+    const std::string name = "/rmtest.ahead." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    const uint64_t now = 17'000'000'000;
+    const uint32_t frames = 512;
+
+    writeMic(l, 0.4f, 4800, now);  // w = 4800
+    float out[frames];
+    r.ReadMic(1000, out, frames, now);  // first sync: offset = (4800-1472)-1000 = 2328
+    const int64_t offset0 = r.DebugMicOffset();
+    for (float f : out) assert(f == 0.4f);
+
+    // pos = 7000+2328 = 9328, i.e. 4528 frames ahead of the still-4800 write
+    // edge - well beyond the old readBehind(+1440)-scaled bound, but under
+    // the new 9600-frame one. Must not resync (and, since w hasn't moved,
+    // wAdvancing is also false, so the sustained-underrun path can't fire
+    // either, despite a single-cycle deficit far past kMicLatencyFrames).
+    r.ReadMic(7000, out, frames, now);
+    assert(r.DebugMicOffset() == offset0);
+
+    // Sanity: comfortably past the 9600-frame bound, it still resyncs - the
+    // bound was loosened, not removed. pos = 14000+2328 = 16328, 11528
+    // frames ahead of the edge.
+    r.ReadMic(14000, out, frames, now);
+    assert(r.DebugMicOffset() != offset0);
+
+    r.Destroy();
+}
+
+// Fix (2): the read-behind margin must be sized off the largest IO cycle
+// any client on this device has ever requested (maxFramesSeen_), not just
+// whichever client happens to call ReadMic - and resync - first. Two
+// clients sharing one device (e.g. a 512-frame and a 1024-frame consumer)
+// read with the same sampleTime; the smaller client is called first, which
+// is exactly the ordering that could previously starve the larger client if
+// the anchor were sized only from the first (smaller) call's own `frames`.
+static void twoClientsNoStarvationTest() {
+    const std::string name = "/rmtest.twoclient." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    const uint64_t now = 15'000'000'000;
+
+    writeMicIndexed(l, 4800, now);  // w = 4800; runway for the first sync.
+
+    float outSmall[512];
+    float outBig[1024];
+    double sampleTime = 2000;
+
+    // Same sampleTime, smaller client (512) called first.
+    r.ReadMic(sampleTime, outSmall, 512, now);
+    r.ReadMic(sampleTime, outBig, 1024, now);
+    const int64_t offset = r.DebugMicOffset();
+
+    // Neither client underruns on this very first shared-sampleTime cycle:
+    // the larger client is not starved just because the smaller client's
+    // call came first and only knew about a 512-frame margin requirement at
+    // the time it (re)synced.
+    for (float f : outSmall) assert(f != 0.f);
+    for (float f : outBig) assert(f != 0.f);
+
+    // Keep the writer comfortably ahead (in step with the shared sampleTime
+    // advance) for many more cycles and confirm neither client ever
+    // underruns and the anchor never has to move again.
+    for (int cycle = 0; cycle < 20; cycle++) {
+        sampleTime += 1024;
+        writeMicIndexed(l, 1024, now);
+        r.ReadMic(sampleTime, outSmall, 512, now);
+        r.ReadMic(sampleTime, outBig, 1024, now);
+        assert(r.DebugMicOffset() == offset);  // no resync/starvation-driven thrash
+        for (float f : outSmall) assert(f != 0.f);
+        for (float f : outBig) assert(f != 0.f);
+    }
+
+    r.Destroy();
+}
+
+// Fix (2)/(5): models the app's real mic-write cadence (ticks roughly every
+// 2ms + jitter, writing 480-frame slots while it's behind its own write
+// schedule - see core/roommesh-core's runtime.rs, and the reviewer's
+// scripts/sim/sim2.cpp harness this mirrors) against readers of every IO
+// cycle size RoomMesh has to support, and asserts that once a reader has
+// synced, it never sees a zero-filled sample again - i.e. that
+// readBehind = max(kMicLatencyFrames, maxFramesSeen + kMicLatencyFrames)
+// leaves enough margin for realistic write-timing jitter. This is the same
+// property the reviewer's sweep validated (1440 simulated runs, 0
+// zero-fill) that motivated sizing the margin this way.
+static void sawtoothNoZeroFillAfterSyncTest(uint32_t frames, int jitterMaxFrames, uint64_t seed) {
+    char nameBuf[80];
+    std::snprintf(nameBuf, sizeof(nameBuf), "/rmtest.saw.%u.%d.%d", frames, jitterMaxFrames,
+                  static_cast<int>(getpid()));
+    SharedRegion r;
+    assert(r.Create(nameBuf));
+    SharedLayout* l = r.layout();
+    const uint64_t hostNs0 = 20'000'000'000;
+
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> jit(0, jitterMaxFrames);
+
+    int64_t nextTick = 0, nextOut = 0;
+    bool started = false;
+    int64_t nextRead = 5000;  // reader starts once the writer has a runway
+    const int64_t T = 48000 * 5;  // 5 simulated seconds
+    std::vector<float> out(frames);
+    long realCyclesChecked = 0;
+
+    auto hostNs = [&](int64_t t) { return hostNs0 + static_cast<uint64_t>(t * (1e9 / 48000.0)); };
+
+    while (true) {
+        const int64_t t = std::min(nextTick, nextRead);
+        if (t > T) break;
+        if (t == nextTick) {
+            if (!started) { nextOut = t; started = true; }
+            while (nextOut <= t + 480) {
+                writeMic(l, 1.f, 480, hostNs(t));
+                nextOut += 480;
+            }
+            nextTick = t + 96 + jit(rng);  // ~2ms nominal tick + 0..jitterMaxFrames of jitter
+        } else {
+            const double st = static_cast<double>(t - frames);
+            r.ReadMic(st, out.data(), frames, hostNs(t));
+            if (t > 20000) {  // past warmup/first-sync: steady state from here on
+                for (float f : out) assert(f != 0.f);
+                realCyclesChecked++;
+            }
+            nextRead = t + frames;
+        }
+    }
+    assert(realCyclesChecked > 0);  // sanity: the loop actually exercised the steady state
+    r.Destroy();
+}
+
+static void largeReaderStableNoResyncTest() {
+    for (uint32_t frames : {256u, 480u, 512u, 1024u}) {
+        for (int jitterFrames : {0, 96}) {  // 0ms and ~2ms of write-tick jitter
+            sawtoothNoZeroFillAfterSyncTest(frames, jitterFrames, static_cast<uint64_t>(frames) * 1000 + jitterFrames);
+        }
+    }
 }
 
 // Fix (4): the app stores app_heartbeat_ns = 0 the instant it stops being
@@ -260,7 +494,7 @@ int main() {
     r.ReadMic(0, out, 512, 1'000'000'000);
     for (float f : out) assert(f == 0.f);
 
-    // app writes 100 ms of 0.5 → driver reads readBehind(512) = max(960, 512+480) = 992
+    // app writes 100 ms of 0.5 → driver reads readBehind(512) = max(960, 512+960) = 1472
     // frames behind the write edge (fix 2: read-behind scales with IO cycle size).
     const uint64_t now = 2'000'000'000;
     writeMic(l, 0.5f, 4800, now);
@@ -290,6 +524,10 @@ int main() {
     backwardSampleTimeJumpTest();
     underrunZeroFillTest();
     burstAfterStallBoundedLatencyTest();
+    frozenWriteEdgeNoReplayTest();
+    sustainedUnderrunWithAdvancingWriterResyncsTest();
+    readerBrieflyAheadNoResyncTest();
+    twoClientsNoStarvationTest();
     largeReaderStableNoResyncTest();
     heartbeatZeroSilenceTest();
 
