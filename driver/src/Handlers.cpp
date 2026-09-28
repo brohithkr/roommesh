@@ -8,9 +8,16 @@
 
 namespace roommesh {
 
-void MicIOHandler::OnReadClientInput(const std::shared_ptr<aspl::Client>&, const std::shared_ptr<aspl::Stream>&,
+void MicIOHandler::OnReadClientInput(const std::shared_ptr<aspl::Client>& client, const std::shared_ptr<aspl::Stream>&,
                                      Float64, Float64 timestamp, void* bytes, UInt32 bytesCount) {
-    region_->ReadMic(timestamp, static_cast<float*>(bytes), bytesCount / sizeof(float), HostNowNs());
+    // The client ID keys ReadMic's per-client replay guard (see
+    // SharedRegion.hpp) so that one attached client's progress can never
+    // mask another's. Fall back to 0 if the HAL ever hands us a null
+    // client - that just means this read isn't individually guarded,
+    // which is the same fail-open behavior as the tracking table filling
+    // up (see kMaxTrackedMicClients).
+    region_->ReadMic(timestamp, static_cast<float*>(bytes), bytesCount / sizeof(float), HostNowNs(),
+                     client ? client->GetClientID() : 0);
 }
 
 void SpeakerIOHandler::OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& stream, Float64, Float64,

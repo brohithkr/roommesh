@@ -22,8 +22,12 @@ public:
     int LastErrno() const { return lastErrno_; }
     const char* LastStep() const { return lastStep_; }
 
-    // Serve `frames` mono samples for the RoomMesh Microphone IO cycle at device sample time `sampleTime`.
-    // Every client in the same cycle passes the same sampleTime and receives the same audio.
+    // Serve `frames` mono samples for the RoomMesh Microphone IO cycle at device sample time
+    // `sampleTime`, for the client identified by `clientId` (from aspl::Client::GetClientID();
+    // defaults to 0 for callers - tests, or a driver build with only one client - that don't
+    // distinguish clients). Every client in the same cycle passes the same sampleTime and
+    // receives the same audio.
+    //
     // Reads at least max(kMicLatencyFrames, maxFramesSeen_ + kMicLatencyFrames) frames behind the
     // app's write edge (see ReadMic's `readBehind` in SharedRegion.cpp; maxFramesSeen_ is a
     // high-water mark across every client, not just this call's own `frames`, so the margin
@@ -35,18 +39,29 @@ public:
     // running slow, not stalled). A plain, one-off underrun (pos + frames > write edge), or a
     // sustained one against a *frozen* write edge, is instead served partially with a
     // zero-filled tail, keeping the anchor stable so it doesn't resync onto - and replay -
-    // already-served audio.
-    void ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs);
+    // already-served audio. A per-client high-water mark (not a single shared one) guards
+    // against replay so that one client's progress can never mask another's, or leak across a
+    // ResetIOStats()-driven resync; a separate, session-scoped floor guards against ever
+    // re-serving audio written before an app_heartbeat_ns gap, even if this exact reader never
+    // personally received it. An anchor that ends up deeper than necessary (e.g. after a
+    // resync computed against a since-departed larger client's margin) is trimmed forward,
+    // once, after it's held a persistent margin surplus for about half a second.
+    void ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs, uint32_t clientId = 0);
     // Store the mixed RoomMesh Speaker output (interleaved `channels`) downmixed to mono.
     void WriteSpeaker(const float* interleaved, uint32_t frames, uint32_t channels, uint64_t nowNs);
     void Heartbeat(uint64_t nowNs);
 
-    // Resets the cross-client IO-cycle-size high-water mark (maxFramesSeen_)
-    // that sizes ReadMic's readBehind margin. Called from
-    // IOStateHandler::OnStartIO when the mic device starts IO, so a
-    // high-water mark left over from a previous IO session (e.g. one that
-    // briefly had a larger-buffer client attached) can't linger and
-    // over-deepen the margin forever.
+    // Resets ReadMic's per-IO-session bookkeeping: the cross-client IO-cycle-size high-water
+    // mark (maxFramesSeen_), the synced flag (forcing a fresh resync on the next call rather
+    // than reusing a stale offset against a HAL sample-time domain that a StopIO/StartIO may
+    // have just reset to 0), and the sustained-underrun/write-edge-advancing trackers
+    // (underrunStreak_, underrunDeficit_, lastMicW_). Called from IOStateHandler::OnStartIO
+    // when the mic device starts IO, so none of this state can linger from a previous IO
+    // session (e.g. one that briefly had a larger-buffer client attached, or whose offset
+    // would otherwise silently replay stale audio against the new session's sample-time
+    // domain - the per-client replay guard below independently prevents that regardless, but
+    // forcing a fresh resync also avoids the extra silence a stale offset would otherwise cost
+    // before the guard's high-water mark naturally caught back up).
     void ResetIOStats();
 
     // Test-only introspection: the current sampleTime -> ring-position mapping
@@ -66,13 +81,35 @@ private:
     // could observe "synced" paired with an offset from before or after
     // that flag flipped. They're packed into one 64-bit atomic instead -
     // bit 63 is the synced flag, the remaining 63 bits are the
-    // sign-extended offset - so every read/write is a single atomic op.
-    // See PackMicState/UnpackMicSynced/UnpackMicOffset in SharedRegion.cpp.
+    // sign-extended offset - so every read/write of *this* pair is a
+    // single atomic op with no torn-read window.
+    //
+    // Every other atomic below (maxFramesSeen_, underrunStreak_,
+    // underrunDeficit_, lastMicW_, silenceFloor_, the margin-trim window,
+    // and each per-client servedEnd) is an independent, unpacked atomic:
+    // a race between two concurrent ReadMic calls can update them out of
+    // the order either call observed. This is intentional, not an
+    // oversight - they're heuristics/bookkeeping (when to resync, when to
+    // trim, how far a specific client has been served), not correctness
+    // invariants for the audio content itself, so the worst a race can do
+    // is make a resync/trim decision a cycle or two early or late. Notably,
+    // wAdvancing (derived from lastMicW_) only reflects whether write_pos
+    // moved since the *immediately preceding* ReadMic call from *any*
+    // client: with two or more clients calling within what's logically the
+    // same cycle, only the first caller (whichever that happens to be) can
+    // observe it as true, and underrunStreak_/underrunDeficit_ likewise
+    // count ReadMic *calls*, not distinct time cycles - so with N clients
+    // attached, the sustained-underrun thresholds (see ReadMic) can be
+    // reached in effect ~N times faster than a single-client reading of
+    // "3 consecutive cycles" suggests. This is an accepted imprecision
+    // (the mechanism still only ever self-corrects, never mis-serves
+    // audio) rather than added cycle-keying complexity for marginal
+    // benefit.
     std::atomic<uint64_t> micState_{0};
 
     // High-water mark of `frames` across every ReadMic call on this
     // region since the last ResetIOStats() (see fix 2 in ReadMic's doc
-    // comment above). Relaxed atomic max, not synchronization.
+    // comment above).
     std::atomic<uint32_t> maxFramesSeen_{0};
 
     // Consecutive-cycle and accumulated-frame counters used to detect a
@@ -80,22 +117,61 @@ private:
     std::atomic<uint32_t> underrunStreak_{0};
     std::atomic<uint32_t> underrunDeficit_{0};
 
-    // Highest absolute mic-ring position ever served to a reader as real
-    // (non-zero-filled) audio, and the offset that was in effect when it
-    // was last advanced. Together these guarantee that re-anchoring
-    // backward (any resync branch) never re-serves - replays - audio a
-    // listener has already heard, while still letting different clients
-    // legitimately share overlapping reads at the same sampleTime under a
-    // stable (not just-changed) offset; see ReadMic.
-    std::atomic<uint64_t> servedRealEnd_{0};
-    std::atomic<int64_t> servedRealOffset_{0};
-
     // write_pos observed on the previous ReadMic call (any client), used to
     // tell whether the write edge is actively advancing right now. Gates
     // the sustained-underrun resync above: re-anchoring while the writer is
     // merely frozen (not dead - heartbeat still fresh) would land on stale
     // audio and replay it.
     std::atomic<uint64_t> lastMicW_{0};
+
+    // The highest write_pos ever observed while ReadMic was in its
+    // silence branch (stale/zero heartbeat, or not enough runway yet).
+    // This marks a hard floor: once the app resumes after such a gap
+    // (a coordinator hand-off, or a new app process entirely) and the
+    // next resync re-anchors, nothing at or before this floor may ever be
+    // served as real audio again - even though this specific reader may
+    // never have actually received it (so the per-client guard below
+    // wouldn't by itself catch it), it belongs to a session that's over,
+    // and serving it would mean playing back audio from before the gap.
+    std::atomic<uint64_t> silenceFloor_{0};
+
+    // Per-client replay guard: the highest absolute mic-ring position ever
+    // served *to this specific client* as real (non-zero-filled) audio.
+    // Keyed by aspl::Client::GetClientID() (see ReadMic's `clientId`
+    // parameter). A resync that re-anchors backward relative to what a
+    // given client has already been served must not re-serve that range to
+    // *that* client - but must not silence a *different* client that
+    // simply hasn't reached as far yet (this is the normal, legitimate
+    // case of multiple clients with different IO cycle sizes, or different
+    // per-client sampleTime cadences, sharing one anchor). Sized generously
+    // for how many processes could plausibly read "RoomMesh Microphone" at
+    // once; look-up is a short linear scan (realtime-safe: no locks, no
+    // allocation). If every slot is ever in use by a still-active client
+    // and a new one shows up, that new client's reads simply aren't
+    // guarded (fail open to serving audio rather than wrongly silencing or
+    // wrongly guarding an unrelated client) - `kMaxTrackedMicClients` is
+    // set well above any realistic number of simultaneous consumers of
+    // this virtual device.
+    static constexpr uint32_t kNoClient = 0xFFFFFFFFu;
+    static constexpr int kMaxTrackedMicClients = 16;
+    struct ClientServedEnd {
+        std::atomic<uint32_t> clientId{kNoClient};
+        std::atomic<uint64_t> servedEnd{0};
+    };
+    ClientServedEnd micClientServed_[kMaxTrackedMicClients];
+    // Finds this client's slot, claiming a free one on first use. Returns
+    // nullptr if the table is full and clientId isn't already tracked (see
+    // kMaxTrackedMicClients above).
+    ClientServedEnd* FindOrCreateClientSlot(uint32_t clientId);
+
+    // One-time forward anchor trim (see ReadMic): tracks how long the
+    // margin between the write edge and what's actually being served has
+    // stayed above the normal readBehind depth, so a resync that (for
+    // whatever reason - e.g. against a margin sized for a client that's
+    // since disconnected) left the anchor deeper than necessary doesn't
+    // carry that extra latency forever.
+    std::atomic<uint64_t> marginWindowStartNs_{0};  // 0 = no window currently open
+    std::atomic<uint64_t> marginWindowMinGap_{0};
 
     int lastErrno_ = 0;
     const char* lastStep_ = nullptr;

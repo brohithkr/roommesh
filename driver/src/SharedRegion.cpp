@@ -30,13 +30,18 @@ int64_t UnpackMicOffset(uint64_t state) {
     return static_cast<int64_t>(bits);
 }
 
-// Relaxed atomic max via CAS retry: used for the cross-client high-water
-// marks (maxFramesSeen_, servedRealEnd_) ReadMic maintains. These are
-// heuristics/bookkeeping, not synchronization, so relaxed ordering suffices.
+// Relaxed atomic max/min via CAS retry: used for the various high-water
+// (and low-water) marks ReadMic maintains. These are heuristics/bookkeeping,
+// not synchronization, so relaxed ordering suffices.
 template <typename T>
 void AtomicMaxRelaxed(std::atomic<T>& a, T v) {
     T cur = a.load(std::memory_order_relaxed);
     while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+template <typename T>
+void AtomicMinRelaxed(std::atomic<T>& a, T v) {
+    T cur = a.load(std::memory_order_relaxed);
+    while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
 }
 
 // "Reader far ahead of the write edge" resync threshold. Loosened (from an
@@ -118,7 +123,23 @@ void SharedRegion::Destroy() {
     if (!name_.empty()) shm_unlink(name_.c_str());
 }
 
-void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs) {
+SharedRegion::ClientServedEnd* SharedRegion::FindOrCreateClientSlot(uint32_t clientId) {
+    // First pass: this client may already have a slot.
+    for (auto& slot : micClientServed_) {
+        if (slot.clientId.load(std::memory_order_relaxed) == clientId) return &slot;
+    }
+    // Second pass: claim a free slot. A plain linear scan + CAS is fine
+    // here - this only runs when a new client shows up (rare relative to
+    // the steady-state ReadMic call rate), and kMaxTrackedMicClients is
+    // small.
+    for (auto& slot : micClientServed_) {
+        uint32_t expected = kNoClient;
+        if (slot.clientId.compare_exchange_strong(expected, clientId, std::memory_order_relaxed)) return &slot;
+    }
+    return nullptr;  // table full; this client's reads simply aren't guarded (see header comment)
+}
+
+void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs, uint32_t clientId) {
     if (!layout_) { std::fill(out, out + frames, 0.f); return; }
     Ring& ring = layout_->mic;
     const uint64_t w = ring.h.write_pos.load(std::memory_order_acquire);
@@ -157,6 +178,14 @@ void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint6
         micState_.fetch_and(~kMicStateSyncedBit, std::memory_order_relaxed);
         underrunStreak_.store(0, std::memory_order_relaxed);
         underrunDeficit_.store(0, std::memory_order_relaxed);
+        // Mark everything written so far as off-limits to any future real
+        // serve (see silenceFloor_): a stale/zero heartbeat means the app's
+        // session may be ending here (a coordinator hand-off, or a new app
+        // process entirely). When it resumes and the next resync re-anchors
+        // to (the by-then-larger) w - readBehind, that position must never
+        // land on this pre-gap tail and serve it as if it were fresh -
+        // whether or not *this* reader personally already saw it.
+        AtomicMaxRelaxed(silenceFloor_, w);
         return;
     }
 
@@ -235,41 +264,63 @@ void SharedRegion::ReadMic(double sampleTime, float* out, uint32_t frames, uint6
     // pos is unconstrained in general (it's exactly w - readBehind, i.e.
     // strictly < w, right after a resync; otherwise it's whatever this
     // call's own sampleTime maps to under the existing, unchanged offset).
-    // Under a *stable* offset, upos only ever moves forward as sampleTime
-    // advances, even across different clients sharing that offset at the
-    // same or overlapping sampleTime (by design: "every client in the same
-    // cycle ... receives the same audio", so two clients legitimately
-    // reading the same range at the same instant is not a replay, even
-    // though one of them may compute a smaller upos than the other already
-    // advanced servedRealEnd_ to). A resync changing the offset is the only
-    // thing that can make upos jump backward in absolute terms relative to
-    // what's already been delivered - so only while the *current* offset
-    // differs from servedRealOffset_ (the offset in effect when
-    // servedRealEnd_ was last advanced, i.e. we haven't yet made real
-    // forward progress under this offset) do we guard against reading ring
-    // memory below servedRealEnd_, the highest absolute position ever
-    // served as real (non-zero-filled) audio: re-serving that range would
-    // replay old audio instead of leaving a one-off silent gap. This
-    // condition self-clears (and stays clear until the next resync) as
-    // soon as one call under the new offset reaches real, unmasked data.
-    // Never read at or past `w` either way, since nothing has been written
-    // there yet.
+    // Guard against ever serving stale/already-delivered content as real
+    // audio: never read below this *client's own* high-water mark (a
+    // resync that re-anchors backward relative to what this specific
+    // client already received would otherwise replay it - but a different
+    // client that simply hasn't reached as far yet must not be silenced by
+    // that; every client in the same cycle legitimately reading the same
+    // range at the same instant is not a replay), and never read below
+    // silenceFloor_ either (audio written before an app_heartbeat_ns gap,
+    // which must never resurface after the gap even to a client that never
+    // personally saw it - see the silence branch above). Never read at or
+    // past `w`, since nothing has been written there yet.
     const uint64_t upos = static_cast<uint64_t>(pos);
-    uint64_t realStart = upos;
-    uint32_t skip = 0;
-    if (off != servedRealOffset_.load(std::memory_order_relaxed)) {
-        const uint64_t servedEnd = servedRealEnd_.load(std::memory_order_relaxed);
-        realStart = std::max(upos, servedEnd);
-        skip = realStart > upos ? static_cast<uint32_t>(std::min<uint64_t>(frames, realStart - upos)) : 0;
-    }
+    ClientServedEnd* clientSlot = FindOrCreateClientSlot(clientId);
+    const uint64_t clientServedEnd = clientSlot ? clientSlot->servedEnd.load(std::memory_order_relaxed) : 0;
+    const uint64_t floor = std::max(clientServedEnd, silenceFloor_.load(std::memory_order_relaxed));
+    const uint64_t realStart = std::max(upos, floor);
+    const uint32_t skip = realStart > upos ? static_cast<uint32_t>(std::min<uint64_t>(frames, realStart - upos)) : 0;
     const uint32_t avail =
         realStart < w ? static_cast<uint32_t>(std::min<uint64_t>(frames - skip, w - realStart)) : 0;
     for (uint32_t i = 0; i < skip; i++) out[i] = 0.f;
     for (uint32_t i = 0; i < avail; i++) out[skip + i] = ring.samples[(realStart + i) & kRingMask];
     for (uint32_t i = skip + avail; i < frames; i++) out[i] = 0.f;
-    if (avail > 0) {
-        AtomicMaxRelaxed(servedRealEnd_, realStart + avail);
-        servedRealOffset_.store(off, std::memory_order_relaxed);
+    if (avail > 0 && clientSlot) AtomicMaxRelaxed(clientSlot->servedEnd, realStart + avail);
+
+    // Fix: anchor depth. A resync can legitimately land deeper than the
+    // current steady-state readBehind - e.g. it was computed while
+    // maxFramesSeen_ (and hence readBehind) was inflated by a larger
+    // client that has since disconnected, or against a write edge that had
+    // temporarily surged ahead. If the margin between the write edge and
+    // what's actually being served (the gap) stays *persistently* above
+    // readBehind + 480 - not just a one-off - for about half a second,
+    // trim the anchor forward, once, back to the normal depth. The
+    // positions being skipped over were never served to anyone (the gap
+    // was never small enough to reach them), so this is not a replay, just
+    // shedding latency the anchor no longer needs to carry.
+    const int64_t gap = static_cast<int64_t>(w) - static_cast<int64_t>(upos + frames);
+    const int64_t trimThreshold = static_cast<int64_t>(readBehind) + 480;
+    if (!resync && gap > trimThreshold) {
+        const uint64_t windowStart = marginWindowStartNs_.load(std::memory_order_relaxed);
+        if (windowStart == 0) {
+            marginWindowStartNs_.store(nowNs, std::memory_order_relaxed);
+            marginWindowMinGap_.store(static_cast<uint64_t>(gap), std::memory_order_relaxed);
+        } else {
+            AtomicMinRelaxed(marginWindowMinGap_, static_cast<uint64_t>(gap));
+            if (nowNs - windowStart >= 500'000'000ull) {
+                const uint64_t minGap = marginWindowMinGap_.load(std::memory_order_relaxed);
+                if (static_cast<int64_t>(minGap) > trimThreshold) {
+                    const int64_t trimmedOff = static_cast<int64_t>(w - readBehind) - st;
+                    micState_.store(PackMicState(true, trimmedOff), std::memory_order_relaxed);
+                    underrunStreak_.store(0, std::memory_order_relaxed);
+                    underrunDeficit_.store(0, std::memory_order_relaxed);
+                }
+                marginWindowStartNs_.store(0, std::memory_order_relaxed);
+            }
+        }
+    } else {
+        marginWindowStartNs_.store(0, std::memory_order_relaxed);
     }
 
     // read_pos is a diagnostic/latency high-water mark ("served through
@@ -291,6 +342,18 @@ int64_t SharedRegion::DebugMicOffset() const {
 
 void SharedRegion::ResetIOStats() {
     maxFramesSeen_.store(0, std::memory_order_relaxed);
+    // Force a fresh resync on the next ReadMic call rather than reusing a
+    // stale offset: a StopIO/StartIO typically resets the HAL's sample-time
+    // domain to 0, and an unchanged offset against that would otherwise map
+    // to a position this session already served (the per-client replay
+    // guard in ReadMic independently prevents that from ever coming out as
+    // audio, but skips straight to a fresh anchor here rather than paying
+    // for the guard to silently mask frames until the old high-water mark
+    // is caught back up to).
+    micState_.fetch_and(~kMicStateSyncedBit, std::memory_order_relaxed);
+    underrunStreak_.store(0, std::memory_order_relaxed);
+    underrunDeficit_.store(0, std::memory_order_relaxed);
+    lastMicW_.store(0, std::memory_order_relaxed);
 }
 
 void SharedRegion::WriteSpeaker(const float* in, uint32_t frames, uint32_t channels, uint64_t nowNs) {

@@ -104,10 +104,11 @@ static void backwardSampleTimeJumpTest() {
     // The resync recomputes off from the *current* (very negative) sampleTime
     // against the same w, so the resulting position happens to land back on
     // exactly the same [3328, 3840) range this reader already served above
-    // (offset0's pos). Fix (1)'s servedRealEnd_ guard must recognize that
-    // range as already-delivered and zero-fill it rather than replay it -
-    // re-serving the same 512 samples a second time would be exactly the
-    // kind of buzz this guard exists to prevent.
+    // (offset0's pos). Fix (2)'s per-client replay guard must recognize that
+    // range as already-delivered (to this same client, clientId 0 by
+    // default) and zero-fill it rather than replay it - re-serving the same
+    // 512 samples a second time would be exactly the kind of buzz this
+    // guard exists to prevent.
     assert(r.DebugMicOffset() != offset0);  // a resync did happen (the offset itself changed)
     for (float f : out) assert(f == 0.f);
     for (float f : out) assert(f != 9.f);  // not stale/unwritten ring memory either
@@ -352,28 +353,33 @@ static void readerBrieflyAheadNoResyncTest() {
 // read with the same sampleTime; the smaller client is called first, which
 // is exactly the ordering that could previously starve the larger client if
 // the anchor were sized only from the first (smaller) call's own `frames`.
-static void twoClientsNoStarvationTest() {
-    const std::string name = "/rmtest.twoclient." + std::to_string(getpid());
+// Each client uses its own clientId (mirroring MicIOHandler, which passes
+// aspl::Client::GetClientID()), exercising the per-client replay guard too -
+// with a shared/default clientId, the smaller client's own progress would
+// incorrectly mask the larger client's reads of the very same range.
+static void twoClientsNoStarvationTest(uint32_t smallFrames, uint32_t bigFrames) {
+    const std::string name =
+        "/rm2c." + std::to_string(smallFrames) + "." + std::to_string(bigFrames) + "." + std::to_string(getpid());
     SharedRegion r;
     assert(r.Create(name.c_str()));
     SharedLayout* l = r.layout();
     const uint64_t now = 15'000'000'000;
+    const uint32_t kSmallClientId = 101, kBigClientId = 202;
 
     writeMicIndexed(l, 4800, now);  // w = 4800; runway for the first sync.
 
-    float outSmall[512];
-    float outBig[1024];
+    std::vector<float> outSmall(smallFrames), outBig(bigFrames);
     double sampleTime = 2000;
 
-    // Same sampleTime, smaller client (512) called first.
-    r.ReadMic(sampleTime, outSmall, 512, now);
-    r.ReadMic(sampleTime, outBig, 1024, now);
+    // Same sampleTime, smaller client called first.
+    r.ReadMic(sampleTime, outSmall.data(), smallFrames, now, kSmallClientId);
+    r.ReadMic(sampleTime, outBig.data(), bigFrames, now, kBigClientId);
     const int64_t offset = r.DebugMicOffset();
 
     // Neither client underruns on this very first shared-sampleTime cycle:
     // the larger client is not starved just because the smaller client's
-    // call came first and only knew about a 512-frame margin requirement at
-    // the time it (re)synced.
+    // call came first and only knew about its own (smaller) margin
+    // requirement at the time it (re)synced.
     for (float f : outSmall) assert(f != 0.f);
     for (float f : outBig) assert(f != 0.f);
 
@@ -381,11 +387,69 @@ static void twoClientsNoStarvationTest() {
     // advance) for many more cycles and confirm neither client ever
     // underruns and the anchor never has to move again.
     for (int cycle = 0; cycle < 20; cycle++) {
-        sampleTime += 1024;
-        writeMicIndexed(l, 1024, now);
-        r.ReadMic(sampleTime, outSmall, 512, now);
-        r.ReadMic(sampleTime, outBig, 1024, now);
+        sampleTime += bigFrames;
+        writeMicIndexed(l, bigFrames, now);
+        r.ReadMic(sampleTime, outSmall.data(), smallFrames, now, kSmallClientId);
+        r.ReadMic(sampleTime, outBig.data(), bigFrames, now, kBigClientId);
         assert(r.DebugMicOffset() == offset);  // no resync/starvation-driven thrash
+        for (float f : outSmall) assert(f != 0.f);
+        for (float f : outBig) assert(f != 0.f);
+    }
+
+    r.Destroy();
+}
+
+// Fix (4)/regression guard: with frame sizes close together (512 vs 1024),
+// even a buggy per-call readBehind (computed from each call's own `frames`
+// rather than the shared maxFramesSeen_ high-water mark) can accidentally
+// still cover the larger client, since the resync formula (off = w -
+// readBehind - st) happens to leave exactly `readBehind` frames of margin -
+// which was >= 1024 anyway. Frame sizes that differ by more than
+// kMicLatencyFrames (960) expose the bug for what it is: a per-call margin
+// sized for the smaller client's first call is *permanently* too shallow
+// for the larger one, not just on the first, transitional cycle.
+static void twoClientsNoStarvationWideGapTest() {
+    const std::string name = "/rmtest.twoclientwide." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    const uint64_t now = 15'500'000'000;
+    const uint32_t kSmallFrames = 256, kBigFrames = 2048;
+    const uint32_t kSmallClientId = 111, kBigClientId = 222;
+
+    writeMic(l, 1.f, 4800, now);  // w = 4800; runway for the first sync.
+
+    std::vector<float> outSmall(kSmallFrames), outBig(kBigFrames);
+    double sampleTime = 2000;
+
+    r.ReadMic(sampleTime, outSmall.data(), kSmallFrames, now, kSmallClientId);
+    r.ReadMic(sampleTime, outBig.data(), kBigFrames, now, kBigClientId);
+
+    // The very first shared cycle can legitimately underrun the larger
+    // client: its size isn't known to maxFramesSeen_ until its own first
+    // call, one call *after* the anchor was already set from the smaller
+    // client's call. What must not happen is *persistent* starvation -
+    // maxFramesSeen_ has to make the *next* resync (triggered by the
+    // resulting underrun) deep enough for both clients from then on.
+    for (int cycle = 0; cycle < 10; cycle++) {
+        sampleTime += kBigFrames;
+        writeMic(l, 1.f, kBigFrames, now);
+        r.ReadMic(sampleTime, outSmall.data(), kSmallFrames, now, kSmallClientId);
+        r.ReadMic(sampleTime, outBig.data(), kBigFrames, now, kBigClientId);
+    }
+
+    // By now the anchor must have settled deep enough for the larger
+    // client, and stay settled: several more cycles with zero underrun for
+    // either client, and no further resyncs (a per-call-margin regression
+    // instead zero-fills the larger client on *every* cycle, forever, since
+    // its own margin requirement never gets remembered).
+    const int64_t offset = r.DebugMicOffset();
+    for (int cycle = 0; cycle < 10; cycle++) {
+        sampleTime += kBigFrames;
+        writeMic(l, 1.f, kBigFrames, now);
+        r.ReadMic(sampleTime, outSmall.data(), kSmallFrames, now, kSmallClientId);
+        r.ReadMic(sampleTime, outBig.data(), kBigFrames, now, kBigClientId);
+        assert(r.DebugMicOffset() == offset);
         for (float f : outSmall) assert(f != 0.f);
         for (float f : outBig) assert(f != 0.f);
     }
@@ -395,9 +459,8 @@ static void twoClientsNoStarvationTest() {
 
 // Fix (2)/(5): models the app's real mic-write cadence (ticks roughly every
 // 2ms + jitter, writing 480-frame slots while it's behind its own write
-// schedule - see core/roommesh-core's runtime.rs, and the reviewer's
-// scripts/sim/sim2.cpp harness this mirrors) against readers of every IO
-// cycle size RoomMesh has to support, and asserts that once a reader has
+// schedule - see core/roommesh-core's runtime.rs) against readers of every
+// IO cycle size RoomMesh has to support, and asserts that once a reader has
 // synced, it never sees a zero-filled sample again - i.e. that
 // readBehind = max(kMicLatencyFrames, maxFramesSeen + kMicLatencyFrames)
 // leaves enough margin for realistic write-timing jitter. This is the same
@@ -454,6 +517,256 @@ static void largeReaderStableNoResyncTest() {
             sawtoothNoZeroFillAfterSyncTest(frames, jitterFrames, static_cast<uint64_t>(frames) * 1000 + jitterFrames);
         }
     }
+}
+
+// Fix (1) (hand-back stale replay): after the app's heartbeat drops to 0 or
+// goes stale (a coordinator hand-off, or the app dying and a new one taking
+// over), the *next* resync must never serve data written before that gap -
+// even though that data was never technically "already served" to this
+// reader, so the per-client replay guard (fix 2) alone wouldn't catch it;
+// this needs the separate, session-scoped silenceFloor_ set in ReadMic's
+// silence branch. Model a session hand-off with session-tagged audio:
+// session 1 tags its writes 1.0, then a heartbeat gap, then session 2
+// (write_pos simply continuing from wherever session 1 left off, exactly
+// like the real shared ring) tags its writes 2.0. The reader must never see
+// 1.0 again once the gap starts - only 2.0 or silence.
+static void handoffNeverReplaysPreviousSessionTest() {
+    for (uint32_t frames : {256u, 512u, 1024u}) {
+        const std::string name = "/rmtest.handoff." + std::to_string(frames) + "." + std::to_string(getpid());
+        SharedRegion r;
+        assert(r.Create(name.c_str()));
+        SharedLayout* l = r.layout();
+        const uint64_t now = 21'000'000'000;
+        std::vector<float> out(frames);
+        double sampleTime = 1000;
+
+        // Session 1: steady, synced reading of audio tagged 1.0.
+        writeMic(l, 1.f, 4800, now);
+        r.ReadMic(sampleTime, out.data(), frames, now);
+        for (float f : out) assert(f == 1.f);
+        for (int cycle = 0; cycle < 20; cycle++) {
+            writeMic(l, 1.f, frames, now);
+            sampleTime += frames;
+            r.ReadMic(sampleTime, out.data(), frames, now);
+            for (float f : out) assert(f == 1.f);
+        }
+
+        // Hand-off: heartbeat drops to 0 (session 1 relinquishes coordinator,
+        // or dies outright). write_pos is frozen - nothing more is written
+        // for session 1.
+        l->header.app_heartbeat_ns.store(0);
+        for (int cycle = 0; cycle < 20; cycle++) {
+            sampleTime += frames;
+            r.ReadMic(sampleTime, out.data(), frames, now);
+            for (float f : out) assert(f == 0.f);  // silence, heartbeat stale
+        }
+
+        // Session 2 resumes (write_pos continues forward from wherever
+        // session 1 left off), tagged 2.0. From here on, every sample must
+        // be 2.0 or silence - never the stale 1.0 tag from before the gap.
+        bool sawFresh = false;
+        for (int cycle = 0; cycle < 40; cycle++) {
+            writeMic(l, 2.f, frames, now);
+            sampleTime += frames;
+            r.ReadMic(sampleTime, out.data(), frames, now);
+            for (float f : out) {
+                assert(f == 2.f || f == 0.f);  // never 1.f (fix 1)
+                if (f == 2.f) sawFresh = true;
+            }
+        }
+        assert(sawFresh);  // sanity: real session-2 audio does eventually flow
+
+        r.Destroy();
+    }
+}
+
+// Fix (2): a quick StopIO/StartIO - the HAL's sample-time domain restarting
+// at (or near) 0 while ReadMic's offset would otherwise be left untouched -
+// must never let the reader compute a position it already served before the
+// restart. Two belts: ResetIOStats() now also clears the synced flag, so
+// the anchor doesn't rely on a sampleTime domain that no longer applies;
+// and even if it didn't, the per-client replay guard independently
+// guarantees no replay either way. Indexed values (each sample tagged with
+// its own absolute position) make any repeat directly visible.
+static void quickRestartNoReplayTest() {
+    for (int cyclesBeforeRestart : {1, 2, 4, 8}) {
+        const std::string name =
+            "/rmtest.restart." + std::to_string(cyclesBeforeRestart) + "." + std::to_string(getpid());
+        SharedRegion r;
+        assert(r.Create(name.c_str()));
+        SharedLayout* l = r.layout();
+        const uint64_t now = 22'000'000'000;
+        const uint32_t frames = 512;
+
+        writeMicIndexed(l, 4800, now);
+        float out[frames];
+        double sampleTime = 0;
+        double maxServed = -1;
+        auto checkAndTrack = [&](double pos) {
+            for (uint32_t i = 0; i < frames; i++) {
+                if (out[i] == 0.f) continue;
+                const double p = pos + i;
+                assert(out[i] == static_cast<float>(p));
+                assert(p >= maxServed);  // never replay an already-served position
+                if (p + 1 > maxServed) maxServed = p + 1;
+            }
+        };
+
+        for (int c = 0; c < cyclesBeforeRestart; c++) {
+            r.ReadMic(sampleTime, out, frames, now);
+            checkAndTrack(sampleTime + r.DebugMicOffset());
+            sampleTime += frames;
+            writeMicIndexed(l, frames, now);
+        }
+
+        // StopIO/StartIO: a little more data trickles in (as it would while
+        // the device is briefly reconfigured), IO stats reset, and the
+        // HAL's sample time restarts at 0 for the new IO session.
+        writeMicIndexed(l, 240, now);
+        const int64_t offsetBeforeRestart = r.DebugMicOffset();
+        r.ResetIOStats();
+        sampleTime = 0;
+
+        // ResetIOStats() must force a fresh resync immediately, rather than
+        // leaving the reader to fall back on the per-client replay guard to
+        // silently zero-fill cycles until its old high-water mark is caught
+        // back up to: the offset must already differ on this very first
+        // post-restart call, and that call must serve real audio (not the
+        // guard papering over a stale anchor with silence).
+        r.ReadMic(sampleTime, out, frames, now);
+        assert(r.DebugMicOffset() != offsetBeforeRestart);
+        checkAndTrack(sampleTime + r.DebugMicOffset());
+        long realFirstCycle = 0;
+        for (float f : out) if (f != 0.f) realFirstCycle++;
+        assert(realFirstCycle > 0);
+        sampleTime += frames;
+        writeMicIndexed(l, frames, now);
+
+        for (int c = 0; c < 5; c++) {
+            r.ReadMic(sampleTime, out, frames, now);
+            checkAndTrack(sampleTime + r.DebugMicOffset());
+            sampleTime += frames;
+            writeMicIndexed(l, frames, now);
+        }
+
+        r.Destroy();
+    }
+}
+
+// Fix (2), end-aligned multi-client scenario: two clients with different
+// frame sizes read independently (each ending its own IO cycle at its own
+// device time, not synchronized to the other) while the writer goes through
+// a slow patch that triggers a resync. Before the per-client replay guard,
+// the *first* client to get real data after a backward-re-anchoring resync
+// would clear a single shared "guard is off" flag, letting the *second*
+// client replay - even though the second client's own read position hadn't
+// itself caught up past what it had already been served.
+static void endAlignedMultiClientNoReplayTest() {
+    for (bool bFirst : {false, true}) {
+        const std::string name = "/rmtest.endaligned." + std::to_string(bFirst) + "." + std::to_string(getpid());
+        SharedRegion r;
+        assert(r.Create(name.c_str()));
+        SharedLayout* l = r.layout();
+        const uint64_t now = 23'000'000'000;
+        const uint32_t FA = 256, FB = 512;
+        const uint32_t kClientA = 11, kClientB = 22;
+
+        writeMicIndexed(l, 6000, now);
+
+        float a[FA], b[FB];
+        double maxA = -1, maxB = -1;
+        auto rd = [&](float* o, uint32_t F, uint32_t clientId, double st, double& mx) {
+            r.ReadMic(st, o, F, now, clientId);
+            const double pos = st + r.DebugMicOffset();
+            for (uint32_t i = 0; i < F; i++) {
+                if (o[i] == 0.f) continue;
+                const double p = pos + i;
+                assert(o[i] == static_cast<float>(p));
+                assert(p >= mx);  // never replay an already-served position
+                if (p + 1 > mx) mx = p + 1;
+            }
+        };
+
+        int64_t t = 6000;
+        for (int cyc = 0; cyc < 400; cyc++) {
+            t += FB;
+            // Writer: normal, then a slow patch (underruns -> resync), then normal again.
+            const uint32_t n = (cyc >= 100 && cyc < 130) ? 400u : FB;
+            writeMicIndexed(l, n, now);
+            // Both clients end-aligned on the same IO cycle boundary (B is
+            // driven once per cycle; A, being half B's size, is driven
+            // twice per B cycle).
+            if (bFirst) {
+                rd(b, FB, kClientB, static_cast<double>(t - FB), maxB);
+                rd(a, FA, kClientA, static_cast<double>(t - FA), maxA);
+            } else {
+                rd(a, FA, kClientA, static_cast<double>(t - FA), maxA);
+                rd(b, FB, kClientB, static_cast<double>(t - FB), maxB);
+            }
+            rd(a, FA, kClientA, static_cast<double>(t - FB), maxA);  // A's other half-cycle (earlier)
+        }
+
+        r.Destroy();
+    }
+}
+
+// Fix (3): a resync can legitimately land the anchor deeper than the
+// current steady-state readBehind - e.g. against a write edge that had
+// briefly raced ahead without quite crossing the "burst" resync bound
+// (readBehind + 1440), or one computed while maxFramesSeen_ was inflated by
+// a client that's since gone. If that excess margin *persists* (not just a
+// one-off), the anchor should be trimmed forward, once, back to the normal
+// depth after about half a second of simulated host time - the skipped
+// positions were never served to anyone, so this isn't a replay.
+static void anchorDepthForwardTrimTest() {
+    const std::string name = "/rmtest.trim." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    uint64_t now = 24'000'000'000;
+    const uint32_t frames = 512;
+    const uint64_t nsPerCycle = static_cast<uint64_t>(frames) * (1'000'000'000ull / 48000);  // ~10.67ms
+
+    writeMic(l, 1.f, 4800, now);
+    float out[frames];
+    double sampleTime = 1000;
+
+    r.ReadMic(sampleTime, out, frames, now);  // first sync: readBehind = 1472, gap = 960
+    for (float f : out) assert(f == 1.f);
+    const int64_t offset0 = r.DebugMicOffset();
+
+    // Inflate the gap into the "gray zone" above readBehind+480 (1952) but
+    // safely under the burst-resync bound readBehind+1440 (2912): write
+    // 1240 frames more than the normal per-cycle amount once, pushing gap
+    // from the steady 960 to 2200, without itself triggering any existing
+    // resync condition.
+    writeMic(l, 1.f, frames + 1240, now);
+    sampleTime += frames;
+    r.ReadMic(sampleTime, out, frames, now);
+    for (float f : out) assert(f == 1.f);
+    assert(r.DebugMicOffset() == offset0);  // confirms the bump alone didn't resync
+
+    // Hold that excess gap steady (writer and reader both advancing by
+    // `frames` per cycle from here, so the ~2200-frame gap neither grows
+    // nor shrinks) for a bit over 600ms of simulated host time.
+    const int cycles = static_cast<int>((600'000'000ull + nsPerCycle - 1) / nsPerCycle);
+    for (int cycle = 0; cycle < cycles; cycle++) {
+        writeMic(l, 1.f, frames, now);
+        sampleTime += frames;
+        now += nsPerCycle;
+        r.ReadMic(sampleTime, out, frames, now);
+        for (float f : out) assert(f == 1.f);  // never underruns while/after trimming
+    }
+
+    // The anchor must have been trimmed forward, once, back to the normal
+    // depth - not left sitting on the ~2200-frame surplus forever.
+    assert(r.DebugMicOffset() != offset0);
+    const uint64_t w = l->mic.h.write_pos.load();
+    const double posAfter = sampleTime + static_cast<double>(r.DebugMicOffset());
+    const int64_t gapAfter = static_cast<int64_t>(w) - static_cast<int64_t>(posAfter) - static_cast<int64_t>(frames);
+    assert(gapAfter >= 0 && gapAfter <= static_cast<int64_t>(readBehindFor(frames)) + 480);
+
+    r.Destroy();
 }
 
 // Fix (4): the app stores app_heartbeat_ns = 0 the instant it stops being
@@ -527,7 +840,12 @@ int main() {
     frozenWriteEdgeNoReplayTest();
     sustainedUnderrunWithAdvancingWriterResyncsTest();
     readerBrieflyAheadNoResyncTest();
-    twoClientsNoStarvationTest();
+    twoClientsNoStarvationTest(512, 1024);
+    twoClientsNoStarvationWideGapTest();
+    handoffNeverReplaysPreviousSessionTest();
+    quickRestartNoReplayTest();
+    endAlignedMultiClientNoReplayTest();
+    anchorDepthForwardTrimTest();
     largeReaderStableNoResyncTest();
     heartbeatZeroSilenceTest();
 
