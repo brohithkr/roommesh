@@ -1051,6 +1051,20 @@ impl RoomEngine {
                 });
             }
         }
+        // Peers we hold queued messages for (an invite to a non-member, an invite response or
+        // join request sent while in no room, ...) are redialed: the dial in `send` may have
+        // failed. Only while they're discoverable, so a vanished peer isn't dialed forever
+        // (members are redialed below regardless); the caller rate-limits the dials.
+        let mut redial: Vec<PeerId> = self
+            .queued
+            .keys()
+            .filter(|p| !self.sessions.contains(p) && self.nearby.contains_key(p))
+            .copied()
+            .collect();
+        redial.sort();
+        for p in redial {
+            self.connect(p);
+        }
         let Some(m) = self.manifest.clone() else {
             return;
         };
@@ -1909,6 +1923,61 @@ mod tests {
         let left: Vec<_> = e2.queued.values().flatten().collect();
         assert_eq!(left.len(), 1);
         assert!(matches!(left[0], ControlMessage::Leave { .. }));
+    }
+
+    #[test]
+    fn queued_messages_are_redialed_without_a_manifest_or_membership() {
+        let mut n = Net::new(&[1, 2]);
+        for (a, b) in [(1, 2), (2, 1)] {
+            n.engines
+                .get_mut(&PeerId(a))
+                .unwrap()
+                .on_discovered(PeerId(b), format!("Mac {b}"));
+        }
+        let invited = |n: &Net| n.has_event(2, |e| matches!(e, RoomEvent::InviteReceived { .. }));
+        // An invite to a non-member whose first dial failed.
+        n.cmd(1, Command::CreateRoom { name: "R".into() });
+        n.cut.insert(k(PeerId(1), PeerId(2)));
+        n.cmd(1, Command::Invite(PeerId(2)));
+        n.advance(500);
+        assert!(!invited(&n));
+        n.cut.clear();
+        n.advance(500);
+        assert!(invited(&n), "the queued invite is redialed");
+        // A decline queued while its sender is in no room at all.
+        n.cut.insert(k(PeerId(1), PeerId(2)));
+        n.drop_link(PeerId(1), PeerId(2));
+        let room_id = n.invite_for(2);
+        n.cmd(
+            2,
+            Command::RespondToInvite {
+                room_id,
+                accept: false,
+            },
+        );
+        assert!(n.manifest(2).is_none());
+        n.cut.clear();
+        n.advance(500);
+        assert!(n.has_event(
+            1,
+            |e| matches!(e, RoomEvent::InviteDeclined { peer } if *peer == PeerId(2))
+        ));
+    }
+
+    #[test]
+    fn queued_messages_for_an_undiscovered_peer_are_not_redialed() {
+        let mut n = Net::new(&[1, 2]);
+        n.cmd(1, Command::CreateRoom { name: "R".into() });
+        n.cut.insert(k(PeerId(1), PeerId(2)));
+        n.cmd(1, Command::Invite(PeerId(2)));
+        n.cut.clear();
+        let e1 = n.engines.get_mut(&PeerId(1)).unwrap();
+        e1.take_outputs();
+        e1.tick(n.now + 100);
+        assert!(!e1
+            .take_outputs()
+            .iter()
+            .any(|o| matches!(o, Output::Connect(_))));
     }
 
     #[test]
