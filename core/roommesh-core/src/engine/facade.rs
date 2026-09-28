@@ -19,7 +19,7 @@
 //! one nonce. The ping's own sequence travels in the pong payload instead:
 //! `[t1, t2, t3, ping_sequence]`, and the pinging DSP accepts a pong only for a ping it still
 //! has outstanding with the same t1 (once). Pings themselves pass a per-sender replay window
-//! (scoped to the session key and epoch) before they are answered.
+//! (scoped to the session key and epoch; older epochs are rejected) before they are answered.
 use crate::engine::metrics::{merge_local_report, PeerMetrics};
 use crate::engine::runtime::{
     AudioBackend, AudioRuntime, AudioSettings, RuntimeEvent, RuntimeMsg, RuntimeSender,
@@ -117,6 +117,9 @@ struct Cache {
     /// The room engine's view: this peer is the current coordinator (answers clock pings even
     /// while its own audio is disabled or its pipeline failed).
     is_coordinator: AtomicBool,
+    /// Per-sender replay window for clock pings. Written on the realtime receive path; pruned by
+    /// the control thread when a sender's session goes down or it leaves the member set.
+    ping_replay: Mutex<HashMap<PeerId, ReplayWindow>>,
 }
 
 /// The RoomMesh core. The [`PeerTransport`] and [`EventSink`] given to [`Core::new`] must honour
@@ -136,13 +139,15 @@ pub struct Core {
     muted: AtomicBool,
     /// Sequence numbers of the clock pongs we seal (see module docs).
     pong_seq: AtomicU32,
-    /// Per-sender replay window for clock pings.
-    ping_replay: Mutex<HashMap<PeerId, ReplayWindow>>,
 }
 
 /// Sliding anti-replay window over one sender's clock-ping sequence numbers, scoped to one
 /// realtime session key (its cipher instance, held so the identity can't be reused; a rekey
-/// resets the window) and epoch.
+/// resets the window) and epoch. Epochs only increase, so under one key a ping from an older
+/// epoch than the window's is stale and rejected (it must not reset the window, or an
+/// already-answered newer-epoch ping would be accepted again); a newer epoch resets it. The
+/// control thread drops a sender's window when it leaves the member set (a later room may
+/// legitimately start over at a lower epoch) or its session goes down.
 #[derive(Default)]
 struct ReplayWindow {
     scope: Option<(Arc<RtCipher>, Epoch)>,
@@ -155,10 +160,15 @@ impl ReplayWindow {
     const WIDTH: u32 = 64;
     /// Whether `seq` is new (and records it). Anything older than the window is rejected.
     fn accept(&mut self, key: &Arc<RtCipher>, epoch: Epoch, seq: u32) -> bool {
-        let same = self
-            .scope
-            .as_ref()
-            .is_some_and(|(k, e)| Arc::ptr_eq(k, key) && *e == epoch);
+        let same = match &self.scope {
+            Some((k, e)) if Arc::ptr_eq(k, key) => {
+                if epoch < *e {
+                    return false;
+                }
+                epoch == *e
+            }
+            _ => false,
+        };
         if !same {
             *self = Self {
                 scope: Some((key.clone(), epoch)),
@@ -259,7 +269,6 @@ impl Core {
             cache,
             muted: AtomicBool::new(false),
             pong_seq: AtomicU32::new(0),
-            ping_replay: Mutex::new(HashMap::new()),
         }
     }
 
@@ -312,6 +321,7 @@ impl Core {
                 }
                 // Replayed pings are not answered (no amplification, no stale samples).
                 let fresh = self
+                    .cache
                     .ping_replay
                     .lock()
                     .entry(h.sender)
@@ -564,6 +574,7 @@ impl ControlLoop {
                 }
             }
             TransportEvent::Disconnected(p) => {
+                self.cache.ping_replay.lock().remove(&p);
                 if self.control.on_disconnected(p).is_some() {
                     self.engine.on_session_down(now, p);
                 }
@@ -599,12 +610,14 @@ impl ControlLoop {
                         // that's still connected but restarted): notify the engine only, the
                         // connection itself is fine (or already being re-handshaked over).
                         Some(ControlEvent::SessionDown(p)) => {
+                            self.cache.ping_replay.lock().remove(&p);
                             self.engine.on_session_down(now, p);
                         }
                         // Crypto desync with no re-open in progress: the connection itself is
                         // suspect, so tear it down too and let a fresh `on_connected` start a
                         // clean handshake.
                         Some(ControlEvent::SessionFailed(p)) => {
+                            self.cache.ping_replay.lock().remove(&p);
                             self.engine.on_session_down(now, p);
                             self.transport.disconnect(p);
                         }
@@ -729,6 +742,10 @@ impl ControlLoop {
                             book.reset_to_names();
                         }
                     }
+                    self.cache
+                        .ping_replay
+                        .lock()
+                        .retain(|p, _| r.members.contains(p));
                     self.cache
                         .is_coordinator
                         .store(r.is_coordinator, Ordering::Relaxed);
@@ -1107,19 +1124,35 @@ mod tests {
         );
     }
 
+    fn test_cipher() -> Arc<RtCipher> {
+        use crate::network::secure::{decode_hello, Handshake};
+        let (a, b) = (
+            Handshake::new(PeerId(1), "a".into()),
+            Handshake::new(PeerId(2), "b".into()),
+        );
+        a.complete(&decode_hello(&b.hello()).unwrap())
+            .unwrap()
+            .realtime()
+    }
+
+    #[test]
+    fn replay_window_rejects_older_epochs_so_a_stale_ping_cannot_reset_it() {
+        let c = test_cipher();
+        let mut w = ReplayWindow::default();
+        assert!(w.accept(&c, Epoch(2), 5));
+        assert!(!w.accept(&c, Epoch(1), 0), "a ping from an older epoch is stale");
+        assert!(
+            !w.accept(&c, Epoch(2), 5),
+            "the already-answered new-epoch ping must stay answered"
+        );
+        assert!(w.accept(&c, Epoch(2), 6));
+        assert!(w.accept(&c, Epoch(3), 0), "a newer epoch resets");
+        assert!(!w.accept(&c, Epoch(2), 7));
+    }
+
     #[test]
     fn replay_window_accepts_each_sequence_once_and_resets_on_rekey_or_epoch() {
-        use crate::network::secure::{decode_hello, Handshake};
-        let cipher = || {
-            let (a, b) = (
-                Handshake::new(PeerId(1), "a".into()),
-                Handshake::new(PeerId(2), "b".into()),
-            );
-            a.complete(&decode_hello(&b.hello()).unwrap())
-                .unwrap()
-                .realtime()
-        };
-        let (c1, c2) = (cipher(), cipher());
+        let (c1, c2) = (test_cipher(), test_cipher());
         let mut w = ReplayWindow::default();
         let e = Epoch(1);
         assert!(w.accept(&c1, e, 10));
@@ -1130,8 +1163,72 @@ mod tests {
         assert!(w.accept(&c1, e, 200));
         assert!(!w.accept(&c1, e, 12), "older than the window");
         assert!(w.accept(&c1, Epoch(2), 12), "new epoch resets");
-        assert!(w.accept(&c2, Epoch(2), 0), "new key resets");
-        assert!(!w.accept(&c2, Epoch(2), 0));
+        assert!(w.accept(&c2, Epoch(1), 0), "new key resets, whatever the epoch");
+        assert!(!w.accept(&c2, Epoch(1), 0));
+    }
+
+    /// Pongs `raw` receives within `ms`.
+    fn pongs_within(raw: &RawPeer, ms: u64) -> usize {
+        let end = Instant::now() + Duration::from_millis(ms);
+        let mut n = 0;
+        while Instant::now() < end {
+            if let Ok(TransportEvent::Realtime(_)) = raw.rx.recv_timeout(Duration::from_millis(20))
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn ping_replay_state_is_pruned_when_the_peer_leaves_the_members_or_its_session() {
+        let net = LoopbackNetwork::new();
+        let a = node(&net, 1, Box::new(NullAudio));
+        let raw = raw_peer(&net, 2, &a, 1);
+        a.core
+            .command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        wait("A coordinates", 3, || a.core.roles().is_coordinator);
+        let epoch = a.core.room_snapshot().unwrap().epoch;
+        let cipher = raw.control.realtime_sessions().read()[&PeerId(1)].clone();
+        let ping = |epoch: Epoch, seq: u32| {
+            let p = cipher.seal(
+                &RtHeader {
+                    kind: PacketKind::ClockPing,
+                    epoch,
+                    stream: StreamId::CLOCK,
+                    sender: PeerId(2),
+                    sequence: seq,
+                    sample_index: 0,
+                    timestamp_ns: 1,
+                    frame_count: 0,
+                },
+                &encode_times(&[1]),
+            );
+            a.core.handle_transport_event(TransportEvent::Realtime(p));
+        };
+        let later = Epoch(epoch.0 + 5);
+        ping(later, 1);
+        assert_eq!(pongs_within(&raw, 200), 1);
+        ping(epoch, 2);
+        ping(later, 1);
+        assert_eq!(pongs_within(&raw, 200), 0, "stale epoch / replay");
+        // A new room: peer 2 is not in the member set any more, so its window is forgotten
+        // and pings for the (lower) new epoch are answered again.
+        a.core.command(Command::Leave).unwrap();
+        a.core
+            .command(Command::CreateRoom { name: "R2".into() })
+            .unwrap();
+        let epoch2 = a.core.room_snapshot().unwrap().epoch;
+        assert!(epoch2 < later);
+        ping(epoch2, 3);
+        assert_eq!(pongs_within(&raw, 200), 1);
+        assert!(a.core.cache.ping_replay.lock().contains_key(&PeerId(2)));
+        // Session down: its window goes too.
+        raw.transport.disconnect(PeerId(1));
+        wait("window pruned on session down", 3, || {
+            !a.core.cache.ping_replay.lock().contains_key(&PeerId(2))
+        });
     }
 
     #[test]
