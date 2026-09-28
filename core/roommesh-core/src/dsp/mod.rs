@@ -2,3 +2,4 @@
 pub mod level;
 pub mod vad;
 pub mod scoring;
+pub mod arbitration;
