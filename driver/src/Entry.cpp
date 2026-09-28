@@ -1,3 +1,4 @@
+#include "Devices.hpp"
 #include "Handlers.hpp"
 #include <aspl/Driver.hpp>
 #include <CoreAudio/AudioServerPlugIn.h>
@@ -5,23 +6,6 @@
 using namespace roommesh;
 
 namespace {
-
-std::shared_ptr<aspl::Device> MakeDevice(const std::shared_ptr<aspl::Context>& ctx, const char* name, const char* uid,
-                                         UInt32 channels, aspl::Direction dir) {
-    aspl::DeviceParameters p;
-    p.Name = name;
-    p.Manufacturer = "RoomMesh";
-    p.DeviceUID = uid;
-    p.ModelUID = std::string(uid) + "_Model";
-    p.SampleRate = kSampleRate;
-    p.ChannelCount = channels;
-    p.EnableMixing = true;
-    p.CanBeDefault = true;
-    p.CanBeDefaultForSystemSounds = false;
-    auto d = std::make_shared<aspl::Device>(ctx, p);
-    d->AddStreamWithControlsAsync(dir);
-    return d;
-}
 
 std::shared_ptr<aspl::Driver> CreateDriver() {
     auto ctx = std::make_shared<aspl::Context>();
@@ -46,7 +30,9 @@ std::shared_ptr<aspl::Driver> CreateDriver() {
 
 }  // namespace
 
-extern "C" void* RoomMeshEntryPoint(CFAllocatorRef, CFUUIDRef typeUUID) {
+// The bundle is built with -fvisibility=hidden; this is the only symbol the
+// HAL loads (via CFPlugInFactories in Info.plist), so export it explicitly.
+extern "C" __attribute__((visibility("default"))) void* RoomMeshEntryPoint(CFAllocatorRef, CFUUIDRef typeUUID) {
     if (!CFEqual(typeUUID, kAudioServerPlugInTypeUUID)) return nullptr;
     static std::shared_ptr<aspl::Driver> driver = CreateDriver();
     return driver->GetReference();

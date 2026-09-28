@@ -1,19 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
-# NOTE (toolchain adaptation): on this machine, CommandLineTools' default
-# "MacOSX.sdk" symlink points at MacOSX27.0.sdk, whose .tbd stub libraries
-# advertise an architecture triple ("arm64e.x1-macos") that this
-# CommandLineTools' own linker/tapi (ld-1267 / tapi-2100.0.2.6) cannot
-# parse ("tapi error: malformed file ... unknown architecture"), so even a
-# trivial `int main(){}` fails to link against the default SDK - for any
-# arch, not just x86_64. The CommandLineTools bundle also ships an older,
-# working MacOSX26.5.sdk. We pin CMAKE_OSX_SYSROOT to it so the universal
-# arm64+x86_64 build (as specified by the plan) links correctly.
+# NOTE (toolchain adaptation, root cause): on this machine, when only
+# CommandLineTools was selected (no full Xcode), its default "MacOSX.sdk"
+# symlink resolved to a mismatched MacOSX27.0.sdk, whose .tbd stub
+# libraries advertised an architecture triple ("arm64e.x1-macos") that
+# that CommandLineTools' own linker/tapi (ld-1267 / tapi-2100.0.2.6) could
+# not parse ("tapi error: malformed file ... unknown architecture") -
+# breaking linking for any arch, not just x86_64. Now that full Xcode
+# 26.5 is selected (`xcode-select -p` -> .../Xcode.app/Contents/Developer),
+# `xcrun --sdk macosx` correctly resolves to Xcode's own MacOSX26.5.sdk, so
+# we just ask CMake to resolve the "macosx" SDK name itself (same as
+# `xcrun --sdk macosx --show-sdk-path`) instead of hardcoding a path.
+# Only applied if the caller hasn't already set CMAKE_OSX_SYSROOT or
+# SDKROOT explicitly.
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
 set(CMAKE_OSX_DEPLOYMENT_TARGET 14.2 CACHE STRING "")
-if(NOT DEFINED CMAKE_OSX_SYSROOT OR CMAKE_OSX_SYSROOT STREQUAL "")
-    if(EXISTS "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk")
-        set(CMAKE_OSX_SYSROOT "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" CACHE STRING "")
-    endif()
+if(NOT DEFINED CMAKE_OSX_SYSROOT AND NOT DEFINED ENV{SDKROOT})
+    set(CMAKE_OSX_SYSROOT macosx CACHE STRING "")  # xcrun --sdk macosx -> selected Xcode's SDK
 endif()
 project(RoomMeshDriver CXX)
 set(CMAKE_CXX_STANDARD 17)
@@ -57,12 +59,34 @@ set(ASPL_PREFIX ${INSTALL_DIR})
 file(MAKE_DIRECTORY ${ASPL_PREFIX}/include)
 
 configure_file(Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
-add_library(RoomMesh MODULE src/Entry.cpp src/Handlers.cpp src/SharedRegion.cpp)
+add_library(RoomMesh MODULE src/Entry.cpp src/Handlers.cpp src/Devices.cpp src/SharedRegion.cpp)
 add_dependencies(RoomMesh libASPL_ext)
-target_include_directories(RoomMesh PRIVATE src ${ASPL_PREFIX}/include)
+target_include_directories(RoomMesh PRIVATE src)
+target_include_directories(RoomMesh SYSTEM PRIVATE ${ASPL_PREFIX}/include)
 target_link_libraries(RoomMesh PRIVATE ${ASPL_PREFIX}/lib/libASPL.a "-framework CoreAudio" "-framework CoreFoundation")
+# The HAL loads the driver only through the CFPlugInFactories entry point
+# (RoomMeshEntryPoint, exported explicitly with
+# __attribute__((visibility("default"))) in Entry.cpp); hide everything
+# else so the bundle doesn't leak libASPL/RoomMesh symbols. -fvisibility
+# only affects RoomMesh's own object files, not the prebuilt libASPL.a
+# (built by the ExternalProject above without that flag), so also tell the
+# linker directly to export nothing but RoomMeshEntryPoint - that hides
+# libASPL's symbols too.
+target_compile_options(RoomMesh PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+target_link_options(RoomMesh PRIVATE -Wl,-exported_symbol,_RoomMeshEntryPoint)
 set_target_properties(RoomMesh PROPERTIES
     BUNDLE TRUE
     BUNDLE_EXTENSION driver
     OUTPUT_NAME RoomMesh
     MACOSX_BUNDLE_INFO_PLIST ${CMAKE_BINARY_DIR}/Info.plist)
+
+# Verifies MakeDevice() actually produces Float32/48kHz streams (see the
+# CRITICAL fix in Devices.cpp: AddStreamWithControlsAsync(Direction) alone
+# would silently keep libASPL's 16-bit-int default format).
+add_executable(device_format_test tests/device_format_test.cpp src/Devices.cpp)
+add_dependencies(device_format_test libASPL_ext)
+target_include_directories(device_format_test PRIVATE src)
+target_include_directories(device_format_test SYSTEM PRIVATE ${ASPL_PREFIX}/include)
+target_link_libraries(device_format_test PRIVATE ${ASPL_PREFIX}/lib/libASPL.a "-framework CoreAudio" "-framework CoreFoundation")
+target_compile_options(device_format_test PRIVATE -UNDEBUG)
+add_test(NAME device_format_test COMMAND device_format_test)

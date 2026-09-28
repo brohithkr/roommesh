@@ -1,5 +1,6 @@
 #include "SharedRegion.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <mach/mach_time.h>
@@ -20,15 +21,47 @@ SharedRegion::~SharedRegion() {
 
 bool SharedRegion::Create(const char* name) {
     name_ = name;
-    shm_unlink(name);                 // drop a stale region from a previous coreaudiod
-    mode_t old = umask(0);            // fchmod on shm objects is EINVAL on macOS: set mode at creation
-    int fd = shm_open(name, O_CREAT | O_RDWR, 0666);
+    lastErrno_ = 0;
+    lastStep_ = nullptr;
+
+    // Drop a stale region left behind by a previous coreaudiod process (or a
+    // previous test run). Not itself a failure: shm_unlink() legitimately
+    // returns ENOENT when there is nothing to remove, and even if it fails
+    // for another reason, the O_CREAT|O_EXCL open below is the real
+    // source of truth and will surface any remaining problem.
+    shm_unlink(name);
+
+    // Decision 4: the shm region is mode 0666 so any local process (the app,
+    // running as the logged-in user, and the driver, running inside
+    // coreaudiod) can attach to it without a privileged daemon. fchmod() on
+    // a POSIX shm object returns EINVAL on macOS, so the only way to get
+    // that mode is to clear umask for the O_CREAT call itself. This does
+    // mean the region is readable/writable by any local user/process, which
+    // is accepted per Decision 4 (no secrets flow through it - only PCM).
+    mode_t old = umask(0);
+    // O_EXCL (after the shm_unlink above) guarantees we always create a
+    // fresh, zero-filled region rather than reusing one that might have a
+    // stale generation/layout from a differently-versioned driver.
+    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0666);
     umask(old);
-    if (fd < 0) return false;
-    if (ftruncate(fd, sizeof(SharedLayout)) != 0) { close(fd); return false; }
+    if (fd < 0) {
+        lastErrno_ = errno;
+        lastStep_ = "shm_open";
+        return false;
+    }
+    if (ftruncate(fd, sizeof(SharedLayout)) != 0) {
+        lastErrno_ = errno;
+        lastStep_ = "ftruncate";
+        close(fd);
+        return false;
+    }
     void* p = mmap(nullptr, sizeof(SharedLayout), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (p == MAP_FAILED) return false;
+    if (p == MAP_FAILED) {
+        lastErrno_ = errno;
+        lastStep_ = "mmap";
+        return false;
+    }
     layout_ = static_cast<SharedLayout*>(p);
     std::memset(static_cast<void*>(layout_), 0, sizeof(SharedLayout));
     layout_->header.magic = kMagic;

@@ -16,6 +16,12 @@ public:
     SharedLayout* layout() const { return layout_; }
     bool valid() const { return layout_ != nullptr; }
 
+    // Valid after Create() returns false: the errno captured at the failing
+    // syscall, and the name of that syscall/step ("shm_open", "ftruncate",
+    // "mmap"), for diagnostic logging.
+    int LastErrno() const { return lastErrno_; }
+    const char* LastStep() const { return lastStep_; }
+
     // Serve `frames` mono samples for the RoomMesh Microphone IO cycle at device sample time `sampleTime`.
     // Every client in the same cycle passes the same sampleTime and receives the same audio.
     void ReadMic(double sampleTime, float* out, uint32_t frames, uint64_t nowNs);
@@ -28,6 +34,8 @@ private:
     std::string name_;
     std::atomic<bool> micSynced_{false};
     std::atomic<int64_t> micOffset_{0};
+    int lastErrno_ = 0;
+    const char* lastStep_ = nullptr;
 };
 
 }  // namespace roommesh

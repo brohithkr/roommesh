@@ -18,6 +18,10 @@ private:
 
 class SpeakerIOHandler : public aspl::IORequestHandler {
 public:
+    // `channels` is the expected channel count (used only to sanity-check
+    // against the stream's actual format at runtime); the channel count
+    // actually used to interpret `bytes` is read from the stream itself via
+    // Stream::GetChannelCount(), not hard-coded.
     SpeakerIOHandler(std::shared_ptr<SharedRegion> r, UInt32 channels) : region_(std::move(r)), channels_(channels) {}
     void OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& stream, Float64 zeroTimestamp, Float64 timestamp,
                             const void* bytes, UInt32 bytesCount) override;
