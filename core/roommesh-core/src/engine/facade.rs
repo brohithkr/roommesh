@@ -1272,12 +1272,13 @@ mod tests {
     }
 
     fn test_cipher() -> Arc<RtCipher> {
-        use crate::network::secure::{decode_hello, Handshake};
+        use crate::network::secure::{commitment, Handshake};
         let (a, b) = (
             Handshake::new(PeerId(1), "a".into()),
             Handshake::new(PeerId(2), "b".into()),
         );
-        a.complete(&decode_hello(&b.hello()).unwrap())
+        let ha = a.hello();
+        a.complete(&ha, &b.hello_reply(&commitment(&ha)))
             .unwrap()
             .realtime()
     }

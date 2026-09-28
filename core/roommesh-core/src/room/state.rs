@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the control-channel wire format changes in a way that isn't
 /// forward/backward compatible (e.g. `secure::Hello` gaining/losing/reordering fields).
 /// Version 2: `Hello` gained `reply_to`.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Version 3: commit-then-reveal handshake (`COMMIT` frame; `reply_to` names a commitment);
+/// keys and SAS derived from a transcript hash of both Hellos.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Capabilities {
