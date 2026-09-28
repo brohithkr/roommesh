@@ -157,6 +157,8 @@ pub enum FfiEvent {
     AecStatusChanged { converged: bool },
     LeftRoom,
     Error { message: String },
+    /// Informational status (e.g. "Microphone recovered"); show it unobtrusively, not as an error.
+    Notice { message: String },
 }
 
 fn quality(x: ConnectionQuality) -> FfiQuality {
@@ -251,6 +253,7 @@ pub fn to_ffi_event(e: RoomEvent) -> FfiEvent {
         RoomEvent::AecStatusChanged { converged } => FfiEvent::AecStatusChanged { converged },
         RoomEvent::LeftRoom => FfiEvent::LeftRoom,
         RoomEvent::Error { message } => FfiEvent::Error { message },
+        RoomEvent::Notice { message } => FfiEvent::Notice { message },
     }
 }
 
@@ -512,6 +515,10 @@ mod tests {
         let e = to_ffi_event(RoomEvent::ActiveMicChanged { primary: Some(PeerId(0xab)), secondary: None });
         match e { FfiEvent::ActiveMicChanged { primary, secondary } => { assert_eq!(primary.as_deref(), Some("00000000000000ab")); assert!(secondary.is_none()); } _ => panic!() }
         assert!(matches!(to_ffi_event(RoomEvent::LeftRoom), FfiEvent::LeftRoom));
+        assert_eq!(
+            to_ffi_event(RoomEvent::Notice { message: "Microphone recovered".into() }),
+            FfiEvent::Notice { message: "Microphone recovered".into() }
+        );
         assert!(parse_peer("nothex").is_err());
     }
     #[test]

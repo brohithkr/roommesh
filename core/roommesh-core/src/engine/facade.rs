@@ -627,6 +627,7 @@ impl ControlLoop {
                 .sink
                 .on_event(RoomEvent::AecStatusChanged { converged }),
             RuntimeEvent::Error(message) => self.sink.on_event(RoomEvent::Error { message }),
+            RuntimeEvent::Notice(message) => self.sink.on_event(RoomEvent::Notice { message }),
             RuntimeEvent::Report(r) => {
                 let Some(c) = self.engine.manifest().map(|m| m.coordinator) else {
                     return;

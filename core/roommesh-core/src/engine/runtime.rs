@@ -55,8 +55,18 @@ const DEVICE_RETRY_NS: u64 = 3_000_000_000;
 /// A requested open that has not completed by then is abandoned (and retried).
 const DEVICE_OPEN_TIMEOUT_NS: u64 = 5_000_000_000;
 /// A running device that delivers no capture blocks / playback reports for this long is
-/// considered dead and restarted.
+/// considered dead and restarted…
 const DEVICE_STALL_NS: u64 = 1_000_000_000;
+/// …except right after opening: some devices take seconds to deliver their first callback.
+const DEVICE_FIRST_ACTIVITY_NS: u64 = 5_000_000_000;
+/// Delay before reopening a stalled device, doubling per consecutive stall up to the max (reset
+/// once the device has been delivering for that long).
+const DEVICE_RESTART_BACKOFF_MIN_NS: u64 = 1_000_000_000;
+const DEVICE_RESTART_BACKOFF_MAX_NS: u64 = 10_000_000_000;
+/// Every frame dropped as too old for this long: the input latency alone exceeds the mic budget.
+const MIC_OVER_BUDGET_NS: u64 = 1_000_000_000;
+const MIC_OVER_BUDGET_MSG: &str =
+    "Microphone latency exceeds the room mic budget; raise Mic latency in Advanced settings";
 /// Mic-grid lag beyond which missed 10 ms slots are skipped (written as silence) instead of
 /// being run through the pipeline.
 ///
@@ -256,9 +266,11 @@ pub enum RuntimeEvent {
     },
     AecStatus(bool),
     Report(PeerReport),
-    /// User-visible device/pipeline status message (failures, and the matching recovery
-    /// notices such as "RoomMesh virtual devices reconnected").
+    /// User-visible device/pipeline failure.
     Error(String),
+    /// User-visible informational status, e.g. a recovery ("Microphone recovered", "RoomMesh
+    /// virtual devices reconnected"). Not an error.
+    Notice(String),
 }
 
 /// State the DSP thread publishes for other threads. The DSP thread only ever holds these locks
@@ -394,6 +406,11 @@ fn emit(events: &Sender<RuntimeEvent>, msg: String) {
     let _ = events.try_send(RuntimeEvent::Error(msg));
 }
 
+fn notice(events: &Sender<RuntimeEvent>, msg: String) {
+    log::info!("{msg}");
+    let _ = events.try_send(RuntimeEvent::Notice(msg));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Virtual device monitor (every Mac)
 
@@ -486,6 +503,11 @@ struct Slot<T, H> {
     pending: Option<(PendingOpen<H>, u64)>,
     retry_at: u64,
     last_activity_ns: u64,
+    /// When the running device was opened, and whether it has delivered anything since.
+    opened_ns: u64,
+    delivered: bool,
+    /// Delay before the next stall restart's reopen (0: not backing off).
+    restart_backoff_ns: u64,
     /// Last failure message reported (deduplicates reports; cleared on recovery).
     reported: Option<String>,
     /// Opened after a reported failure; recovery is announced once audio actually flows.
@@ -499,6 +521,9 @@ impl<T, H> Slot<T, H> {
             pending: None,
             retry_at: 0,
             last_activity_ns: 0,
+            opened_ns: 0,
+            delivered: false,
+            restart_backoff_ns: 0,
             reported: None,
             confirming: false,
         }
@@ -508,6 +533,35 @@ impl<T, H> Slot<T, H> {
         let running = self.running.take().is_some();
         let pending = self.pending.take().is_some();
         running || pending
+    }
+    /// Not wanted any more: forget failures and backoff.
+    fn reset(&mut self) {
+        self.retry_at = 0;
+        self.reported = None;
+        self.confirming = false;
+        self.restart_backoff_ns = 0;
+    }
+    fn opened(&mut self, dev: T, now: u64) {
+        self.running = Some(dev);
+        self.last_activity_ns = now;
+        self.opened_ns = now;
+        self.delivered = false;
+        self.confirming = self.reported.is_some();
+    }
+    /// Running but silent for too long: a generous grace until the first delivery, then 1 s.
+    fn stalled(&self, now: u64) -> bool {
+        let limit = if self.delivered {
+            DEVICE_STALL_NS
+        } else {
+            DEVICE_FIRST_ACTIVITY_NS
+        };
+        self.running.is_some() && now.saturating_sub(self.last_activity_ns) > limit
+    }
+    /// The next stall restart's reopen delay (exponential backoff).
+    fn next_restart_delay(&mut self) -> u64 {
+        let d = self.restart_backoff_ns.max(DEVICE_RESTART_BACKOFF_MIN_NS);
+        self.restart_backoff_ns = (d * 2).min(DEVICE_RESTART_BACKOFF_MAX_NS);
+        d
     }
     fn fail(&mut self, events: &Sender<RuntimeEvent>, msg: String, retry_at: u64) {
         self.retry_at = retry_at;
@@ -519,8 +573,12 @@ impl<T, H> Slot<T, H> {
     }
     fn activity(&mut self, now: u64, events: &Sender<RuntimeEvent>, what: &str) {
         self.last_activity_ns = now;
+        self.delivered = true;
+        if now.saturating_sub(self.opened_ns) >= DEVICE_RESTART_BACKOFF_MAX_NS {
+            self.restart_backoff_ns = 0; // healthy for a while: the next stall restarts quickly
+        }
         if std::mem::take(&mut self.confirming) && self.reported.take().is_some() {
-            emit(events, format!("{what} recovered"));
+            notice(events, format!("{what} recovered"));
         }
     }
 }
@@ -528,6 +586,10 @@ impl<T, H> Slot<T, H> {
 struct Capture {
     h: CaptureHandle,
     fa: FrameAssembler,
+    /// Since when even the freshest frame has been too old for the mic budget; reported once
+    /// per open (as `MIC_OVER_BUDGET_MSG`) when that lasts `MIC_OVER_BUDGET_NS`.
+    over_budget_since: Option<u64>,
+    over_budget_reported: bool,
 }
 
 struct Playback {
@@ -555,6 +617,8 @@ struct CoordState {
     farend_clock: DeviceClock,
     /// (ring position, host time) where the next far-end chunk should start.
     farend_expect: Option<(u64, u64)>,
+    /// Last (write_pos, write_host_ns) fed to `farend_clock`.
+    farend_last_wt: Option<(u64, u64)>,
     next_out_ns: u64,
     selection: Selection,
 }
@@ -577,6 +641,7 @@ impl CoordState {
         self.farend = FrameAssembler::new(SAMPLE_RATE);
         self.farend_clock.reset();
         self.farend_expect = None;
+        self.farend_last_wt = None;
     }
 }
 
@@ -794,6 +859,13 @@ impl Dsp {
         if let Some(cs) = self.coord.as_mut() {
             cs.pipe.set_arbitration(s.coordinator.arbitration.clone());
         }
+        if s.coordinator.mic_latency_ns != self.settings.coordinator.mic_latency_ns {
+            if let Some(c) = self.capture.running.as_mut() {
+                // New budget: judge (and report) the input latency afresh.
+                c.over_budget_since = None;
+                c.over_budget_reported = false;
+            }
+        }
         self.settings = s;
         if devices_changed {
             self.stop_devices();
@@ -874,6 +946,7 @@ impl Dsp {
                             farend: FrameAssembler::new(SAMPLE_RATE),
                             farend_clock: DeviceClock::new(SAMPLE_RATE as f64, 0),
                             farend_expect: None,
+                            farend_last_wt: None,
                             next_out_ns: 0,
                             selection: Selection::default(),
                         });
@@ -901,18 +974,25 @@ impl Dsp {
             if slot.clear() {
                 self.backend.stop_capture();
             }
-            slot.retry_at = 0;
-            slot.reported = None;
-            slot.confirming = false;
+            slot.reset();
             return;
         }
-        if slot.running.is_some() && now.saturating_sub(slot.last_activity_ns) > DEVICE_STALL_NS {
+        // Undrained blocks are activity too (the DSP thread itself may have stalled).
+        if slot
+            .running
+            .as_ref()
+            .is_some_and(|c| c.h.blocks.slots() > 0)
+        {
+            slot.activity(now, &self.events, "Microphone");
+        }
+        if slot.stalled(now) {
             slot.clear();
             self.backend.stop_capture();
+            let retry_at = now + slot.next_restart_delay();
             slot.fail(
                 &self.events,
                 "Microphone stopped delivering audio; restarting it".into(),
-                now,
+                retry_at,
             );
         }
         if slot.running.is_none() && slot.pending.is_none() && now >= slot.retry_at {
@@ -925,9 +1005,15 @@ impl Dsp {
             Ok(Ok(h)) => {
                 slot.pending = None;
                 let fa = FrameAssembler::new(h.sample_rate);
-                slot.running = Some(Capture { h, fa });
-                slot.last_activity_ns = now;
-                slot.confirming = slot.reported.is_some();
+                slot.opened(
+                    Capture {
+                        h,
+                        fa,
+                        over_budget_since: None,
+                        over_budget_reported: false,
+                    },
+                    now,
+                );
             }
             Ok(Err(e)) => {
                 slot.pending = None;
@@ -965,18 +1051,25 @@ impl Dsp {
             if slot.clear() {
                 self.backend.stop_playback();
             }
-            slot.retry_at = 0;
-            slot.reported = None;
-            slot.confirming = false;
+            slot.reset();
             return;
         }
-        if slot.running.is_some() && now.saturating_sub(slot.last_activity_ns) > DEVICE_STALL_NS {
+        // Undrained reports are activity too (the DSP thread itself may have stalled).
+        if slot
+            .running
+            .as_ref()
+            .is_some_and(|p| p.h.reports.slots() > 0)
+        {
+            slot.activity(now, &self.events, "Speaker");
+        }
+        if slot.stalled(now) {
             slot.clear();
             self.backend.stop_playback();
+            let retry_at = now + slot.next_restart_delay();
             slot.fail(
                 &self.events,
                 "Speaker stopped playing; restarting it".into(),
-                now,
+                retry_at,
             );
         }
         if slot.running.is_none() && slot.pending.is_none() && now >= slot.retry_at {
@@ -989,15 +1082,16 @@ impl Dsp {
             Ok(Ok(h)) => {
                 slot.pending = None;
                 let clock = PlaybackClock::new(h.sample_rate as f64);
-                slot.running = Some(Playback {
-                    h,
-                    clock,
-                    pushed: 0,
-                    last_output_frames: None,
-                    callback_frames: 0,
-                });
-                slot.last_activity_ns = now;
-                slot.confirming = slot.reported.is_some();
+                slot.opened(
+                    Playback {
+                        h,
+                        clock,
+                        pushed: 0,
+                        last_output_frames: None,
+                        callback_frames: 0,
+                    },
+                    now,
+                );
             }
             Ok(Err(e)) => {
                 slot.pending = None;
@@ -1054,7 +1148,9 @@ impl Dsp {
         if let Some(ev) = self.vdev.tick(now, &mut *self.backend, active) {
             match ev {
                 VdevEvent::Unavailable(msg) => self.error(msg),
-                VdevEvent::Reconnected => self.error("RoomMesh virtual devices reconnected".into()),
+                VdevEvent::Reconnected => {
+                    notice(&self.events, "RoomMesh virtual devices reconnected".into())
+                }
             }
         }
         self.shared
@@ -1130,10 +1226,14 @@ impl Dsp {
             return;
         };
         // Frames older than the coordinator's mic budget can no longer be used; dropping them
-        // avoids a stale-backlog burst after a mic toggle or a stall.
-        let oldest = now.saturating_sub(self.settings.coordinator.mic_latency_ns);
+        // avoids a stale-backlog burst after a mic toggle or a stall. A frame is only complete
+        // FRAME_NS after its start, hence the extra frame.
+        let oldest = now.saturating_sub(self.settings.coordinator.mic_latency_ns + FRAME_NS);
+        let mut newest_stale = None;
         while let Some(frame) = cap.fa.pop_frame() {
-            if self.muted || frame.timestamp_ns < oldest {
+            let stale = frame.timestamp_ns < oldest;
+            newest_stale = Some(stale);
+            if self.muted || stale {
                 continue;
             }
             if let Some(cs) = self.coord.as_mut() {
@@ -1154,6 +1254,19 @@ impl Dsp {
                 send_rt(&self.transport, &self.sessions, c, &hdr, &payload);
             }
         }
+        // A backlog after a stall drains stale frames too, but its newest frame is fresh; only
+        // when even the newest is too old does the input latency itself exceed the budget.
+        match newest_stale {
+            Some(true) => {
+                let since = *cap.over_budget_since.get_or_insert(now);
+                if !cap.over_budget_reported && now.saturating_sub(since) >= MIC_OVER_BUDGET_NS {
+                    cap.over_budget_reported = true;
+                    emit(&self.events, MIC_OVER_BUDGET_MSG.into());
+                }
+            }
+            Some(false) => cap.over_budget_since = None,
+            None => {}
+        }
     }
 
     // Borrow note: `cs` borrows `self.coord`; everything else is reached through disjoint
@@ -1166,7 +1279,13 @@ impl Dsp {
         // far-end: what the meeting app plays into "RoomMesh Speaker"
         if let Some(link) = cs.vdev.as_mut() {
             while let Some(chunk) = link.spk.read(4096) {
-                cs.farend_clock.report(chunk.write_pos, chunk.write_host_ns);
+                // Same write position with a different host time is a torn read of the
+                // driver's (position, time) pair: keep the clock on the previous sample.
+                let (w, t) = (chunk.write_pos, chunk.write_host_ns);
+                if cs.farend_last_wt.is_none_or(|(lw, _)| lw != w) {
+                    cs.farend_clock.report(w, t);
+                    cs.farend_last_wt = Some((w, t));
+                }
                 let ts = cs.farend_clock.time_of(chunk.first_pos).unwrap_or(now);
                 if let Some((pos, t)) = cs.farend_expect {
                     if pos != chunk.first_pos || ts.abs_diff(t) > FAREND_JUMP_NS {
@@ -1413,6 +1532,18 @@ mod tests {
         );
         (d, ev_rx)
     }
+    /// (errors, notices) queued so far.
+    fn split_events(ev: &crossbeam_channel::Receiver<RuntimeEvent>) -> (Vec<String>, Vec<String>) {
+        let (mut errs, mut notes) = (Vec::new(), Vec::new());
+        for e in ev.try_iter() {
+            match e {
+                RuntimeEvent::Error(m) => errs.push(m),
+                RuntimeEvent::Notice(m) => notes.push(m),
+                _ => {}
+            }
+        }
+        (errs, notes)
+    }
     fn errors(ev: &crossbeam_channel::Receiver<RuntimeEvent>) -> Vec<String> {
         ev.try_iter()
             .filter_map(|e| match e {
@@ -1586,11 +1717,15 @@ mod tests {
             a_pos,
             "nothing more is written to A"
         );
-        let msgs = errors(&ev);
+        let (errs, notes) = split_events(&ev);
         assert_eq!(
-            msgs.iter().filter(|m| m.contains("reconnected")).count(),
+            notes.iter().filter(|m| m.contains("reconnected")).count(),
             1,
-            "{msgs:?}"
+            "{notes:?}"
+        );
+        assert!(
+            !errs.iter().any(|m| m.contains("reconnected")),
+            "a recovery is a notice, not an error: {errs:?}"
         );
     }
 
@@ -1830,5 +1965,191 @@ mod tests {
             .expect("an error event");
         assert!(msg.contains("audio stopped working"), "{msg}");
         rt.shutdown(); // joins the dead thread without hanging
+    }
+
+    /// Physical devices driven by the test: counts opens and exposes the producer ends.
+    #[derive(Clone, Default)]
+    struct FakeDevices {
+        captures: Arc<std::sync::atomic::AtomicUsize>,
+        playbacks: Arc<std::sync::atomic::AtomicUsize>,
+        mic: Arc<Mutex<Option<rtrb::Producer<crate::audio::device_io::CaptureBlock>>>>,
+        reports: Arc<Mutex<Option<rtrb::Producer<crate::audio::device_io::PlaybackReport>>>>,
+        /// Keeps the consumer end of the output ring alive.
+        output: Arc<Mutex<Option<rtrb::Consumer<f32>>>>,
+    }
+    impl FakeDevices {
+        /// Queues one 10 ms capture block stamped `capture_ns`.
+        fn mic_block(&self, index: u64, capture_ns: u64) {
+            use crate::audio::device_io::{CaptureBlock, BLOCK_FRAMES};
+            let b = CaptureBlock {
+                first_frame: index,
+                capture_ns,
+                len: 480,
+                samples: [0.0; BLOCK_FRAMES],
+            };
+            let _ = self.mic.lock().as_mut().expect("mic open").push(b);
+        }
+        fn report(&self) {
+            let r = crate::audio::device_io::PlaybackReport::default();
+            let _ = self.reports.lock().as_mut().expect("speaker open").push(r);
+        }
+        fn opens(&self) -> (usize, usize) {
+            (
+                self.captures.load(Ordering::SeqCst),
+                self.playbacks.load(Ordering::SeqCst),
+            )
+        }
+    }
+    impl AudioBackend for FakeDevices {
+        fn start_capture(&mut self, _: &DeviceSelector) -> Result<CaptureHandle, DeviceError> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            let (p, c) = rtrb::RingBuffer::new(256);
+            *self.mic.lock() = Some(p);
+            Ok(CaptureHandle {
+                blocks: c,
+                sample_rate: 48_000,
+                device_name: "Fake Mic".into(),
+            })
+        }
+        fn stop_capture(&mut self) {}
+        fn start_playback(&mut self, _: &DeviceSelector) -> Result<PlaybackHandle, DeviceError> {
+            self.playbacks.fetch_add(1, Ordering::SeqCst);
+            let (sp, sc) = rtrb::RingBuffer::new(48_000);
+            let (rp, rc) = rtrb::RingBuffer::new(256);
+            *self.reports.lock() = Some(rp);
+            *self.output.lock() = Some(sc);
+            Ok(PlaybackHandle {
+                samples: sp,
+                reports: rc,
+                sample_rate: 48_000,
+                device_name: "Fake Speaker".into(),
+            })
+        }
+        fn stop_playback(&mut self) {}
+        fn open_virtual_device(&mut self) -> Result<Arc<SharedRegion>, VirtualDeviceError> {
+            Err(VirtualDeviceError::NotFound(libc::ENOENT))
+        }
+    }
+
+    #[test]
+    fn slow_starting_mic_gets_a_grace_period_and_restarts_back_off() {
+        let fake = FakeDevices::default();
+        let (mut d, ev) = dsp(2, Box::new(fake.clone()));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2))); // member, mic on, not the speaker
+        assert_eq!(fake.opens().0, 1);
+        let at = |ms: u64| t0 + ms * MS;
+        for ms in (100..=4_800).step_by(100) {
+            d.step(at(ms));
+        }
+        assert_eq!(
+            fake.opens().0,
+            1,
+            "restarted within the 5 s first-delivery grace"
+        );
+        // First delivery at 4.9 s; from then on 1 s of silence is a stall.
+        fake.mic_block(0, at(4_890));
+        d.step(at(4_900));
+        d.step(at(5_800));
+        assert_eq!(fake.opens().0, 1);
+        d.step(at(6_000));
+        let (errs, _) = split_events(&ev);
+        assert!(
+            errs.iter().any(|m| m.contains("stopped delivering")),
+            "{errs:?}"
+        );
+        // Reopened after a 1 s backoff…
+        d.step(at(6_900));
+        assert_eq!(fake.opens().0, 1, "reopened before the backoff elapsed");
+        d.step(at(7_100));
+        assert_eq!(fake.opens().0, 2);
+        // …and never delivers: 5 s grace again, then the backoff doubles to 2 s.
+        d.step(at(12_000));
+        assert_eq!(fake.opens().0, 2);
+        d.step(at(12_200)); // stalled: restart, reopen due at 14.2 s
+        d.step(at(14_000));
+        assert_eq!(fake.opens().0, 2, "backoff should have doubled to 2 s");
+        d.step(at(14_300));
+        assert_eq!(fake.opens().0, 3);
+        // Audio flows again: announced as a notice, not an error.
+        fake.mic_block(0, at(14_390));
+        d.step(at(14_400));
+        let (errs, notes) = split_events(&ev);
+        assert!(
+            notes.iter().any(|m| m == "Microphone recovered"),
+            "{notes:?}"
+        );
+        assert!(!errs.iter().any(|m| m.contains("recovered")), "{errs:?}");
+    }
+
+    #[test]
+    fn dsp_stall_with_data_in_the_rings_does_not_restart_devices() {
+        let fake = FakeDevices::default();
+        let (mut d, ev) = dsp(2, Box::new(fake.clone()));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 2, 2))); // member, mic on, room speaker
+        assert_eq!(fake.opens(), (1, 1));
+        let mut idx = 0;
+        for i in 1..=10u64 {
+            let t = t0 + i * 10 * MS;
+            fake.mic_block(idx, t - 10 * MS);
+            idx += 480;
+            fake.report();
+            d.step(t);
+        }
+        // Both devices keep delivering, but the DSP thread doesn't run for 3 s.
+        fake.mic_block(idx, t0 + 3_000 * MS);
+        fake.report();
+        d.step(t0 + 3_100 * MS);
+        assert_eq!(fake.opens(), (1, 1), "a DSP stall is not a device stall");
+        let (errs, _) = split_events(&ev);
+        assert!(!errs.iter().any(|m| m.contains("stopped")), "{errs:?}");
+    }
+
+    #[test]
+    fn mic_latency_over_budget_is_reported_once() {
+        let fake = FakeDevices::default();
+        let (mut d, ev) = dsp(2, Box::new(fake.clone()));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        let budget = d.settings.coordinator.mic_latency_ns;
+        let over = |ev: &crossbeam_channel::Receiver<RuntimeEvent>| {
+            split_events(ev)
+                .0
+                .iter()
+                .filter(|m| m.as_str() == MIC_OVER_BUDGET_MSG)
+                .count()
+        };
+        // A 1 s backlog drained at once, then live audio: not reported.
+        let mut idx = 0;
+        for k in 0..100u64 {
+            fake.mic_block(idx, t0 + k * 10 * MS);
+            idx += 480;
+        }
+        let mut t = t0 + 1_020 * MS;
+        let mut run = |d: &mut Dsp, latency: u64, steps: usize| {
+            for _ in 0..steps {
+                fake.mic_block(idx, t - latency);
+                idx += 480;
+                d.step(t);
+                t += 10 * MS;
+            }
+        };
+        run(&mut d, 20 * MS, 150);
+        assert_eq!(over(&ev), 0);
+        // Input latency just under the budget: the newest complete frame is then ~one frame
+        // older than the budget, and must still be used.
+        run(&mut d, budget - 5 * MS, 200);
+        assert_eq!(
+            over(&ev),
+            0,
+            "a frame is only complete FRAME_NS after its start"
+        );
+        // Input latency alone now exceeds the budget: every frame is dropped. Reported once.
+        run(&mut d, budget + 60 * MS, 300);
+        assert_eq!(over(&ev), 1);
     }
 }

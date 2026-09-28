@@ -92,6 +92,10 @@ pub enum RoomEvent {
     Error {
         message: String,
     },
+    /// Informational status for the user (e.g. a device recovered); not an error.
+    Notice {
+        message: String,
+    },
 }
 
 /// What this Mac must do right now. Produced by the room engine, consumed by the audio runtime.
