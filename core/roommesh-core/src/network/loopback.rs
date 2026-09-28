@@ -28,12 +28,11 @@ fn key(a: PeerId, b: PeerId) -> (PeerId, PeerId) {
 
 pub struct LoopbackNetwork {
     inner: Mutex<Inner>,
-    /// Held only while actually calling `TransportSink::send` for a batch of collected events
-    /// (see `flush`). `inner`'s lock is never held during a send (a sink is allowed to block --
-    /// see `TransportSink`'s doc), but without some ordering, two threads racing to flush their
-    /// own batches could interleave arbitrarily even though each batch was computed under a
-    /// single, consistent snapshot of `inner`. Serializing flushes in lock-acquisition order
-    /// keeps a single, predictable global delivery order across threads.
+    /// Orders deliveries (see `with_lock_and_flush`): taken *before* `inner` and held through
+    /// both computing a batch of events under `inner` and sending it, so batches are delivered
+    /// in the order their state changes were made. `inner` itself is released before the sends
+    /// (a sink may block -- see `TransportSink`'s doc); without `emit`, two threads could
+    /// deliver their batches in the opposite order to the one they computed them in.
     emit: Mutex<()>,
 }
 
