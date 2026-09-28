@@ -13,7 +13,12 @@ constexpr uint32_t kVersion = 1;
 constexpr uint32_t kSampleRate = 48000;
 constexpr uint32_t kRingFrames = 32768;  // power of two (~680 ms)
 constexpr uint64_t kRingMask = kRingFrames - 1;
-constexpr uint64_t kMicLatencyFrames = 960;  // driver reads 20 ms behind the app's write edge
+// Minimum distance (in frames) the driver reads behind the app's write
+// edge (~20 ms). This is a floor, not a fixed lag: SharedRegion::ReadMic
+// scales the actual read-behind distance up for larger IO cycle sizes
+// (readBehind = max(kMicLatencyFrames, frames + 480)) so clients with
+// bigger buffers (e.g. 1024+ frames) don't resync every cycle.
+constexpr uint64_t kMicLatencyFrames = 960;
 
 struct SharedHeader {
     uint32_t magic;
@@ -52,5 +57,24 @@ static_assert(sizeof(SharedHeader) == 64);
 static_assert(sizeof(RingHeader) == 64);
 static_assert(sizeof(Ring) == 64 + 4 * kRingFrames);
 static_assert(sizeof(SharedLayout) == 262336);
+
+// Field-offset assertions mirroring the Rust-side layout test
+// (core/roommesh-core/src/audio/shared_layout.rs). This struct is a shared
+// memory-mapped ABI between the driver (this file) and the app: any
+// unintentional offset shift here would silently desync the two sides.
+// std::atomic<uint64_t>/<uint32_t> as used here are trivial wrappers that
+// remain standard-layout under libc++/libstdc++, but some toolchains still
+// warn on offsetof through them; the warning is suppressed locally rather
+// than dropping the check.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+static_assert(offsetof(SharedHeader, generation) == 16, "SharedHeader::generation must sit at byte 16");
+static_assert(offsetof(SharedLayout, mic) == 64, "SharedLayout::mic must sit at byte 64");
+static_assert(offsetof(SharedLayout, speaker) == 131200, "SharedLayout::speaker must sit at byte 131200");
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 }  // namespace roommesh
