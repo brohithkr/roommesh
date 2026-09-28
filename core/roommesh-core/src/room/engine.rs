@@ -1,5 +1,13 @@
 //! Room state machine. Pure and deterministic: callers feed inputs stamped with the current time
 //! (ms) and drain `Output`s (messages, connection requests, UI events, role changes).
+//!
+//! Coordinator liveness is judged through the whole room, not just the local link: every
+//! heartbeat carries `sees_coordinator` (the sender's own view), and a peer only declares the
+//! coordinator lost when it can't reach it itself *and* no other live member currently reports
+//! reaching it. Trade-off: with one broken link (A↔C cut, B sees both) C stays in A's room with a
+//! single coordinator instead of splitting the room — but C's mic can't reach the coordinator
+//! (and C sees it as offline) until the link heals. Control requests from C are relayed through
+//! a member that can see the coordinator.
 use crate::ids::{PeerId, RoomId};
 use crate::room::election::{elect_coordinator, speaker_candidates};
 use crate::room::events::*;
@@ -86,6 +94,8 @@ pub struct RoomEngine {
     invites_in: HashMap<RoomId, PendingInvite>,
     joining: Option<(RoomId, u64)>,
     queued: HashMap<PeerId, Vec<ControlMessage>>,
+    /// Latest `sees_coordinator` report per member for the current epoch: (received at, value).
+    coord_reports: HashMap<PeerId, (u64, bool)>,
     coordinator_lost_since: Option<u64>,
     coordinator_lost_prompted: bool,
     speaker_lost_prompted: bool,
@@ -107,6 +117,7 @@ impl RoomEngine {
             invites_in: HashMap::new(),
             joining: None,
             queued: HashMap::new(),
+            coord_reports: HashMap::new(),
             coordinator_lost_since: None,
             coordinator_lost_prompted: false,
             speaker_lost_prompted: false,
@@ -148,6 +159,31 @@ impl RoomEngine {
                 .last_seen
                 .get(&p)
                 .is_some_and(|t| now.saturating_sub(*t) <= self.cfg.peer_timeout_ms)
+    }
+
+    /// Member `p`'s latest `sees_coordinator` report, if it's recent enough to go by.
+    fn coordinator_report(&self, now: u64, p: PeerId) -> Option<bool> {
+        self.coord_reports
+            .get(&p)
+            .filter(|(t, _)| now.saturating_sub(*t) <= self.cfg.peer_timeout_ms)
+            .map(|(_, sees)| *sees)
+    }
+
+    /// Another live member recently reported that it can reach the current coordinator.
+    fn coordinator_seen_by_others(&self, now: u64, m: &RoomManifest) -> bool {
+        let local = self.local();
+        m.members.iter().any(|x| {
+            x.id != local
+                && x.id != m.coordinator
+                && self.coordinator_report(now, x.id) == Some(true)
+        })
+    }
+
+    /// The coordinator is gone from the whole room's point of view (as far as we can tell).
+    fn coordinator_lost(&self, now: u64, m: &RoomManifest) -> bool {
+        m.coordinator != self.local()
+            && !self.is_alive(now, m.coordinator)
+            && !self.coordinator_seen_by_others(now, m)
     }
 
     pub fn roles(&self) -> LocalRoles {
@@ -254,6 +290,25 @@ impl RoomEngine {
                 self.send(id, msg.clone());
             }
         }
+    }
+    /// Where to send something meant for the coordinator over a live session: the coordinator
+    /// itself, else a connected member that reports seeing it (it relays).
+    fn coordinator_route(&self, now: u64, m: &RoomManifest) -> Option<PeerId> {
+        if self.sessions.contains(&m.coordinator) {
+            return Some(m.coordinator);
+        }
+        let local = self.local();
+        m.members.iter().map(|x| x.id).find(|&id| {
+            id != local
+                && id != m.coordinator
+                && self.sessions.contains(&id)
+                && self.coordinator_report(now, id) == Some(true)
+        })
+    }
+    /// Sends to the coordinator (directly or relayed), queueing for it when neither is possible.
+    fn send_to_coordinator(&mut self, now: u64, m: &RoomManifest, msg: ControlMessage) {
+        let to = self.coordinator_route(now, m).unwrap_or(m.coordinator);
+        self.send(to, msg);
     }
     /// A peer that thinks we're in `room_id` (we're not, and aren't joining it) is told we left.
     fn reply_not_in_room(&mut self, from: PeerId, room_id: RoomId) {
@@ -403,17 +458,17 @@ impl RoomEngine {
             self.apply_change(now, change);
         } else {
             match change {
-                ChangeRequest::SetCoordinator(p) if !self.is_alive(now, m.coordinator) => {
+                ChangeRequest::SetCoordinator(p) if self.coordinator_lost(now, &m) => {
                     self.propose_coordinator(now, p)
                 }
-                other => self.send(
-                    m.coordinator,
-                    ControlMessage::Request {
+                other => {
+                    let msg = ControlMessage::Request {
                         room_id: m.room_id,
                         epoch: m.epoch,
                         change: other,
-                    },
-                ),
+                    };
+                    self.send_to_coordinator(now, &m, msg)
+                }
             }
         }
         Ok(())
@@ -518,6 +573,7 @@ impl RoomEngine {
 
     fn reset_room_flags(&mut self) {
         self.active = (None, None);
+        self.coord_reports.clear();
         self.coordinator_lost_since = None;
         self.coordinator_lost_prompted = false;
         self.speaker_lost_prompted = false;
@@ -578,6 +634,7 @@ impl RoomEngine {
         let coord_changed =
             old.as_ref().map(|o| (o.coordinator, o.epoch)) != Some((new.coordinator, new.epoch));
         if coord_changed {
+            self.coord_reports.clear();
             self.coordinator_lost_since = None;
             self.coordinator_lost_prompted = false;
             self.active = (None, None);
@@ -648,8 +705,9 @@ impl RoomEngine {
                     next.revision += 1;
                     self.publish(now, next);
                 } else if m.coordinator != from {
-                    self.send(
-                        m.coordinator,
+                    self.send_to_coordinator(
+                        now,
+                        &m,
                         ControlMessage::JoinRequest { room_id, member },
                     );
                 }
@@ -678,7 +736,7 @@ impl RoomEngine {
                         epoch,
                         change,
                     };
-                    self.send(cur.coordinator, msg);
+                    self.send_to_coordinator(now, &cur, msg);
                 }
             }
             ControlMessage::Leave { room_id } => {
@@ -689,6 +747,7 @@ impl RoomEngine {
                     return;
                 }
                 self.last_seen.remove(&from);
+                self.coord_reports.remove(&from);
                 if cur.coordinator == local && cur.is_member(from) {
                     let mut next = cur;
                     next.remove_member(from);
@@ -701,6 +760,7 @@ impl RoomEngine {
                 epoch,
                 revision,
                 manifest,
+                sees_coordinator,
             } => {
                 let Some(cur) = self.manifest.clone().filter(|m| m.room_id == room_id) else {
                     return self.reply_not_in_room(from, room_id);
@@ -716,6 +776,9 @@ impl RoomEngine {
                     self.receive_manifest(now, from, m);
                 } else if cur.coordinator == local && (epoch, revision) < cur.version() {
                     self.send(from, ControlMessage::Manifest(cur));
+                }
+                if self.manifest.as_ref().is_some_and(|m| m.epoch == epoch) {
+                    self.coord_reports.insert(from, (now, sees_coordinator));
                 }
             }
             ControlMessage::ActiveMic {
@@ -766,6 +829,16 @@ impl RoomEngine {
                 }
             }
             Acceptance::Reject(_) if !cur.is_member(from) => {}
+            Acceptance::Reject(_)
+                if m.epoch == cur.epoch
+                    && m.coordinator == cur.coordinator
+                    && m.revision > cur.revision
+                    && !self.is_alive(now, cur.coordinator) =>
+            {
+                // Our coordinator's newer manifest, relayed by a member while our own link to
+                // the coordinator is down.
+                self.install(now, m);
+            }
             Acceptance::Reject(_)
                 if m.epoch == cur.epoch
                     && m.coordinator == local
@@ -840,23 +913,29 @@ impl RoomEngine {
                 epoch: m.epoch,
                 revision: m.revision,
                 manifest: (m.coordinator == local).then(|| m.clone()),
+                sees_coordinator: self.is_alive(now, m.coordinator),
             };
+            // A member that can't reach the coordinator gets its manifest relayed by us.
+            let can_relay = m.coordinator != local && self.is_alive(now, m.coordinator);
             for id in m.member_ids() {
                 if id == local {
                     continue;
                 }
                 if self.sessions.contains(&id) {
-                    self.out.push(Output::Send {
-                        to: id,
-                        msg: hb.clone(),
-                    });
+                    let mut msg = hb.clone();
+                    if can_relay && self.coordinator_report(now, id) == Some(false) {
+                        if let ControlMessage::Heartbeat { manifest, .. } = &mut msg {
+                            *manifest = Some(m.clone());
+                        }
+                    }
+                    self.out.push(Output::Send { to: id, msg });
                 } else {
                     self.out.push(Output::Connect(id));
                 }
             }
         }
 
-        if m.coordinator != local && !self.is_alive(now, m.coordinator) {
+        if self.coordinator_lost(now, &m) {
             let since = *self.coordinator_lost_since.get_or_insert(now);
             let waited = now.saturating_sub(since);
             if self.cfg.auto_elect {
@@ -1443,6 +1522,7 @@ mod tests {
                 epoch: m.epoch,
                 revision: m.revision,
                 manifest: Some(m.clone()),
+                sees_coordinator: true,
             },
         );
         assert_eq!(
@@ -1481,5 +1561,37 @@ mod tests {
             },
         );
         assert_eq!(e2.manifest().unwrap().speaker, Some(PeerId(3)));
+    }
+
+    #[test]
+    fn one_broken_link_keeps_a_single_coordinator() {
+        let mut n = room(&[1, 2, 3]);
+        n.partition(&[1], &[3]); // 2 still sees both
+        for _ in 0..60 {
+            n.advance(500);
+            for i in 1..=3 {
+                let m = n.manifest(i).expect("still in the room");
+                assert_eq!((m.coordinator, m.epoch), (PeerId(1), Epoch(1)), "peer {i}");
+            }
+            assert_eq!(coordinators(&n, &[1, 2, 3]), vec![1]);
+        }
+        assert!(!n.has_event(3, |e| matches!(e, RoomEvent::CoordinatorLost { .. })));
+        // Requests from the cut-off peer are relayed by a member that sees the coordinator, and
+        // that member relays the coordinator's manifest back.
+        n.cmd(3, Command::SetSpeaker(Some(PeerId(3))));
+        n.advance(1_500);
+        assert_eq!(n.converged(&[1, 2, 3]).speaker, Some(PeerId(3)));
+        assert!(n.engines[&PeerId(3)].roles().is_speaker);
+    }
+
+    #[test]
+    fn coordinator_still_fails_over_when_nobody_sees_it() {
+        let mut n = room(&[1, 2, 3]);
+        n.partition(&[1], &[3]);
+        n.advance(3_000);
+        n.kill(1);
+        n.advance(8_000);
+        let m = n.converged(&[2, 3]);
+        assert_eq!((m.coordinator, m.epoch), (PeerId(2), Epoch(2)));
     }
 }
