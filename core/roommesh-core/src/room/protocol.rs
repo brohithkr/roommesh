@@ -1,0 +1,79 @@
+//! Reliable control-channel messages (postcard-encoded, then sealed by `network::secure`).
+use crate::ids::{Epoch, PeerId, RoomId};
+use crate::room::state::{MemberInfo, RoomManifest};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ChangeRequest {
+    SetCoordinator(PeerId),
+    SetSpeaker(Option<PeerId>),
+    SetMicEnabled { peer: PeerId, enabled: bool },
+    RemoveMember(PeerId),
+    Rename(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerReport {
+    pub peer: PeerId,
+    pub rtt_ms: f32,
+    pub jitter_ms: f32,
+    pub loss_pct: f32,
+    pub clock_offset_ms: f32,
+    pub drift_ppm: f32,
+    pub transport: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ControlMessage {
+    Invite { manifest: RoomManifest, from_name: String },
+    InviteResponse { room_id: RoomId, accepted: bool },
+    JoinRequest { room_id: RoomId, member: MemberInfo },
+    Manifest(RoomManifest),
+    Request { room_id: RoomId, epoch: Epoch, change: ChangeRequest },
+    Leave { room_id: RoomId },
+    /// Sent every second to every member. The coordinator attaches the full manifest so
+    /// members that missed an update (or a healed partition) converge.
+    Heartbeat { room_id: RoomId, epoch: Epoch, revision: u32, manifest: Option<RoomManifest> },
+    ActiveMic { room_id: RoomId, epoch: Epoch, primary: Option<PeerId>, secondary: Option<PeerId> },
+    PeerReport(PeerReport),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProtocolError {
+    #[error("malformed control message: {0}")]
+    Malformed(#[from] postcard::Error),
+}
+
+pub fn encode(msg: &ControlMessage) -> Vec<u8> {
+    postcard::to_allocvec(msg).expect("control message serialization cannot fail")
+}
+pub fn decode(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
+    Ok(postcard::from_bytes(bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::room::state::*;
+    #[test]
+    fn roundtrip_all_variants() {
+        let m = RoomManifest::new(RoomId(1), "R".into(), MemberInfo {
+            id: PeerId(1), name: "A".into(), mic_enabled: true, capabilities: Capabilities::full() });
+        let msgs = vec![
+            ControlMessage::Invite { manifest: m.clone(), from_name: "A".into() },
+            ControlMessage::InviteResponse { room_id: RoomId(1), accepted: true },
+            ControlMessage::JoinRequest { room_id: RoomId(1), member: m.members[0].clone() },
+            ControlMessage::Manifest(m.clone()),
+            ControlMessage::Request { room_id: RoomId(1), epoch: Epoch(1), change: ChangeRequest::SetSpeaker(Some(PeerId(2))) },
+            ControlMessage::Leave { room_id: RoomId(1) },
+            ControlMessage::Heartbeat { room_id: RoomId(1), epoch: Epoch(1), revision: 0, manifest: Some(m.clone()) },
+            ControlMessage::ActiveMic { room_id: RoomId(1), epoch: Epoch(1), primary: Some(PeerId(1)), secondary: None },
+            ControlMessage::PeerReport(PeerReport { peer: PeerId(1), rtt_ms: 3.0, jitter_ms: 1.0, loss_pct: 0.0, clock_offset_ms: 0.2, drift_ppm: 4.0, transport: "awdl0".into() }),
+        ];
+        for msg in msgs {
+            let bytes = encode(&msg);
+            assert_eq!(decode(&bytes).unwrap(), msg);
+        }
+        assert!(decode(&[0xff, 0xff, 0xff]).is_err());
+    }
+}
