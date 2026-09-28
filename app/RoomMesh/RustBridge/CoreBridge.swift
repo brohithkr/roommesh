@@ -28,8 +28,8 @@ extension FfiError {
     /// The plain message carried by every (flat) UniFFI error case.
     var message: String {
         switch self {
-        // TODO(notice): add `.Timeout(let m)` here once the regenerated bindings include FfiError.Timeout.
-        case .AlreadyInRoom(let m), .NotInRoom(let m), .NoSuchInvite(let m), .NotMember(let m), .InvalidPeerId(let m):
+        case .AlreadyInRoom(let m), .NotInRoom(let m), .NoSuchInvite(let m), .NotMember(let m), .InvalidPeerId(let m),
+             .Timeout(let m):
             return m
         }
     }

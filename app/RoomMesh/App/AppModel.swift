@@ -197,7 +197,6 @@ final class AppModel {
 
     // MARK: events
     func apply(_ e: FfiEvent) {
-        // TODO(notice): add `case .notice(let m): showNotice(m)` once the regenerated bindings include FfiEvent.notice.
         switch e {
         case .nearbyChanged(let peers): nearby = peers
         case .roomChanged(let state): room = state
@@ -214,6 +213,7 @@ final class AppModel {
         case .aecStatusChanged(let c): aecConverged = c
         case .leftRoom: room = nil; coordinatorLostCandidates = nil; speakerLostCandidates = nil; qualities = [:]
         case .error(let m): lastError = m
+        case .notice(let m): showNotice(m)
         case .peerJoined, .peerLeft, .activeMicChanged: break // reflected by the following .roomChanged
         }
     }
