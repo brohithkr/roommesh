@@ -666,6 +666,7 @@ dependencies = [
  "crossbeam-channel",
  "getrandom 0.3.4",
  "hkdf",
+ "libc",
  "log",
  "mach2",
  "opus",
