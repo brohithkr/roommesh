@@ -13,14 +13,18 @@ cmake_minimum_required(VERSION 3.20)
 # Only applied if the caller hasn't already set CMAKE_OSX_SYSROOT or
 # SDKROOT explicitly.
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
-set(CMAKE_OSX_DEPLOYMENT_TARGET 14.2 CACHE STRING "")
+# Default the deployment target to 14.2, but never override a caller's
+# -DCMAKE_OSX_DEPLOYMENT_TARGET (or MACOSX_DEPLOYMENT_TARGET in the environment,
+# which CMake picks up at project()).
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 14.2 CACHE STRING "")
+endif()
 if(NOT DEFINED CMAKE_OSX_SYSROOT AND NOT DEFINED ENV{SDKROOT})
     set(CMAKE_OSX_SYSROOT macosx CACHE STRING "")  # xcrun --sdk macosx -> selected Xcode's SDK
 endif()
 project(RoomMeshDriver CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET 14.2)
 
 enable_testing()
 add_executable(ring_test tests/ring_test.cpp src/SharedRegion.cpp)
@@ -30,13 +34,27 @@ add_test(NAME ring_test COMMAND ring_test)
 
 set(DRIVER_FACTORY_UUID "9F3A7C2E-5B1D-4E8A-A6C4-2D7E91B0F5A3")
 set(DRIVER_BUNDLE_ID "io.github.brohithkr.RoomMesh.Driver")
-set(DRIVER_VERSION "1.0.0")
+# The driver ships in the same pkg as the app, so it carries the app's version.
+# Read it from the app's Info.plist unless the caller passes -DDRIVER_VERSION.
+set(APP_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/../app/RoomMesh/Resources/Info.plist)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${APP_INFO_PLIST})
+if(NOT DRIVER_VERSION)
+    execute_process(
+        COMMAND /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" ${APP_INFO_PLIST}
+        OUTPUT_VARIABLE DRIVER_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _plist_rc)
+    if(NOT _plist_rc EQUAL 0 OR DRIVER_VERSION STREQUAL "")
+        message(FATAL_ERROR "cannot read CFBundleShortVersionString from ${APP_INFO_PLIST}; pass -DDRIVER_VERSION=x.y.z")
+    endif()
+endif()
+message(STATUS "RoomMesh driver version: ${DRIVER_VERSION}")
 
 include(ExternalProject)
 string(REPLACE ";" "|" ASPL_ARCHS "${CMAKE_OSX_ARCHITECTURES}")
 ExternalProject_Add(libASPL_ext
     GIT_REPOSITORY https://github.com/gavv/libASPL.git
-    GIT_TAG v3.1.2
+    GIT_TAG 47f688ed6bb637ab8b7f4b36864734b2b1f69b6b   # v3.1.2 (pinned: tags can move)
     GIT_SHALLOW OFF   # libASPL's CMake calls `git describe --tags`
     LIST_SEPARATOR |
     # libASPL's own CMakeLists.txt uses TARGET-style add_custom_command()
@@ -50,7 +68,7 @@ ExternalProject_Add(libASPL_ext
     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
                -DCMAKE_BUILD_TYPE=Release
                -DCMAKE_OSX_ARCHITECTURES=${ASPL_ARCHS}
-               -DCMAKE_OSX_DEPLOYMENT_TARGET=14.2
+               -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
                -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT}
                -DBUILD_TESTING=OFF
     BUILD_BYPRODUCTS <INSTALL_DIR>/lib/libASPL.a)
