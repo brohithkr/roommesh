@@ -96,6 +96,13 @@ const MAX_OUTSTANDING_PINGS: usize = 32;
 const PING_TTL_NS: u64 = 1_000_000_000;
 /// Capacity of the lossy realtime-packet queue into the DSP thread.
 const PACKET_QUEUE: usize = 4096;
+/// Realtime packets handled per wake before the next `step()`, so a flood can't starve the
+/// audio cadence (the rest wait for the next wake, which comes at once).
+const MAX_PACKETS_PER_WAKE: usize = 256;
+/// Off the coordinator, a captured frame older than this is not worth uplinking. Fixed and
+/// generous (the largest mic budget a coordinator may use): a member doesn't know the
+/// coordinator's actual budget, which judges lateness itself.
+const MEMBER_UPLINK_BUDGET_NS: u64 = 300_000_000;
 /// A far-end chunk whose time disagrees with the previous chunk's end by more than this is a
 /// discontinuity (playback paused/restarted, reader resynced).
 const FAREND_JUMP_NS: u64 = 20_000_000;
@@ -750,32 +757,44 @@ impl Dsp {
                 sel.recv(&packets);
                 let _ = sel.ready_timeout(TICK);
             }
-            loop {
-                // Control first: a role/settings change queued behind packets applies before
-                // them, and between any two packets.
-                loop {
-                    match control.try_recv() {
-                        Ok(m) => {
-                            if !self.handle(m) {
-                                break 'run;
-                            }
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => break 'run,
-                    }
-                }
-                match packets.try_recv() {
-                    Ok(m) => {
-                        if !self.handle(m) {
-                            break 'run;
-                        }
-                    }
-                    Err(_) => break,
-                }
+            if !self.drain(&control, &packets) {
+                break 'run;
             }
             self.step(now_ns());
         }
         self.stop_all();
+    }
+
+    /// Handles the queued messages. Control first, fully: a role/settings change queued behind
+    /// packets applies before them, and between any two packets. At most
+    /// `MAX_PACKETS_PER_WAKE` packets, though. Returns false on shutdown.
+    fn drain(&mut self, control: &Receiver<RuntimeMsg>, packets: &Receiver<RuntimeMsg>) -> bool {
+        let mut handled = 0;
+        loop {
+            loop {
+                match control.try_recv() {
+                    Ok(m) => {
+                        if !self.handle(m) {
+                            return false;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return false,
+                }
+            }
+            if handled == MAX_PACKETS_PER_WAKE {
+                return true;
+            }
+            match packets.try_recv() {
+                Ok(m) => {
+                    handled += 1;
+                    if !self.handle(m) {
+                        return false;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
     }
 
     fn handle(&mut self, m: RuntimeMsg) -> bool {
@@ -912,6 +931,9 @@ impl Dsp {
             self.clock.reset();
             self.next_ping_ns = 0;
             self.outstanding_pings.clear();
+            // It describes our link to the previous coordinator (and `metrics_step`, which
+            // would replace it, doesn't run while audio is off).
+            *self.shared.local_report.lock() = None;
             let authority = new.coordinator.unwrap_or(self.local);
             if let Some(sp) = self.speaker.as_mut() {
                 sp.set_authority(new.epoch, authority);
@@ -1225,10 +1247,17 @@ impl Dsp {
         let Some(cap) = self.capture.running.as_mut() else {
             return;
         };
-        // Frames older than the coordinator's mic budget can no longer be used; dropping them
-        // avoids a stale-backlog burst after a mic toggle or a stall. A frame is only complete
-        // FRAME_NS after its start, hence the extra frame.
-        let oldest = now.saturating_sub(self.settings.coordinator.mic_latency_ns + FRAME_NS);
+        // Frames older than the mic budget can no longer be used; dropping them avoids a
+        // stale-backlog burst after a mic toggle or a stall. A frame is only complete FRAME_NS
+        // after its start, hence the extra frame. Only the coordinator knows the room's budget
+        // (its own setting); a member uplinks by a fixed generous one.
+        let is_coord = self.coord.is_some();
+        let budget = if is_coord {
+            self.settings.coordinator.mic_latency_ns
+        } else {
+            MEMBER_UPLINK_BUDGET_NS
+        };
+        let oldest = now.saturating_sub(budget + FRAME_NS);
         let mut newest_stale = None;
         while let Some(frame) = cap.fa.pop_frame() {
             let stale = frame.timestamp_ns < oldest;
@@ -1255,11 +1284,15 @@ impl Dsp {
             }
         }
         // A backlog after a stall drains stale frames too, but its newest frame is fresh; only
-        // when even the newest is too old does the input latency itself exceed the budget.
+        // when even the newest is too old does the input latency itself exceed the budget. The
+        // advice (raise Mic latency) only applies to the coordinator's own setting.
         match newest_stale {
             Some(true) => {
                 let since = *cap.over_budget_since.get_or_insert(now);
-                if !cap.over_budget_reported && now.saturating_sub(since) >= MIC_OVER_BUDGET_NS {
+                if is_coord
+                    && !cap.over_budget_reported
+                    && now.saturating_sub(since) >= MIC_OVER_BUDGET_NS
+                {
                     cap.over_budget_reported = true;
                     emit(&self.events, MIC_OVER_BUDGET_MSG.into());
                 }
@@ -1354,9 +1387,11 @@ impl Dsp {
     }
 
     fn speaker_step(&mut self, now: u64) {
-        let (Some(pb), Some(sp)) = (self.playback.running.as_mut(), self.speaker.as_mut()) else {
+        let Some(pb) = self.playback.running.as_mut() else {
             return;
         };
+        // Reports are drained even without a speaker pipeline: undrained ones count as device
+        // activity (see `reconcile_playback`) and would hide a dead device.
         let mut got = false;
         while let Ok(r) = pb.h.reports.pop() {
             got = true;
@@ -1369,6 +1404,12 @@ impl Dsp {
             pb.last_output_frames = Some(r.output_frames);
             pb.clock.report(r);
         }
+        if got {
+            self.playback.activity(now, &self.events, "Speaker");
+        }
+        let (Some(pb), Some(sp)) = (self.playback.running.as_mut(), self.speaker.as_mut()) else {
+            return;
+        };
         let rate = pb.h.sample_rate as f64;
         let ns_to_frames = |ns: u64| (rate * ns as f64 / 1e9) as u64;
         let target = ns_to_frames(PLAYBACK_QUEUE_MIN_NS)
@@ -1398,9 +1439,6 @@ impl Dsp {
             if n < chunk {
                 break;
             }
-        }
-        if got {
-            self.playback.activity(now, &self.events, "Speaker");
         }
     }
 
@@ -2114,7 +2152,7 @@ mod tests {
         let (mut d, ev) = dsp(2, Box::new(fake.clone()));
         let t0 = now_ns();
         d.handle(RuntimeMsg::SetEnabled(true));
-        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        d.handle(RuntimeMsg::Roles(roles(2, 1, 2))); // coordinator: its budget applies
         let budget = d.settings.coordinator.mic_latency_ns;
         let over = |ev: &crossbeam_channel::Receiver<RuntimeEvent>| {
             split_events(ev)
@@ -2151,5 +2189,123 @@ mod tests {
         // Input latency alone now exceeds the budget: every frame is dropped. Reported once.
         run(&mut d, budget + 60 * MS, 300);
         assert_eq!(over(&ev), 1);
+    }
+
+    #[test]
+    fn members_judge_their_uplink_by_a_generous_fixed_budget_and_never_report_it() {
+        let fake = FakeDevices::default();
+        let (mut d, ev) = dsp(2, Box::new(fake.clone()));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2))); // member
+        let local_budget = d.settings.coordinator.mic_latency_ns;
+        let (mut idx, mut t) = (0, t0 + 20 * MS);
+        let mut run = |d: &mut Dsp, latency: u64, steps: usize| {
+            for _ in 0..steps {
+                fake.mic_block(idx, t - latency);
+                idx += 480;
+                d.step(t);
+                t += 10 * MS;
+            }
+        };
+        let over_since = |d: &Dsp| d.capture.running.as_ref().unwrap().over_budget_since;
+        // Over our own (coordinator) setting but well within the uplink budget: still fresh.
+        run(&mut d, local_budget + 60 * MS, 150);
+        assert_eq!(over_since(&d), None);
+        // Beyond even the uplink budget: dropped, but a member has no budget advice to give.
+        run(&mut d, MEMBER_UPLINK_BUDGET_NS + 60 * MS, 300);
+        assert!(over_since(&d).is_some());
+        let (errs, _) = split_events(&ev);
+        assert!(!errs.iter().any(|m| m == MIC_OVER_BUDGET_MSG), "{errs:?}");
+    }
+
+    #[test]
+    fn dead_speaker_is_detected_without_a_speaker_pipeline() {
+        let fake = FakeDevices::default();
+        let (mut d, ev) = dsp(2, Box::new(fake.clone()));
+        d.speaker = None; // e.g. the decoder could not be created
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 2, 2))); // member, room speaker
+        assert_eq!(fake.opens().1, 1);
+        for i in 1..=10u64 {
+            fake.report();
+            d.step(t0 + i * 10 * MS);
+        }
+        // The device stops calling back: its leftover reports must not count as activity.
+        d.step(t0 + 1_500 * MS);
+        let (errs, _) = split_events(&ev);
+        assert!(
+            errs.iter().any(|m| m.contains("Speaker stopped playing")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn local_report_is_cleared_when_the_coordinator_or_epoch_changes() {
+        let (mut d, _ev) = dsp(2, Box::new(NullAudio));
+        let report = || {
+            Some(PeerReport {
+                peer: PeerId(2),
+                rtt_ms: 5.0,
+                jitter_ms: 0.0,
+                loss_pct: 0.0,
+                clock_offset_ms: 0.0,
+                drift_ppm: 0.0,
+                transport: "lo".into(),
+            })
+        };
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        *d.shared.local_report.lock() = report();
+        d.handle(RuntimeMsg::Roles(LocalRoles {
+            mic_enabled: false,
+            ..roles(1, 1, 2)
+        }));
+        assert!(
+            d.shared.local_report.lock().is_some(),
+            "same coordinator and epoch: kept"
+        );
+        d.handle(RuntimeMsg::Roles(roles(3, 3, 2)));
+        assert!(d.shared.local_report.lock().is_none(), "new coordinator");
+        *d.shared.local_report.lock() = report();
+        d.handle(RuntimeMsg::Roles(LocalRoles {
+            epoch: Epoch(2),
+            ..roles(3, 3, 2)
+        }));
+        assert!(d.shared.local_report.lock().is_none(), "new epoch");
+    }
+
+    #[test]
+    fn packet_drain_is_capped_per_wake_but_control_is_drained_fully() {
+        let (mut d, _ev) = dsp(2, Box::new(NullAudio));
+        let (ctl_tx, ctl_rx) = unbounded();
+        let (pkt_tx, pkt_rx) = bounded(PACKET_QUEUE);
+        for i in 0..1_000u32 {
+            pkt_tx
+                .send(RuntimeMsg::Packet {
+                    header: RtHeader {
+                        kind: PacketKind::Mic,
+                        epoch: Epoch(1),
+                        stream: StreamId::MIC,
+                        sender: PeerId(1),
+                        sequence: i,
+                        sample_index: 0,
+                        timestamp_ns: 0,
+                        frame_count: 480,
+                    },
+                    payload: vec![],
+                    arrival_ns: 0,
+                })
+                .unwrap();
+        }
+        ctl_tx.send(RuntimeMsg::Mute(true)).unwrap();
+        ctl_tx.send(RuntimeMsg::SetEnabled(true)).unwrap();
+        assert!(d.drain(&ctl_rx, &pkt_rx));
+        assert!(d.muted && d.enabled, "control is drained fully");
+        assert_eq!(pkt_rx.len(), 1_000 - MAX_PACKETS_PER_WAKE);
+        assert!(d.drain(&ctl_rx, &pkt_rx));
+        assert_eq!(pkt_rx.len(), 1_000 - 2 * MAX_PACKETS_PER_WAKE);
+        ctl_tx.send(RuntimeMsg::Shutdown).unwrap();
+        assert!(!d.drain(&ctl_rx, &pkt_rx));
     }
 }
