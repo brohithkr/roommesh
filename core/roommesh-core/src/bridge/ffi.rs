@@ -27,6 +27,9 @@ pub enum FfiError {
     /// or transport callback). Safe to retry.
     #[error("RoomMesh is busy — try again")]
     Timeout,
+    /// The core stopped working (internal failure); the app must be restarted.
+    #[error("RoomMesh stopped unexpectedly — restart the app")]
+    Internal,
 }
 
 impl From<RoomError> for FfiError {
@@ -37,6 +40,7 @@ impl From<RoomError> for FfiError {
             RoomError::NoSuchInvite => Self::NoSuchInvite,
             RoomError::NotMember => Self::NotMember,
             RoomError::Timeout => Self::Timeout,
+            RoomError::Internal => Self::Internal,
         }
     }
 }
@@ -554,6 +558,8 @@ mod tests {
         assert!(matches!(FfiError::from(RoomError::NotMember), FfiError::NotMember));
         assert!(matches!(FfiError::from(RoomError::Timeout), FfiError::Timeout));
         assert_eq!(FfiError::Timeout.to_string(), "RoomMesh is busy — try again");
+        assert!(matches!(FfiError::from(RoomError::Internal), FfiError::Internal));
+        assert_eq!(FfiError::Internal.to_string(), "RoomMesh stopped unexpectedly — restart the app");
         assert!(parse_peer("00000000000000AB").is_err());
         assert_eq!(parse_peer("00000000000000ab").unwrap(), PeerId(0xab));
         let e = to_ffi_event(RoomEvent::CoordinatorLost { candidates: vec![PeerId(1), PeerId(2)] });

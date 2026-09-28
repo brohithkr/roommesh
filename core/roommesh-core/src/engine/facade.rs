@@ -218,6 +218,7 @@ impl Core {
         let runtime_shared = runtime.shared();
         let (tx, rx) = unbounded::<CoreMsg>();
         let cache = Arc::new(Cache::default());
+        let (panic_cache, panic_runtime) = (cache.clone(), runtime.sender());
         let ctl = ControlLoop {
             engine: RoomEngine::new(RoomConfig {
                 auto_elect: cfg.auto_elect,
@@ -248,6 +249,15 @@ impl Core {
                 let run = std::panic::AssertUnwindSafe(move || ctl.run(rx, rt_ev_rx));
                 if std::panic::catch_unwind(run).is_err() {
                     log::error!("roommesh-control panicked; room control has stopped");
+                    // Nothing maintains the room any more: stop showing it, stop answering
+                    // clock pings as its coordinator, and stop audio on the last roles (for
+                    // good: a later `start_audio` finds no room).
+                    *panic_cache.snapshot.lock() = None;
+                    *panic_cache.roles.lock() = None;
+                    panic_cache.is_coordinator.store(false, Ordering::Relaxed);
+                    panic_cache.ping_replay.lock().clear();
+                    panic_runtime.send(RuntimeMsg::Roles(LocalRoles::none()));
+                    panic_runtime.send(RuntimeMsg::SetEnabled(false));
                     sink.on_event(RoomEvent::Error {
                         message: "RoomMesh stopped working (internal error). Restart the app."
                             .into(),
@@ -373,13 +383,15 @@ impl Core {
         }
     }
 
-    /// Runs a room command on the control thread and waits (up to 3 s) for its result.
+    /// Runs a room command on the control thread and waits for its result.
     ///
     /// On `Ok`, the caches behind [`room_snapshot`](Self::room_snapshot), [`nearby`](Self::nearby)
     /// and [`roles`](Self::roles) already reflect the command (its events are delivered to the
     /// sink right after). [`RoomError::Timeout`] means the command was not applied: the control
-    /// thread was busy for 3 s, or this was called from the control thread itself (i.e. from
-    /// inside [`EventSink::on_event`]), which fails immediately.
+    /// thread did not take it within 3 s, or this was called from the control thread itself
+    /// (i.e. from inside [`EventSink::on_event`]), which fails immediately. Once the control
+    /// thread has taken the command it is applied, so its result is awaited however long that
+    /// takes. [`RoomError::Internal`]: the control thread has died.
     pub fn command(&self, c: Command) -> Result<(), RoomError> {
         if std::thread::current().id() == self.control_thread {
             log::error!("Core::command called re-entrantly from an event callback; rejected");
@@ -392,21 +404,24 @@ impl Core {
             .send(CoreMsg::Command(c, tx, claim.clone()))
             .is_err()
         {
-            return Err(RoomError::NotInRoom); // control thread gone
+            return Err(RoomError::Internal); // control thread gone
         }
+        // A dropped reply sender (disconnect) means the control thread died with the command
+        // queued or while running it.
         match rx.recv_timeout(COMMAND_TIMEOUT) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 if !claim.swap(true, Ordering::SeqCst) {
                     return Err(RoomError::Timeout); // abandoned: the control thread skips it
                 }
-                // The control thread took it just now; its answer is imminent.
-                rx.recv_timeout(COMMAND_TIMEOUT).unwrap_or_else(|_| {
-                    log::error!("room command started but its result never arrived");
-                    Err(RoomError::Timeout)
+                // The control thread has taken it and will apply it: reporting a timeout now
+                // would be wrong, so wait for the result.
+                rx.recv().unwrap_or_else(|_| {
+                    log::error!("room command started but the control thread died");
+                    Err(RoomError::Internal)
                 })
             }
-            Err(RecvTimeoutError::Disconnected) => Err(RoomError::NotInRoom),
+            Err(RecvTimeoutError::Disconnected) => Err(RoomError::Internal),
         }
     }
 
@@ -942,16 +957,15 @@ mod tests {
         assert_eq!(core.room_snapshot().unwrap().name, "First");
     }
 
-    /// Panics on the first RoomChanged; records every Error event.
+    /// Panics on the RoomChanged showing a room named "boom"; records every Error event.
     #[derive(Default)]
     struct PanicSink {
-        panicked: AtomicBool,
         errors: Mutex<Vec<String>>,
     }
     impl EventSink for PanicSink {
         fn on_event(&self, e: RoomEvent) {
             match e {
-                RoomEvent::RoomChanged(_) if !self.panicked.swap(true, Ordering::SeqCst) => {
+                RoomEvent::RoomChanged(Some(s)) if s.name == "boom" => {
                     panic!("injected control-thread panic")
                 }
                 RoomEvent::Error { message } => self.errors.lock().push(message),
@@ -961,15 +975,84 @@ mod tests {
     }
 
     #[test]
-    fn control_thread_death_is_reported() {
+    fn control_thread_death_is_reported_and_leaves_a_consistent_state() {
         let net = LoopbackNetwork::new();
         let sink = Arc::new(PanicSink::default());
         let core = spawn_core(&net, 1, Box::new(NullAudio), sink.clone());
+        let dsp_coordinates = || core.runtime_shared.is_coordinator.load(Ordering::Relaxed);
+        core.start_audio();
         core.command(Command::CreateRoom { name: "R".into() })
             .unwrap();
-        wait("error event", 3, || !sink.errors.lock().is_empty());
-        assert!(sink.errors.lock()[0].contains("stopped working"));
-        assert!(core.command(Command::Leave).is_err());
+        wait("the DSP coordinates", 3, dsp_coordinates);
+        core.command(Command::Rename("boom".into())).unwrap();
+        wait("the control thread's error event", 3, || {
+            sink.errors.lock().iter().any(|m| m.contains("stopped working"))
+        });
+        // No room, no roles, no clock-ping answers, and audio stops.
+        assert!(core.room_snapshot().is_none());
+        assert_eq!(core.roles(), LocalRoles::none());
+        assert!(!core.cache.is_coordinator.load(Ordering::Relaxed));
+        wait("the DSP stops coordinating", 3, || !dsp_coordinates());
+        assert_eq!(core.command(Command::Leave), Err(RoomError::Internal));
+        // Re-enabling audio must not bring the stale roles back.
+        core.start_audio();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!dsp_coordinates());
+    }
+
+    /// Loopback transport whose next `connect` blocks the calling (control) thread for
+    /// `block_ms`.
+    struct SlowConnect {
+        inner: Arc<crate::network::loopback::LoopbackTransport>,
+        block_ms: std::sync::atomic::AtomicU64,
+    }
+    impl PeerTransport for SlowConnect {
+        fn start(&self, a: LocalAdvertisement) {
+            self.inner.start(a)
+        }
+        fn stop(&self) {
+            self.inner.stop()
+        }
+        fn connect(&self, p: PeerId) {
+            let ms = self.block_ms.swap(0, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(ms));
+            self.inner.connect(p)
+        }
+        fn disconnect(&self, p: PeerId) {
+            self.inner.disconnect(p)
+        }
+        fn send_control(&self, p: PeerId, f: Vec<u8>) {
+            self.inner.send_control(p, f)
+        }
+        fn send_realtime(&self, p: PeerId, f: Vec<u8>) {
+            self.inner.send_realtime(p, f)
+        }
+    }
+
+    #[test]
+    fn a_command_the_control_thread_took_is_waited_for_not_reported_as_timed_out() {
+        let net = LoopbackNetwork::new();
+        let (tx, _rx) = unbounded();
+        let slow = Arc::new(SlowConnect {
+            inner: net.transport(PeerId(1), tx),
+            block_ms: Default::default(),
+        });
+        let core = Core::new(
+            CoreConfig::new(PeerId(1), "Mac 1".into()),
+            slow.clone(),
+            Arc::new(Collector::default()),
+            Box::new(NullAudio),
+        );
+        core.command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        // Inviting a peer with no session dials it while running the command: the control
+        // thread has claimed it and is busy well past the timeout, but it will apply it.
+        let block = COMMAND_TIMEOUT * 3;
+        slow.block_ms
+            .store(block.as_millis() as u64, Ordering::SeqCst);
+        let t = Instant::now();
+        assert_eq!(core.command(Command::Invite(PeerId(99))), Ok(()));
+        assert!(t.elapsed() >= block, "{:?}", t.elapsed());
     }
 
     #[test]

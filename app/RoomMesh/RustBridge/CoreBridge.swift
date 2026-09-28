@@ -31,7 +31,7 @@ extension FfiError {
     var message: String {
         switch self {
         case .AlreadyInRoom(let m), .NotInRoom(let m), .NoSuchInvite(let m), .NotMember(let m), .InvalidPeerId(let m),
-             .Timeout(let m):
+             .Timeout(let m), .Internal(let m):
             return m
         }
     }

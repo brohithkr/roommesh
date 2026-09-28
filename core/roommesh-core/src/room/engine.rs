@@ -73,6 +73,9 @@ pub enum RoomError {
     /// re-entrantly from an event callback). The command was not applied.
     #[error("timed out")]
     Timeout,
+    /// The core's control thread has stopped (it panicked); nothing can be applied any more.
+    #[error("internal error: room control stopped")]
+    Internal,
 }
 
 #[derive(Clone, Debug, PartialEq)]
