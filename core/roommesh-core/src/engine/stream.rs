@@ -62,10 +62,10 @@ impl StreamReceiver {
                     timestamp_ns,
                     sample_index,
                 } => {
-                    let next = self.jb.peek(seq + 1).map(|p| p.payload.clone());
+                    let next = self.jb.peek(seq + 1).map(|p| p.payload.as_slice());
                     let n = self
                         .dec
-                        .conceal(next.as_deref(), &mut self.scratch[..FRAME_SAMPLES])
+                        .conceal(next, &mut self.scratch[..FRAME_SAMPLES])
                         .unwrap_or(0);
                     self.emit(sample_index, map_ts(timestamp_ns), n);
                 }

@@ -78,6 +78,8 @@ struct MicChannel {
     vad: Vad,
     scorer: MicScorer,
     env: EnvelopeTracker,
+    /// Last analysed level, held in `env` during dropouts so envelope histories stay aligned.
+    last_level_db: f32,
     status: MicStatus,
 }
 
@@ -152,6 +154,7 @@ impl CoordinatorPipeline {
                 vad: Vad::new(),
                 scorer: MicScorer::new(),
                 env: EnvelopeTracker::new(50),
+                last_level_db: -90.0,
                 status: MicStatus {
                     peer: p,
                     score: 0.0,
@@ -267,6 +270,9 @@ impl CoordinatorPipeline {
             ch.status.present = present;
             ch.status.aec = ch.aec.stats();
             if !present {
+                // One entry per frame for every mic keeps envelope histories time-aligned
+                // (same-talker / echo-leak correlations compare them index by index).
+                ch.env.push(ch.last_level_db);
                 // Dropout (stream not started, stalled or lost): zero-filled audio must not reach
                 // the VAD/envelope, or the noise floor collapses to digital silence and every
                 // later frame looks like high-SNR speech.
@@ -278,6 +284,7 @@ impl CoordinatorPipeline {
             }
             let v = ch.vad.process(&mic);
             ch.env.push(v.level_db);
+            ch.last_level_db = v.level_db;
             let echo_leak = if farend_active && v.snr_db < 20.0 {
                 ch.env.correlation(&self.ref_env).max(0.0)
             } else {

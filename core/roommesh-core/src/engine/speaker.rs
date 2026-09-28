@@ -143,6 +143,61 @@ mod tests {
         assert!((rms - 0.3 / 2f32.sqrt()).abs() < 0.08, "rms {rms}");
     }
     #[test]
+    fn remote_path_is_sample_aligned() {
+        // A chirp's autocorrelation has one sharp peak, so the best-matching lag between what is
+        // rendered and what was scheduled for that time measures the end-to-end timing error.
+        let chirp = |n: i64| -> f32 {
+            let t = n as f64 / 48_000.0;
+            (0.3 * (2.0 * std::f64::consts::PI * (200.0 * t + 0.5 * 8_000.0 * t * t)).sin()) as f32
+        };
+        let mut coord = CoordinatorPipeline::new(
+            PeerId(1),
+            Epoch(1),
+            CoordinatorConfig {
+                use_webrtc_aec: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sp = SpeakerPipeline::new(Epoch(1), PeerId(1)).unwrap();
+        let offset = 5_000_000u64; // local = coord - 5 ms
+        for i in 0..40u64 {
+            let s: Vec<f32> = (0..480).map(|k| chirp((i * 480 + k) as i64)).collect();
+            let pb = coord.push_farend(&AudioFrame {
+                sample_index: i * 480,
+                timestamp_ns: T0 + i * FRAME_NS,
+                samples: s,
+            });
+            assert!(sp.push_packet(pb.header, pb.payload, T0 + i * FRAME_NS));
+        }
+        // Far-end sample n (captured at T0 + n/48k) is due at local T0 + delay - offset + n/48k.
+        let n0 = 9_600i64; // 200 ms in
+        let play_local = T0 + coord.config().playout_delay_ns - offset + 200_000_000;
+        let mut out = vec![0.0f32; 960];
+        let st = sp.render(
+            play_local,
+            NS_PER_SAMPLE,
+            &mut out,
+            play_local - 50_000_000,
+            |c| Some(c - offset),
+            |l| Some(l + offset),
+        );
+        assert_eq!(st.missing, 0);
+        let corr = |lag: i64| -> f32 {
+            out.iter()
+                .enumerate()
+                .map(|(j, v)| v * chirp(n0 + j as i64 + lag))
+                .sum()
+        };
+        let best = (-96..=96)
+            .max_by(|a, b| corr(*a).total_cmp(&corr(*b)))
+            .unwrap();
+        assert!(
+            best.abs() <= 20,
+            "rendered audio is {best} samples off schedule"
+        );
+    }
+    #[test]
     fn rejects_foreign_or_stale_packets() {
         let mut sp = SpeakerPipeline::new(Epoch(2), PeerId(1)).unwrap();
         let h = RtHeader {
