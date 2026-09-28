@@ -1,0 +1,57 @@
+import Foundation
+import Observation
+
+extension UserDefaults {
+    /// `ROOMMESH_PROFILE=b open -n RoomMesh.app` runs a second instance with its own identity (local testing).
+    static var roomMesh: UserDefaults {
+        if let p = ProcessInfo.processInfo.environment["ROOMMESH_PROFILE"], let d = UserDefaults(suiteName: "io.github.brohithkr.RoomMesh.\(p)") { return d }
+        return .standard
+    }
+}
+
+@MainActor @Observable
+final class SettingsStore {
+    @ObservationIgnored private let d: UserDefaults
+    @ObservationIgnored var onChange: (() -> Void)?
+
+    var inputDevice: String? { didSet { d.set(inputDevice, forKey: "inputDevice"); onChange?() } }
+    var outputDevice: String? { didSet { d.set(outputDevice, forKey: "outputDevice"); onChange?() } }
+    var allowSimultaneousTalkers: Bool { didSet { d.set(allowSimultaneousTalkers, forKey: "multiTalk"); onChange?() } }
+    var echoCancellation: Bool { didSet { d.set(echoCancellation, forKey: "aec"); onChange?() } }
+    var noiseSuppression: Bool { didSet { d.set(noiseSuppression, forKey: "ns"); onChange?() } }
+    var micLatencyMs: UInt32 { didSet { d.set(Int(micLatencyMs), forKey: "micLatency"); onChange?() } }
+    var playoutDelayMs: UInt32 { didSet { d.set(Int(playoutDelayMs), forKey: "playout"); onChange?() } }
+    var autoElectCoordinator: Bool { didSet { d.set(autoElectCoordinator, forKey: "autoElect"); onChange?() } }
+    var fallbackSpeakerToCoordinator: Bool { didSet { d.set(fallbackSpeakerToCoordinator, forKey: "fallbackSpeaker"); onChange?() } }
+    var showWindowAtLaunch: Bool { didSet { d.set(showWindowAtLaunch, forKey: "showWindow") } }
+
+    init(defaults: UserDefaults) {
+        d = defaults
+        // micLatency 70 ms matches the core's default.
+        d.register(defaults: ["aec": true, "ns": true, "micLatency": 70, "playout": 80, "autoElect": true, "showWindow": true])
+        inputDevice = d.string(forKey: "inputDevice")
+        outputDevice = d.string(forKey: "outputDevice")
+        allowSimultaneousTalkers = d.bool(forKey: "multiTalk")
+        echoCancellation = d.bool(forKey: "aec")
+        noiseSuppression = d.bool(forKey: "ns")
+        micLatencyMs = UInt32(d.integer(forKey: "micLatency"))
+        playoutDelayMs = UInt32(d.integer(forKey: "playout"))
+        autoElectCoordinator = d.bool(forKey: "autoElect")
+        fallbackSpeakerToCoordinator = d.bool(forKey: "fallbackSpeaker")
+        showWindowAtLaunch = d.bool(forKey: "showWindow")
+    }
+
+    var ffi: FfiSettings {
+        FfiSettings(inputDevice: inputDevice, outputDevice: outputDevice, allowSimultaneousTalkers: allowSimultaneousTalkers,
+                    echoCancellation: echoCancellation, noiseSuppression: noiseSuppression, micLatencyMs: micLatencyMs,
+                    playoutDelayMs: playoutDelayMs, autoElectCoordinator: autoElectCoordinator,
+                    fallbackSpeakerToCoordinator: fallbackSpeakerToCoordinator)
+    }
+
+    func peerId() -> String {
+        if let id = d.string(forKey: "peerId"), id.count == 16 { return id }
+        let id = generatePeerId()
+        d.set(id, forKey: "peerId")
+        return id
+    }
+}
