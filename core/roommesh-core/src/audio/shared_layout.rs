@@ -28,7 +28,22 @@ pub struct RingHeader {
     pub write_host_ns: AtomicU64,
     pub read_pos: AtomicU64,
     pub read_host_ns: AtomicU64,
-    pub _reserved: [u64; 4],
+    /// Speaker-ring seqlock, occupying the first of the four original reserved slots
+    /// (SHM_VERSION is unchanged - this is a compatible extension). Mirror:
+    /// driver/src/SharedLayout.hpp's `RingHeader::seq`. The mic ring's RingHeader also has this
+    /// field (both rings share this struct), but the driver never writes it there.
+    ///
+    /// Odd while the driver's `SharedRegion::WriteSpeaker` is mid-write; even, and incremented
+    /// by 2, once `write_host_ns` and `write_pos` have both been published for that write. See
+    /// `virtual_device::SpeakerReader::write_state` for the reader side of the protocol.
+    ///
+    /// A region written by a driver from before this field existed leaves it at 0 forever (that
+    /// driver's WriteSpeaker never stores to it) - the reader treats `seq == 0` as "no seqlock
+    /// support" and falls back to its previous `write_host_ns`-matching heuristic, so an old
+    /// driver paired with a new app keeps working (just without the stronger guarantee) until
+    /// the driver side is reinstalled too.
+    pub seq: AtomicU64,
+    pub _reserved: [u64; 3],
 }
 
 #[repr(C)]
@@ -59,5 +74,6 @@ mod tests {
         assert_eq!(offset_of!(SharedHeader, generation), 16);
         assert_eq!(offset_of!(SharedHeader, app_heartbeat_ns), 32);
         assert_eq!(offset_of!(SharedHeader, mic_clients), 40);
+        assert_eq!(offset_of!(RingHeader, seq), 32, "occupies the original reserved[0] slot");
     }
 }

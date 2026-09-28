@@ -857,6 +857,40 @@ static void anchorDepthForwardTrimSuiteTest() {
     }
 }
 
+// Speaker-ring seqlock (RingHeader::seq): WriteSpeaker must leave seq even
+// after every call (never observably odd from outside the call, since
+// WriteSpeaker has a single caller and returns only once the final
+// even store has happened), incrementing by exactly 2 per write, and
+// distinct from write_pos/write_host_ns's own values - a regression that
+// forgot to advance seq, or advanced it by the wrong amount, would silently
+// break the Rust reader's ability to detect an in-progress write.
+static void speakerSeqlockTest() {
+    const std::string name = "/rmtest.seq." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    assert(l->speaker.h.seq.load() == 0);  // matches the Rust reader's "old driver" sentinel
+
+    float mono[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+    uint64_t expectedSeq = 0;
+    for (uint64_t i = 1; i <= 5; i++) {
+        r.WriteSpeaker(mono, 4, 1, 1'000'000'000 * i);
+        expectedSeq += 2;
+        const uint64_t seq = l->speaker.h.seq.load();
+        assert(seq == expectedSeq);
+        assert(seq % 2 == 0);  // never left odd
+        assert(l->speaker.h.write_pos.load() == 4 * i);
+        assert(l->speaker.h.write_host_ns.load() == 1'000'000'000 * i);
+    }
+
+    // The mic ring shares RingHeader but the driver never touches seq
+    // there - it must stay at 0 regardless of mic activity.
+    writeMic(l, 1.f, 512, 6'000'000'000);
+    assert(l->mic.h.seq.load() == 0);
+
+    r.Destroy();
+}
+
 // Fix (4): the app stores app_heartbeat_ns = 0 the instant it stops being
 // the room's coordinator, rather than leaving the last real timestamp
 // there. Reads must silence immediately when that happens - not only after
@@ -911,11 +945,13 @@ int main() {
     for (float f : out) assert(f == 0.f);
 
     // speaker: stereo downmix
+    assert(l->speaker.h.seq.load() == 0);  // fresh region: no write yet, matches "old driver" sentinel
     float st[8] = {1, 0, 0.5f, 0.5f, 0, 0, -1, 1};
     r.WriteSpeaker(st, 4, 2, now);
     assert(l->speaker.h.write_pos.load() == 4);
     assert(l->speaker.samples[0] == 0.5f && l->speaker.samples[1] == 0.5f && l->speaker.samples[3] == 0.f);
     assert(l->speaker.h.write_host_ns.load() == now);
+    assert(l->speaker.h.seq.load() == 2);  // even, incremented by 2, never left odd
 
     r.Heartbeat(now);
     assert(l->header.driver_heartbeat_ns.load() == now);
@@ -936,6 +972,7 @@ int main() {
     clientSlotsReleasedNoLeakTest();
     anchorDepthForwardTrimSuiteTest();
     largeReaderStableNoResyncTest();
+    speakerSeqlockTest();
     heartbeatZeroSilenceTest();
 
     std::puts("ring_test PASS");

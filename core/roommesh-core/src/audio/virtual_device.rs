@@ -235,6 +235,26 @@ impl SharedRegion {
         for (i, s) in samples.iter().enumerate() {
             unsafe { store_sample(ring, w + i as u64, *s) };
         }
+        // Mirrors the real driver's SharedRegion::WriteSpeaker seqlock protocol (see
+        // RingHeader::seq in shared_layout.rs) so tests exercise the same sequence a real
+        // driver produces, rather than leaving seq at 0 (which would only ever exercise the
+        // old-driver fallback path in write_state below).
+        let s = h.seq.load(Ordering::Relaxed);
+        h.seq.store(s + 1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        h.write_host_ns.store(host_ns, Ordering::Relaxed);
+        h.write_pos
+            .store(w + samples.len() as u64, Ordering::Release);
+        h.seq.store(s + 2, Ordering::Release);
+    }
+    /// Emulates a driver from before the seqlock existed: publishes write_pos/write_host_ns the
+    /// old way, leaving `seq` at 0. Used to test [`SpeakerReader`]'s fallback path.
+    pub fn test_driver_write_speaker_legacy(&self, samples: &[f32], host_ns: u64) {
+        let (ring, h) = self.speaker_ring();
+        let w = h.write_pos.load(Ordering::Relaxed);
+        for (i, s) in samples.iter().enumerate() {
+            unsafe { store_sample(ring, w + i as u64, *s) };
+        }
         h.write_host_ns.store(host_ns, Ordering::Release);
         h.write_pos
             .store(w + samples.len() as u64, Ordering::Release);
@@ -320,9 +340,45 @@ impl SpeakerReader {
     pub fn region(&self) -> &Arc<SharedRegion> {
         &self.region
     }
-    /// A consistent (write_pos, write_host_ns) pair: the host time is read on both sides of the
-    /// position and the read retried (bounded) if the driver published in between.
+    /// A consistent (write_pos, write_host_ns) pair, using the driver's seqlock
+    /// (RingHeader::seq; see SharedRegion::WriteSpeaker in driver/src/SharedRegion.cpp):
+    /// read seq, retry if odd (a write is in progress); read write_pos and write_host_ns;
+    /// fence; re-read seq and retry if it changed underneath us. seq == 0 means a driver from
+    /// before the seqlock existed is running (it never writes this field), so fall back to the
+    /// previous heuristic instead of waiting forever on a seqlock that will never advance.
     fn write_state(h: &RingHeader) -> (u64, u64) {
+        const MAX_ATTEMPTS: u32 = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            let seq1 = h.seq.load(Ordering::Acquire);
+            if seq1 == 0 {
+                return Self::write_state_legacy_heuristic(h);
+            }
+            if seq1 & 1 != 0 {
+                continue; // odd: a write is in progress right now, retry
+            }
+            let w = h.write_pos.load(Ordering::Relaxed);
+            let t = h.write_host_ns.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let seq2 = h.seq.load(Ordering::Relaxed);
+            if seq1 == seq2 {
+                return (w, t);
+            }
+            // seq changed while we were reading w/t (a write started and/or completed
+            // concurrently): the pair we just read may be torn, retry.
+        }
+        // Exhausted the bounded retries (e.g. the driver is writing unusually fast, or seq is
+        // stuck odd because the driver crashed mid-write). Fall back to a plain Acquire read of
+        // each field rather than spinning forever - a torn pair here is no worse than what the
+        // pre-seqlock heuristic could already produce in the same pathological case.
+        (
+            h.write_pos.load(Ordering::Acquire),
+            h.write_host_ns.load(Ordering::Acquire),
+        )
+    }
+    /// Pre-seqlock heuristic, kept for regions written by an older driver (see write_state
+    /// above): the host time is read on both sides of the position and the read retried
+    /// (bounded) if the driver published in between.
+    fn write_state_legacy_heuristic(h: &RingHeader) -> (u64, u64) {
         let mut state = (0, 0);
         for _ in 0..4 {
             let t1 = h.write_host_ns.load(Ordering::Acquire);
@@ -458,6 +514,44 @@ mod tests {
         assert_eq!(region.test_mic_write_pos(), 480);
         drop(w);
         assert_eq!(region.header().app_heartbeat_ns.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn speaker_seqlock_advances_and_reader_gets_consistent_state() {
+        let region = Arc::new(SharedRegion::create_for_test().unwrap());
+        assert_eq!(region.speaker_ring().1.seq.load(Ordering::Relaxed), 0);
+        let mut spk = SpeakerReader::new(region.clone());
+        region.test_driver_write_speaker(&[0.1; 10], 1_000);
+        assert_eq!(region.speaker_ring().1.seq.load(Ordering::Relaxed), 2);
+        assert!(spk.read(4096).is_none(), "reader starts at the live edge");
+
+        region.test_driver_write_speaker(&[0.2; 20], 2_000);
+        assert_eq!(region.speaker_ring().1.seq.load(Ordering::Relaxed), 4);
+        let chunk = spk.read(4096).unwrap();
+        assert_eq!(chunk.write_pos, 30);
+        assert_eq!(chunk.write_host_ns, 2_000);
+        assert_eq!(chunk.samples.len(), 20);
+        assert!(chunk.samples.iter().all(|v| *v == 0.2));
+    }
+
+    #[test]
+    fn speaker_reader_falls_back_to_heuristic_for_pre_seqlock_driver() {
+        let region = Arc::new(SharedRegion::create_for_test().unwrap());
+        let mut spk = SpeakerReader::new(region.clone());
+        // Legacy write path never touches seq - it stays 0, the reader's "old driver" signal
+        // to fall back to the write_host_ns-matching heuristic instead of a seqlock retry loop
+        // that would otherwise spin until it exhausts MAX_ATTEMPTS.
+        region.test_driver_write_speaker_legacy(&[0.1; 5], 1_000);
+        assert_eq!(region.speaker_ring().1.seq.load(Ordering::Relaxed), 0);
+        assert!(spk.read(4096).is_none(), "reader starts at the live edge");
+
+        region.test_driver_write_speaker_legacy(&[0.3; 15], 5_000);
+        assert_eq!(region.speaker_ring().1.seq.load(Ordering::Relaxed), 0);
+        let chunk = spk.read(4096).unwrap();
+        assert_eq!(chunk.write_pos, 20);
+        assert_eq!(chunk.write_host_ns, 5_000);
+        assert_eq!(chunk.samples.len(), 15);
+        assert!(chunk.samples.iter().all(|v| *v == 0.3));
     }
 
     #[test]

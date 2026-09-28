@@ -447,8 +447,17 @@ void SharedRegion::WriteSpeaker(const float* in, uint32_t frames, uint32_t chann
         for (uint32_t c = 0; c < channels; c++) s += in[f * channels + c];
         ring.samples[(w + f) & kRingMask] = s / static_cast<float>(channels);
     }
+    // Seqlock (see RingHeader::seq in SharedLayout.hpp): mark odd before
+    // touching write_host_ns/write_pos, fence so that marking is ordered
+    // before those stores, publish both, then mark even. WriteSpeaker has
+    // exactly one caller (this device's IO thread), so `s` needs no atomic
+    // read-modify-write - nothing else can be concurrently advancing it.
+    const uint64_t s = ring.h.seq.load(std::memory_order_relaxed);
+    ring.h.seq.store(s + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
     ring.h.write_host_ns.store(nowNs, std::memory_order_relaxed);
     ring.h.write_pos.store(w + frames, std::memory_order_release);
+    ring.h.seq.store(s + 2, std::memory_order_release);
 }
 
 void SharedRegion::Heartbeat(uint64_t nowNs) {
