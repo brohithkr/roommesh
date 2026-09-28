@@ -1,10 +1,13 @@
 //! App-side client of the RoomMesh driver's shared memory: writes the arbitrated room mic into
 //! the mic ring (served by "RoomMesh Microphone") and reads what meeting apps play into
 //! "RoomMesh Speaker" from the speaker ring.
+//!
+//! Sample slots are accessed as `AtomicU32` (f32 bits, `Relaxed`); ordering between the sample
+//! data and the ring positions comes from the `Release` store / `Acquire` load of `write_pos`.
 use crate::audio::shared_layout::*;
 use std::ffi::CString;
 use std::ptr::addr_of_mut;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
@@ -13,6 +16,8 @@ pub enum VirtualDeviceError {
     NotFound(i32),
     #[error("shared memory has unexpected size or version")]
     Incompatible,
+    #[error("RoomMesh driver shared memory is not initialised yet")]
+    NotReady,
     #[error("system call failed: {0}")]
     Os(i32),
 }
@@ -21,12 +26,34 @@ pub struct SharedRegion {
     ptr: *mut SharedLayout,
     name: String,
     owner: bool,
+    generation: u64,
 }
 unsafe impl Send for SharedRegion {}
 unsafe impl Sync for SharedRegion {}
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+}
+
+/// The sample slot `pos` of `ring` as an atomic cell.
+///
+/// # Safety
+/// `ring` must point into a live mapping of a `SharedLayout`.
+unsafe fn slot<'a>(ring: *mut Ring, pos: u64) -> &'a AtomicU32 {
+    // f32 and u32 have the same size and alignment; the slot is only ever accessed atomically.
+    AtomicU32::from_ptr(addr_of_mut!((*ring).samples[(pos & RING_MASK) as usize]).cast())
+}
+
+/// # Safety
+/// See [`slot`].
+unsafe fn load_sample(ring: *mut Ring, pos: u64) -> f32 {
+    f32::from_bits(slot(ring, pos).load(Ordering::Relaxed))
+}
+
+/// # Safety
+/// See [`slot`].
+unsafe fn store_sample(ring: *mut Ring, pos: u64, v: f32) {
+    slot(ring, pos).store(v.to_bits(), Ordering::Relaxed)
 }
 
 impl SharedRegion {
@@ -39,8 +66,9 @@ impl SharedRegion {
             }
             let mut st: libc::stat = std::mem::zeroed();
             if libc::fstat(fd, &mut st) != 0 {
+                let e = errno();
                 libc::close(fd);
-                return Err(VirtualDeviceError::Os(errno()));
+                return Err(VirtualDeviceError::Os(e));
             }
             // macOS rounds shm sizes up to a page multiple
             if (st.st_size as usize) < std::mem::size_of::<SharedLayout>() {
@@ -55,19 +83,29 @@ impl SharedRegion {
                 fd,
                 0,
             );
+            let e = errno();
             libc::close(fd);
             if p == libc::MAP_FAILED {
-                return Err(VirtualDeviceError::Os(errno()));
+                return Err(VirtualDeviceError::Os(e));
             }
-            let r = Self {
+            let mut r = Self {
                 ptr: p as *mut SharedLayout,
                 name: name.to_string(),
                 owner: false,
+                generation: 0,
             };
+            // The driver fills in the static header fields and then publishes a non-zero
+            // generation (Release); read it first (Acquire) so the fields below are initialised.
+            let generation = r.header().generation.load(Ordering::Acquire);
+            if generation == 0 {
+                return Err(VirtualDeviceError::NotReady);
+            }
+            r.generation = generation;
             let h = r.header();
             if h.magic != SHM_MAGIC
                 || h.version != SHM_VERSION
                 || h.ring_frames as usize != RING_FRAMES
+                || h.sample_rate != 48_000
             {
                 return Err(VirtualDeviceError::Incompatible);
             }
@@ -77,6 +115,15 @@ impl SharedRegion {
 
     /// Creates a private region with the driver's initial state (tests and the devtool only).
     pub fn create_for_test() -> Result<Self, VirtualDeviceError> {
+        Self::create_for_test_with(1, 0)
+    }
+
+    /// [`create_for_test`](Self::create_for_test) with a chosen `generation` (non-zero) and
+    /// initial driver heartbeat.
+    pub fn create_for_test_with(
+        generation: u64,
+        driver_heartbeat_ns: u64,
+    ) -> Result<Self, VirtualDeviceError> {
         let mut b = [0u8; 4];
         getrandom::fill(&mut b).expect("rng");
         let name = format!("/rmtest.{:08x}", u32::from_le_bytes(b));
@@ -90,10 +137,15 @@ impl SharedRegion {
             if fd < 0 {
                 return Err(VirtualDeviceError::Os(errno()));
             }
+            let fail = |fd: libc::c_int| {
+                let e = errno();
+                libc::close(fd);
+                libc::shm_unlink(c.as_ptr());
+                VirtualDeviceError::Os(e)
+            };
             let size = std::mem::size_of::<SharedLayout>();
             if libc::ftruncate(fd, size as libc::off_t) != 0 {
-                libc::close(fd);
-                return Err(VirtualDeviceError::Os(errno()));
+                return Err(fail(fd));
             }
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -103,21 +155,29 @@ impl SharedRegion {
                 fd,
                 0,
             );
-            libc::close(fd);
             if p == libc::MAP_FAILED {
-                return Err(VirtualDeviceError::Os(errno()));
+                return Err(fail(fd));
             }
+            libc::close(fd);
             std::ptr::write_bytes(p as *mut u8, 0, size);
             let lp = p as *mut SharedLayout;
             (*lp).header.magic = SHM_MAGIC;
             (*lp).header.version = SHM_VERSION;
             (*lp).header.sample_rate = 48_000;
             (*lp).header.ring_frames = RING_FRAMES as u32;
-            (*lp).header.generation.store(1, Ordering::Release);
+            (*lp)
+                .header
+                .driver_heartbeat_ns
+                .store(driver_heartbeat_ns, Ordering::Relaxed);
+            (*lp)
+                .header
+                .generation
+                .store(generation.max(1), Ordering::Release);
             Ok(Self {
                 ptr: lp,
                 name,
                 owner: true,
+                generation: generation.max(1),
             })
         }
     }
@@ -127,6 +187,11 @@ impl SharedRegion {
     }
     pub fn header(&self) -> &SharedHeader {
         unsafe { &(*self.ptr).header }
+    }
+    /// The driver generation this mapping was opened at (changes when the driver restarts and
+    /// recreates the region).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
     fn mic_ring(&self) -> (*mut Ring, &RingHeader) {
         unsafe { (addr_of_mut!((*self.ptr).mic), &(*self.ptr).mic.h) }
@@ -141,16 +206,20 @@ impl SharedRegion {
     }
 
     // ---- driver-side emulation, used by tests and `roommesh-devtool shm-selftest` ----
+    pub fn test_set_driver_heartbeat(&self, ns: u64) {
+        self.header()
+            .driver_heartbeat_ns
+            .store(ns, Ordering::Relaxed);
+    }
+    pub fn test_mic_write_pos(&self) -> u64 {
+        self.mic_ring().1.write_pos.load(Ordering::Acquire)
+    }
     pub fn test_driver_read_mic(&self, from_pos: u64, out: &mut [f32]) -> usize {
         let (ring, h) = self.mic_ring();
         let w = h.write_pos.load(Ordering::Acquire);
         let n = (w.saturating_sub(from_pos) as usize).min(out.len());
         for (i, o) in out.iter_mut().take(n).enumerate() {
-            *o = unsafe {
-                std::ptr::read_volatile(addr_of_mut!(
-                    (*ring).samples[((from_pos + i as u64) & RING_MASK) as usize]
-                ))
-            };
+            *o = unsafe { load_sample(ring, from_pos + i as u64) };
         }
         h.read_pos.store(from_pos + n as u64, Ordering::Release);
         n
@@ -159,14 +228,9 @@ impl SharedRegion {
         let (ring, h) = self.speaker_ring();
         let w = h.write_pos.load(Ordering::Relaxed);
         for (i, s) in samples.iter().enumerate() {
-            unsafe {
-                std::ptr::write_volatile(
-                    addr_of_mut!((*ring).samples[((w + i as u64) & RING_MASK) as usize]),
-                    *s,
-                )
-            };
+            unsafe { store_sample(ring, w + i as u64, *s) };
         }
-        h.write_host_ns.store(host_ns, Ordering::Relaxed);
+        h.write_host_ns.store(host_ns, Ordering::Release);
         h.write_pos
             .store(w + samples.len() as u64, Ordering::Release);
     }
@@ -187,6 +251,8 @@ impl Drop for SharedRegion {
     }
 }
 
+/// Writes the room mic into the mic ring. Dropping the writer zeroes the app heartbeat so the
+/// driver serves silence immediately instead of waiting for the heartbeat to go stale.
 pub struct MicWriter {
     region: Arc<SharedRegion>,
 }
@@ -202,12 +268,7 @@ impl MicWriter {
         let (ring, h) = self.region.mic_ring();
         let w = h.write_pos.load(Ordering::Relaxed);
         for (i, s) in samples.iter().enumerate() {
-            unsafe {
-                std::ptr::write_volatile(
-                    addr_of_mut!((*ring).samples[((w + i as u64) & RING_MASK) as usize]),
-                    *s,
-                )
-            };
+            unsafe { store_sample(ring, w + i as u64, *s) };
         }
         h.write_host_ns.store(now_ns, Ordering::Relaxed);
         h.write_pos
@@ -219,6 +280,15 @@ impl MicWriter {
     }
     pub fn clients(&self) -> u32 {
         self.region.header().mic_clients.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for MicWriter {
+    fn drop(&mut self) {
+        self.region
+            .header()
+            .app_heartbeat_ns
+            .store(0, Ordering::Release);
     }
 }
 
@@ -242,11 +312,28 @@ impl SpeakerReader {
             cursor: None,
         }
     }
+    pub fn region(&self) -> &Arc<SharedRegion> {
+        &self.region
+    }
+    /// A consistent (write_pos, write_host_ns) pair: the host time is read on both sides of the
+    /// position and the read retried (bounded) if the driver published in between.
+    fn write_state(h: &RingHeader) -> (u64, u64) {
+        let mut state = (0, 0);
+        for _ in 0..4 {
+            let t1 = h.write_host_ns.load(Ordering::Acquire);
+            let w = h.write_pos.load(Ordering::Acquire);
+            let t2 = h.write_host_ns.load(Ordering::Acquire);
+            state = (w, t2);
+            if t1 == t2 {
+                break;
+            }
+        }
+        state
+    }
     /// Reads up to `max` new samples. The first call only positions the cursor at the live edge.
     pub fn read(&mut self, max: usize) -> Option<SpeakerChunk> {
         let (ring, h) = self.region.speaker_ring();
-        let w = h.write_pos.load(Ordering::Acquire);
-        let wt = h.write_host_ns.load(Ordering::Relaxed);
+        let (w, wt) = Self::write_state(h);
         let cur = self.cursor.get_or_insert(w);
         if w < *cur || w - *cur > (RING_FRAMES - 4_800) as u64 {
             *cur = w.saturating_sub(960);
@@ -257,11 +344,7 @@ impl SpeakerReader {
         }
         let first = *cur;
         let samples = (0..n as u64)
-            .map(|i| unsafe {
-                std::ptr::read_volatile(addr_of_mut!(
-                    (*ring).samples[((first + i) & RING_MASK) as usize]
-                ))
-            })
+            .map(|i| unsafe { load_sample(ring, first + i) })
             .collect();
         *cur += n as u64;
         h.read_pos.store(*cur, Ordering::Release);
@@ -318,6 +401,37 @@ mod tests {
         assert!(SharedRegion::open("/roommesh.nonexistent").is_err());
         let reopened = SharedRegion::open(region.name()).unwrap();
         assert_eq!(reopened.header().magic, SHM_MAGIC);
+    }
+    #[test]
+    fn open_records_generation_and_rejects_uninitialised_region() {
+        let region = SharedRegion::create_for_test_with(7, 123).unwrap();
+        assert_eq!(region.generation(), 7);
+        assert!(region.driver_alive(123 + 1_000_000_000));
+        assert!(!region.driver_alive(123 + 3_000_000_000));
+        assert_eq!(SharedRegion::open(region.name()).unwrap().generation(), 7);
+        region.header().generation.store(0, Ordering::Release);
+        assert!(matches!(
+            SharedRegion::open(region.name()),
+            Err(VirtualDeviceError::NotReady)
+        ));
+        region.header().generation.store(8, Ordering::Release);
+        let r = SharedRegion::open(region.name()).unwrap();
+        assert_eq!(r.generation(), 8);
+        r.test_set_driver_heartbeat(5);
+        assert_eq!(
+            region.header().driver_heartbeat_ns.load(Ordering::Relaxed),
+            5
+        );
+    }
+    #[test]
+    fn dropping_mic_writer_zeroes_app_heartbeat() {
+        let region = Arc::new(SharedRegion::create_for_test().unwrap());
+        let w = MicWriter::new(region.clone());
+        w.write(&[0.1; 480], 42);
+        assert_eq!(region.header().app_heartbeat_ns.load(Ordering::Relaxed), 42);
+        assert_eq!(region.test_mic_write_pos(), 480);
+        drop(w);
+        assert_eq!(region.header().app_heartbeat_ns.load(Ordering::Acquire), 0);
     }
 
     #[test]
