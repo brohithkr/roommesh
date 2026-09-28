@@ -1,49 +1,124 @@
 //! Developer diagnostics for the RoomMesh driver and audio devices.
+//!
+//! Exit codes: 0 = PASS / success, 1 = FAIL or error, 2 = usage error.
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use roommesh_core::audio::device_io::list_devices;
 use roommesh_core::audio::shared_layout::SHM_NAME;
 use roommesh_core::audio::virtual_device::{MicWriter, SharedRegion, SpeakerReader};
 use roommesh_core::time::now_ns;
+use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+const USAGE: &str = "\
+usage: roommesh-devtool [--force] <command>
+
+commands:
+  devices           list the physical audio devices the app would use (RoomMesh devices excluded)
+  shm-status        print the driver's shared-memory header (heartbeats, IO clients, liveness)
+  shm-selftest      in-process ring round trip; no driver needed
+  mic-loopback      write a tone into the mic ring and capture it from \"RoomMesh Microphone\"
+  speaker-loopback  play a tone into \"RoomMesh Speaker\" and read it back from the speaker ring
+
+options:
+  --force           run a loopback even while the RoomMesh app looks live
+  -h, --help        show this help
+
+The loopbacks drive the shared memory directly, so quit RoomMesh first; they refuse to run
+while the app's heartbeat is fresh or a client is capturing from RoomMesh Microphone.
+mic-loopback needs microphone permission: run it from Terminal.app.
+exit status: 0 = PASS, 1 = FAIL or error, 2 = usage error";
+
+/// Liveness window for the app heartbeat (same threshold the driver uses for its own).
+const LIVE_NS: u64 = 2_000_000_000;
+
+/// Energy (sum of squares) a loopback must exceed to PASS.
+const PASS_ENERGY: f64 = 100.0;
+
+/// `Ok(true)` = PASS / success, `Ok(false)` = FAIL, `Err` = could not run the check.
+type Outcome = Result<bool, String>;
 
 /// A 440 Hz test tone sample at 48 kHz for sample index `i`.
 fn tone(i: u64) -> f32 {
     0.25 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin()
 }
 
+/// Locks `m`, ignoring poisoning: the guarded values are plain counters.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Finds a device by exact name directly through cpal, bypassing `device_io`'s exclusion of
 /// RoomMesh virtual devices — the whole point of the loopback checks is to talk to them.
-fn find(name: &str, input: bool) -> cpal::Device {
+fn find(name: &str, input: bool) -> Result<cpal::Device, String> {
     let host = cpal::default_host();
     let mut it: Box<dyn Iterator<Item = cpal::Device>> = if input {
-        Box::new(host.input_devices().expect("enumerate input devices"))
+        Box::new(
+            host.input_devices()
+                .map_err(|e| format!("cannot enumerate input devices: {e}"))?,
+        )
     } else {
-        Box::new(host.output_devices().expect("enumerate output devices"))
+        Box::new(
+            host.output_devices()
+                .map_err(|e| format!("cannot enumerate output devices: {e}"))?,
+        )
     };
     it.find(|d| d.description().is_ok_and(|x| x.name() == name))
-        .unwrap_or_else(|| panic!("device '{name}' not found — is the driver installed?"))
+        .ok_or_else(|| format!("device '{name}' not found — is the driver installed?"))
 }
 
-fn open() -> Arc<SharedRegion> {
-    Arc::new(SharedRegion::open(SHM_NAME).unwrap_or_else(|e| {
-        eprintln!("FAIL: {e}");
-        std::process::exit(1)
-    }))
+fn open() -> Result<Arc<SharedRegion>, String> {
+    SharedRegion::open(SHM_NAME)
+        .map(Arc::new)
+        .map_err(|e| format!("cannot open {SHM_NAME}: {e}"))
 }
 
-fn cmd_devices() {
+/// Formats a heartbeat's age, or "none" when it has never been written (or was cleared).
+fn age(now: u64, heartbeat_ns: u64) -> String {
+    if heartbeat_ns == 0 {
+        "none".into()
+    } else {
+        format!("{} ms", now.saturating_sub(heartbeat_ns) / 1_000_000)
+    }
+}
+
+/// Refuses to run a loopback while RoomMesh (or a meeting app) is using the shared memory:
+/// the loopback would fight the app over the mic ring and both results would be garbage.
+fn ensure_app_not_live(r: &SharedRegion, force: bool) -> Result<(), String> {
+    let h = r.header();
+    let now = now_ns();
+    let hb = h.app_heartbeat_ns.load(Ordering::Relaxed);
+    let clients = h.mic_clients.load(Ordering::Relaxed);
+    let reason = if hb != 0 && now.saturating_sub(hb) < LIVE_NS {
+        format!("the app heartbeat is fresh ({} old)", age(now, hb))
+    } else if clients > 0 {
+        format!("{clients} client(s) are capturing from RoomMesh Microphone")
+    } else {
+        return Ok(());
+    };
+    if force {
+        eprintln!("warning: {reason}; continuing because of --force");
+        Ok(())
+    } else {
+        Err(format!(
+            "RoomMesh looks live: {reason}. Quit RoomMesh first (or pass --force)"
+        ))
+    }
+}
+
+fn cmd_devices() -> Outcome {
     for d in list_devices() {
         println!(
             "{:<40} in={} out={} default={}",
             d.name, d.is_input, d.is_output, d.is_default
         );
     }
+    Ok(true)
 }
 
-fn cmd_shm_status() {
-    let r = open();
+fn cmd_shm_status() -> Outcome {
+    let r = open()?;
     let h = r.header();
     println!(
         "magic={:#x} version={} rate={} generation={}",
@@ -54,9 +129,9 @@ fn cmd_shm_status() {
     );
     let now = now_ns();
     println!(
-        "driver heartbeat age={} ms, app heartbeat age={} ms",
-        now.saturating_sub(h.driver_heartbeat_ns.load(Ordering::Relaxed)) / 1_000_000,
-        now.saturating_sub(h.app_heartbeat_ns.load(Ordering::Relaxed)) / 1_000_000
+        "driver heartbeat age={}, app heartbeat age={}",
+        age(now, h.driver_heartbeat_ns.load(Ordering::Relaxed)),
+        age(now, h.app_heartbeat_ns.load(Ordering::Relaxed))
     );
     println!(
         "mic io active={} speaker io active={}",
@@ -64,34 +139,61 @@ fn cmd_shm_status() {
         h.speaker_clients.load(Ordering::Relaxed)
     );
     println!("driver alive: {}", r.driver_alive(now_ns()));
+    Ok(true)
 }
 
-fn cmd_shm_selftest() {
-    let r = Arc::new(SharedRegion::create_for_test().expect("create"));
+fn cmd_shm_selftest() -> Outcome {
+    let r = Arc::new(
+        SharedRegion::create_for_test().map_err(|e| format!("cannot create test region: {e}"))?,
+    );
     MicWriter::new(r.clone()).write(&[0.5; 480], now_ns());
     let mut out = vec![0.0; 480];
-    assert_eq!(r.test_driver_read_mic(0, &mut out), 480);
-    println!("PASS shm-selftest");
+    let n = r.test_driver_read_mic(0, &mut out);
+    let ok = n == 480 && out.iter().all(|&v| v == 0.5);
+    if ok {
+        println!("PASS shm-selftest");
+    } else {
+        let bad = out.iter().filter(|&&v| v != 0.5).count();
+        println!("FAIL shm-selftest: read {n}/480 frames, {bad} samples differ from 0.5");
+    }
+    Ok(ok)
 }
 
-fn cmd_mic_loopback() {
-    let r = open();
+#[derive(Default)]
+struct Capture {
+    callbacks: u64,
+    samples: u64,
+    nonzero: u64,
+    energy: f64,
+}
+
+fn cmd_mic_loopback(force: bool) -> Outcome {
+    let r = open()?;
+    ensure_app_not_live(&r, force)?;
     let writer = MicWriter::new(r);
-    let energy = Arc::new(Mutex::new(0.0f64));
-    let e2 = energy.clone();
-    let dev = find("RoomMesh Microphone", true);
-    let cfg: cpal::StreamConfig = dev.default_input_config().unwrap().config();
+    let cap = Arc::new(Mutex::new(Capture::default()));
+    let cap2 = cap.clone();
+    let dev = find("RoomMesh Microphone", true)?;
+    let cfg: cpal::StreamConfig = dev
+        .default_input_config()
+        .map_err(|e| format!("RoomMesh Microphone has no default input config: {e}"))?
+        .config();
     let s = dev
         .build_input_stream::<f32, _, _>(
             cfg,
             move |d: &[f32], _: &cpal::InputCallbackInfo| {
-                *e2.lock().unwrap() += d.iter().map(|v| (v * v) as f64).sum::<f64>();
+                let mut c = lock(&cap2);
+                c.callbacks += 1;
+                c.samples += d.len() as u64;
+                c.nonzero += d.iter().filter(|&&v| v != 0.0).count() as u64;
+                c.energy += d.iter().map(|v| (v * v) as f64).sum::<f64>();
             },
-            |e| eprintln!("{e}"),
+            |e| eprintln!("input stream error: {e}"),
             None,
         )
-        .unwrap();
-    s.play().unwrap();
+        .map_err(|e| format!("cannot open an input stream on RoomMesh Microphone: {e}"))?;
+    s.play()
+        .map_err(|e| format!("cannot start the RoomMesh Microphone stream: {e}"))?;
     let start = Instant::now();
     let mut written = 0u64;
     while start.elapsed() < Duration::from_secs(3) {
@@ -103,17 +205,43 @@ fn cmd_mic_loopback() {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let e = *energy.lock().unwrap();
+    drop(s);
+    let c = lock(&cap);
+    let e = c.energy;
+    if c.callbacks == 0 {
+        println!("FAIL mic-loopback energy={e:.1}: no input callbacks received");
+        return Ok(false);
+    }
+    if c.nonzero == 0 {
+        println!(
+            "FAIL mic-loopback energy={e:.1}: {} callbacks, {} samples, all exactly 0",
+            c.callbacks, c.samples
+        );
+        println!(
+            "hint: bit-exact silence is what macOS TCC feeds a process without microphone \
+             permission; run from Terminal.app with microphone permission"
+        );
+        return Ok(false);
+    }
+    let pass = e > PASS_ENERGY;
     println!(
-        "{} mic-loopback energy={e:.1}",
-        if e > 100.0 { "PASS" } else { "FAIL" }
+        "{} mic-loopback energy={e:.1} ({} callbacks, {} samples)",
+        if pass { "PASS" } else { "FAIL" },
+        c.callbacks,
+        c.samples
     );
+    Ok(pass)
 }
 
-fn cmd_speaker_loopback() {
-    let mut reader = SpeakerReader::new(open());
-    let dev = find("RoomMesh Speaker", false);
-    let cfg: cpal::StreamConfig = dev.default_output_config().unwrap().config();
+fn cmd_speaker_loopback(force: bool) -> Outcome {
+    let r = open()?;
+    ensure_app_not_live(&r, force)?;
+    let mut reader = SpeakerReader::new(r);
+    let dev = find("RoomMesh Speaker", false)?;
+    let cfg: cpal::StreamConfig = dev
+        .default_output_config()
+        .map_err(|e| format!("RoomMesh Speaker has no default output config: {e}"))?
+        .config();
     let ch = cfg.channels as usize;
     let mut i = 0u64;
     let s = dev
@@ -125,11 +253,12 @@ fn cmd_speaker_loopback() {
                     i += 1;
                 }
             },
-            |e| eprintln!("{e}"),
+            |e| eprintln!("output stream error: {e}"),
             None,
         )
-        .unwrap();
-    s.play().unwrap();
+        .map_err(|e| format!("cannot open an output stream on RoomMesh Speaker: {e}"))?;
+    s.play()
+        .map_err(|e| format!("cannot start the RoomMesh Speaker stream: {e}"))?;
     reader.read(1 << 16); // position the cursor at the live edge
                           // Drain continuously rather than sleeping and bulk-draining at the end: the ring holds
                           // ~680ms, so a single sleep(2s) then one read() would fall behind by more than that and
@@ -153,22 +282,51 @@ fn cmd_speaker_loopback() {
             .map(|v| (*v as f64) * (*v as f64))
             .sum::<f64>();
     }
+    let pass = energy > PASS_ENERGY;
     println!(
         "{} speaker-loopback energy={energy:.1}",
-        if energy > 100.0 { "PASS" } else { "FAIL" }
+        if pass { "PASS" } else { "FAIL" }
     );
+    Ok(pass)
 }
 
-fn main() {
-    let cmd = std::env::args().nth(1).unwrap_or_default();
-    match cmd.as_str() {
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}\n\n{USAGE}");
+    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    let mut force = false;
+    let mut cmd: Option<String> = None;
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--force" => force = true,
+            s if s.starts_with('-') => return usage_error(&format!("unknown option '{s}'")),
+            s if cmd.is_none() => cmd = Some(s.to_string()),
+            s => return usage_error(&format!("unexpected argument '{s}'")),
+        }
+    }
+    let Some(cmd) = cmd else {
+        return usage_error("no command given");
+    };
+    let outcome = match cmd.as_str() {
         "devices" => cmd_devices(),
         "shm-status" => cmd_shm_status(),
         "shm-selftest" => cmd_shm_selftest(),
-        "mic-loopback" => cmd_mic_loopback(),
-        "speaker-loopback" => cmd_speaker_loopback(),
-        _ => eprintln!(
-            "usage: roommesh-devtool devices|shm-status|shm-selftest|mic-loopback|speaker-loopback"
-        ),
+        "mic-loopback" => cmd_mic_loopback(force),
+        "speaker-loopback" => cmd_speaker_loopback(force),
+        other => return usage_error(&format!("unknown command '{other}'")),
+    };
+    match outcome {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("FAIL {cmd}: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
