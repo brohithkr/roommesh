@@ -17,15 +17,19 @@
 //! from a Core-lifetime counter ([`Core`]'s `pong_seq`), never from the ping it answers — a
 //! duplicated or replayed ping would otherwise make us seal two different plaintexts under
 //! one nonce. The ping's own sequence travels in the pong payload instead:
-//! `[t1, t2, t3, ping_sequence]`.
+//! `[t1, t2, t3, ping_sequence]`, and the pinging DSP accepts a pong only for a ping it still
+//! has outstanding with the same t1 (once). Pings themselves pass a per-sender replay window
+//! (scoped to the session key and epoch) before they are answered.
 use crate::engine::metrics::PeerMetrics;
 use crate::engine::runtime::{
-    AudioBackend, AudioRuntime, AudioSettings, RuntimeEvent, RuntimeMsg, RuntimeShared,
+    AudioBackend, AudioRuntime, AudioSettings, RuntimeEvent, RuntimeMsg, RuntimeSender,
+    RuntimeShared,
 };
-use crate::ids::{PeerId, StreamId};
+use crate::ids::{Epoch, PeerId, StreamId};
 use crate::network::clock_sync::ClockSample;
 use crate::network::control::{ControlChannel, ControlEvent, RtSessions};
 use crate::network::realtime::{decode_packet, decode_times, encode_times, PacketKind, RtHeader};
+use crate::network::secure::RtCipher;
 use crate::network::transport::{LocalAdvertisement, PeerTransport, TransportEvent};
 use crate::room::engine::{Command, Output, RoomConfig, RoomEngine, RoomError};
 use crate::room::events::*;
@@ -114,6 +118,55 @@ pub struct Core {
     muted: AtomicBool,
     /// Sequence numbers of the clock pongs we seal (see module docs).
     pong_seq: AtomicU32,
+    /// Per-sender replay window for clock pings.
+    ping_replay: Mutex<HashMap<PeerId, ReplayWindow>>,
+}
+
+/// Sliding anti-replay window over one sender's clock-ping sequence numbers, scoped to one
+/// realtime session key (its cipher instance, held so the identity can't be reused; a rekey
+/// resets the window) and epoch.
+#[derive(Default)]
+struct ReplayWindow {
+    scope: Option<(Arc<RtCipher>, Epoch)>,
+    highest: u32,
+    /// Bit `i` set: `highest - i` was seen.
+    seen: u64,
+}
+
+impl ReplayWindow {
+    const WIDTH: u32 = 64;
+    /// Whether `seq` is new (and records it). Anything older than the window is rejected.
+    fn accept(&mut self, key: &Arc<RtCipher>, epoch: Epoch, seq: u32) -> bool {
+        let same = self
+            .scope
+            .as_ref()
+            .is_some_and(|(k, e)| Arc::ptr_eq(k, key) && *e == epoch);
+        if !same {
+            *self = Self {
+                scope: Some((key.clone(), epoch)),
+                highest: seq,
+                seen: 1,
+            };
+            return true;
+        }
+        if seq > self.highest {
+            let shift = seq - self.highest;
+            self.seen = if shift >= Self::WIDTH {
+                0
+            } else {
+                self.seen << shift
+            };
+            self.seen |= 1;
+            self.highest = seq;
+            return true;
+        }
+        let back = self.highest - seq;
+        if back >= Self::WIDTH || self.seen & (1 << back) != 0 {
+            return false;
+        }
+        self.seen |= 1 << back;
+        true
+    }
 }
 
 impl Core {
@@ -175,6 +228,7 @@ impl Core {
             cache,
             muted: AtomicBool::new(false),
             pong_seq: AtomicU32::new(0),
+            ping_replay: Mutex::new(HashMap::new()),
         }
     }
 
@@ -223,6 +277,16 @@ impl Core {
                 if !self.cache.is_coordinator.load(Ordering::Relaxed) {
                     return;
                 }
+                // Replayed pings are not answered (no amplification, no stale samples).
+                let fresh = self
+                    .ping_replay
+                    .lock()
+                    .entry(h.sender)
+                    .or_default()
+                    .accept(&cipher, h.epoch, h.sequence);
+                if !fresh {
+                    return;
+                }
                 let Some(&t1) = decode_times(&payload).first() else {
                     return;
                 };
@@ -242,7 +306,10 @@ impl Core {
                     .send_realtime(h.sender, cipher.seal(&rh, &body));
             }
             PacketKind::ClockPong => {
-                if let [t1, t2, t3, _ping_seq] = decode_times(&payload)[..] {
+                if let [t1, t2, t3, ping_seq] = decode_times(&payload)[..] {
+                    let Ok(ping_seq) = u32::try_from(ping_seq) else {
+                        return;
+                    };
                     self.runtime.send(RuntimeMsg::Pong {
                         sample: ClockSample {
                             t1,
@@ -251,6 +318,7 @@ impl Core {
                             t4: arrival,
                         },
                         from: h.sender,
+                        ping_seq,
                     });
                 }
             }
@@ -355,7 +423,7 @@ struct ControlLoop {
     transport: Arc<dyn PeerTransport>,
     sink: Arc<dyn EventSink>,
     cache: Arc<Cache>,
-    runtime_tx: Sender<RuntimeMsg>,
+    runtime_tx: RuntimeSender,
     runtime_shared: Arc<RuntimeShared>,
     last_connect: HashMap<PeerId, u64>,
     last_tick_ms: u64,
@@ -575,7 +643,7 @@ impl ControlLoop {
                         .is_coordinator
                         .store(r.is_coordinator, Ordering::Relaxed);
                     *self.cache.roles.lock() = Some(r.clone());
-                    let _ = self.runtime_tx.try_send(RuntimeMsg::Roles(r));
+                    self.runtime_tx.send(RuntimeMsg::Roles(r));
                 }
             }
         }
@@ -753,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicated_clock_ping_gets_pongs_with_distinct_sequences() {
+    fn clock_pings_are_answered_once_with_distinct_pong_sequences() {
         let net = LoopbackNetwork::new();
         let a = node(&net, 1, Box::new(NullAudio));
         let raw = raw_peer(&net, 2, &a, 1);
@@ -764,40 +832,46 @@ mod tests {
         wait("A coordinates", 3, || a.core.roles().is_coordinator);
         let epoch = a.core.room_snapshot().unwrap().epoch;
         let cipher = raw.control.realtime_sessions().read()[&PeerId(1)].clone();
-        let ping = cipher.seal(
-            &RtHeader {
-                kind: PacketKind::ClockPing,
-                epoch,
-                stream: StreamId::CLOCK,
-                sender: PeerId(2),
-                sequence: 7,
-                sample_index: 0,
-                timestamp_ns: 123,
-                frame_count: 0,
-            },
-            &encode_times(&[123]),
-        );
-        a.core
-            .handle_transport_event(TransportEvent::Realtime(ping.clone()));
-        a.core
-            .handle_transport_event(TransportEvent::Realtime(ping));
+        let ping = |seq: u32| {
+            cipher.seal(
+                &RtHeader {
+                    kind: PacketKind::ClockPing,
+                    epoch,
+                    stream: StreamId::CLOCK,
+                    sender: PeerId(2),
+                    sequence: seq,
+                    sample_index: 0,
+                    timestamp_ns: 123,
+                    frame_count: 0,
+                },
+                &encode_times(&[123 + seq as u64]),
+            )
+        };
+        // A duplicated (replayed) ping is answered once; the next ping is answered too.
+        for p in [ping(7), ping(7), ping(8), ping(7)] {
+            a.core.handle_transport_event(TransportEvent::Realtime(p));
+        }
         let mut pongs = Vec::new();
-        let end = Instant::now() + Duration::from_secs(3);
-        while pongs.len() < 2 && Instant::now() < end {
+        let end = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < end {
             if let Ok(TransportEvent::Realtime(p)) = raw.rx.recv_timeout(Duration::from_millis(50))
             {
                 pongs.push(cipher.open(&p).expect("pong authenticates"));
             }
         }
-        assert_eq!(pongs.len(), 2, "each ping is answered");
-        for (h, payload) in &pongs {
+        assert_eq!(
+            pongs.len(),
+            2,
+            "each distinct ping is answered exactly once"
+        );
+        for ((h, payload), seq) in pongs.iter().zip([7u64, 8]) {
             assert_eq!(h.kind, PacketKind::ClockPong);
             assert_eq!(h.sender, PeerId(1));
             let t = decode_times(payload);
             assert_eq!(t.len(), 4);
             assert_eq!(
                 (t[0], t[3]),
-                (123, 7),
+                (123 + seq, seq),
                 "t1 and the ping's sequence are echoed"
             );
             assert!(t[2] >= t[1]);
@@ -806,6 +880,33 @@ mod tests {
             pongs[0].0.sequence, pongs[1].0.sequence,
             "pong nonces must never repeat"
         );
+    }
+
+    #[test]
+    fn replay_window_accepts_each_sequence_once_and_resets_on_rekey_or_epoch() {
+        use crate::network::secure::{decode_hello, Handshake};
+        let cipher = || {
+            let (a, b) = (
+                Handshake::new(PeerId(1), "a".into()),
+                Handshake::new(PeerId(2), "b".into()),
+            );
+            a.complete(&decode_hello(&b.hello()).unwrap())
+                .unwrap()
+                .realtime()
+        };
+        let (c1, c2) = (cipher(), cipher());
+        let mut w = ReplayWindow::default();
+        let e = Epoch(1);
+        assert!(w.accept(&c1, e, 10));
+        assert!(!w.accept(&c1, e, 10), "duplicate");
+        assert!(w.accept(&c1, e, 12));
+        assert!(w.accept(&c1, e, 11), "reordered within the window");
+        assert!(!w.accept(&c1, e, 11));
+        assert!(w.accept(&c1, e, 200));
+        assert!(!w.accept(&c1, e, 12), "older than the window");
+        assert!(w.accept(&c1, Epoch(2), 12), "new epoch resets");
+        assert!(w.accept(&c2, Epoch(2), 0), "new key resets");
+        assert!(!w.accept(&c2, Epoch(2), 0));
     }
 
     #[test]

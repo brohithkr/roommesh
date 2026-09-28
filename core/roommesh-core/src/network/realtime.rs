@@ -88,7 +88,8 @@ pub fn decode_packet(buf: &[u8]) -> Result<(RtHeader, &[u8]), RtError> {
     Ok((h, &buf[HEADER_LEN..]))
 }
 
-/// Clock ping payload: t1. Pong payload: t1, t2, t3 (all u64 LE, host ns of their clocks).
+/// Clock ping payload: t1. Pong payload: t1, t2, t3, ping_seq (all u64 LE; the times are host ns
+/// of their clocks, ping_seq is the sequence number of the ping being answered).
 pub fn encode_times(times: &[u64]) -> Vec<u8> { times.iter().flat_map(|t| t.to_le_bytes()).collect() }
 pub fn decode_times(p: &[u8]) -> Vec<u64> {
     p.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect()
