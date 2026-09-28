@@ -10,6 +10,9 @@ pub enum ChangeRequest {
     SetMicEnabled { peer: PeerId, enabled: bool },
     RemoveMember(PeerId),
     Rename(String),
+    /// A member refreshing its own name/capabilities; the coordinator keeps `mic_enabled` as
+    /// the manifest has it.
+    UpdateMember(MemberInfo),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +82,7 @@ mod tests {
             ControlMessage::Manifest(m.clone()),
             ControlMessage::Request { room_id: RoomId(1), epoch: Epoch(1), change: ChangeRequest::SetSpeaker(Some(PeerId(2))) },
             ControlMessage::Leave { room_id: RoomId(1) },
+            ControlMessage::Request { room_id: RoomId(1), epoch: Epoch(1), change: ChangeRequest::UpdateMember(m.members[0].clone()) },
             ControlMessage::Heartbeat { room_id: RoomId(1), epoch: Epoch(1), revision: 0, manifest: Some(m.clone()), sees_coordinator: true },
             ControlMessage::Heartbeat { room_id: RoomId(1), epoch: Epoch(1), revision: 0, manifest: None, sees_coordinator: false },
             ControlMessage::ActiveMic { room_id: RoomId(1), epoch: Epoch(1), primary: Some(PeerId(1)), secondary: None },

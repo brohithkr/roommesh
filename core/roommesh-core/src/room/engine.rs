@@ -84,6 +84,21 @@ struct PendingInvite {
     from: PeerId,
 }
 
+/// The room a control message belongs to (None for room-independent messages).
+fn message_room(msg: &ControlMessage) -> Option<RoomId> {
+    match msg {
+        ControlMessage::Invite { manifest, .. } => Some(manifest.room_id),
+        ControlMessage::Manifest(m) => Some(m.room_id),
+        ControlMessage::InviteResponse { room_id, .. }
+        | ControlMessage::JoinRequest { room_id, .. }
+        | ControlMessage::Request { room_id, .. }
+        | ControlMessage::Leave { room_id }
+        | ControlMessage::Heartbeat { room_id, .. }
+        | ControlMessage::ActiveMic { room_id, .. } => Some(*room_id),
+        ControlMessage::PeerReport(_) => None,
+    }
+}
+
 pub struct RoomEngine {
     cfg: RoomConfig,
     now: u64,
@@ -102,6 +117,10 @@ pub struct RoomEngine {
     last_heartbeat: u64,
     active: (Option<PeerId>, Option<PeerId>),
     last_roles: Option<LocalRoles>,
+    /// Members reported online by the last `RoomChanged`.
+    last_online: Vec<PeerId>,
+    /// Peers a `Connect` was emitted for since the last `take_outputs` (dedupe).
+    connects: HashSet<PeerId>,
     out: Vec<Output>,
 }
 
@@ -124,6 +143,8 @@ impl RoomEngine {
             last_heartbeat: 0,
             active: (None, None),
             last_roles: None,
+            last_online: vec![],
+            connects: HashSet::new(),
             out: vec![],
         }
     }
@@ -136,6 +157,7 @@ impl RoomEngine {
         self.manifest.as_ref()
     }
     pub fn take_outputs(&mut self) -> Vec<Output> {
+        self.connects.clear();
         std::mem::take(&mut self.out)
     }
     pub fn set_auto_elect(&mut self, v: bool) {
@@ -144,8 +166,13 @@ impl RoomEngine {
     pub fn set_fallback_speaker(&mut self, v: bool) {
         self.cfg.fallback_speaker_to_coordinator = v;
     }
+    /// Updates the local member info; when in a room and the name or capabilities differ from
+    /// the manifest, the change is propagated through the coordinator (`mic_enabled` stays as
+    /// the room has it).
     pub fn set_local_info(&mut self, info: MemberInfo) {
         self.cfg.local = info;
+        let now = self.now;
+        self.sync_local_info(now, true);
     }
     pub fn is_coordinator(&self) -> bool {
         self.manifest
@@ -159,6 +186,11 @@ impl RoomEngine {
                 .last_seen
                 .get(&p)
                 .is_some_and(|t| now.saturating_sub(*t) <= self.cfg.peer_timeout_ms)
+    }
+
+    /// Online as shown to the user: a live session and recent traffic (local always online).
+    fn is_online(&self, now: u64, p: PeerId) -> bool {
+        p == self.local() || (self.sessions.contains(&p) && self.is_alive(now, p))
     }
 
     /// Member `p`'s latest `sees_coordinator` report, if it's recent enough to go by.
@@ -223,13 +255,23 @@ impl RoomEngine {
                     id: x.id,
                     name: x.name.clone(),
                     is_local: x.id == local,
-                    online: self.is_alive(self.now, x.id),
+                    online: self.is_online(self.now, x.id),
                     mic_enabled: x.mic_enabled,
                     is_coordinator: x.id == m.coordinator,
                     is_speaker: m.speaker == Some(x.id),
                     is_active_mic: self.active.0 == Some(x.id) || self.active.1 == Some(x.id),
                 })
                 .collect(),
+        })
+    }
+
+    fn online_members(&self, now: u64) -> Vec<PeerId> {
+        self.manifest.as_ref().map_or(vec![], |m| {
+            m.members
+                .iter()
+                .map(|x| x.id)
+                .filter(|&id| self.is_online(now, id))
+                .collect()
         })
     }
 
@@ -256,6 +298,7 @@ impl RoomEngine {
     }
     fn emit_room(&mut self) {
         let s = self.snapshot();
+        self.last_online = self.online_members(self.now);
         self.event(RoomEvent::RoomChanged(s));
     }
     fn emit_nearby(&mut self) {
@@ -269,6 +312,13 @@ impl RoomEngine {
             self.out.push(Output::Roles(r));
         }
     }
+    /// At most one `Connect` per peer per drain of the outputs.
+    fn connect(&mut self, p: PeerId) {
+        if p != self.local() && self.connects.insert(p) {
+            self.out.push(Output::Connect(p));
+        }
+    }
+    /// Sends now, or queues until the session comes up (and asks for a connection).
     fn send(&mut self, to: PeerId, msg: ControlMessage) {
         if to == self.local() {
             return;
@@ -281,7 +331,13 @@ impl RoomEngine {
                 q.remove(0);
             } // unreachable peers must not grow memory
             q.push(msg);
-            self.out.push(Output::Connect(to));
+            self.connect(to);
+        }
+    }
+    /// Sends only over an established session; for realtime-ish messages that are useless late.
+    fn send_if_connected(&mut self, to: PeerId, msg: ControlMessage) {
+        if to != self.local() && self.sessions.contains(&to) {
+            self.out.push(Output::Send { to, msg });
         }
     }
     fn broadcast_to(&mut self, members: &[PeerId], msg: ControlMessage) {
@@ -309,6 +365,12 @@ impl RoomEngine {
     fn send_to_coordinator(&mut self, now: u64, m: &RoomManifest, msg: ControlMessage) {
         let to = self.coordinator_route(now, m).unwrap_or(m.coordinator);
         self.send(to, msg);
+    }
+    fn drop_queued_for_room(&mut self, room_id: RoomId) {
+        for q in self.queued.values_mut() {
+            q.retain(|msg| message_room(msg) != Some(room_id));
+        }
+        self.queued.retain(|_, q| !q.is_empty());
     }
     /// A peer that thinks we're in `room_id` (we're not, and aren't joining it) is told we left.
     fn reply_not_in_room(&mut self, from: PeerId, room_id: RoomId) {
@@ -449,6 +511,7 @@ impl RoomEngine {
             ChangeRequest::SetCoordinator(p) | ChangeRequest::RemoveMember(p) => Some(*p),
             ChangeRequest::SetSpeaker(p) => *p,
             ChangeRequest::SetMicEnabled { peer, .. } => Some(*peer),
+            ChangeRequest::UpdateMember(info) => Some(info.id),
             ChangeRequest::Rename(_) => None,
         };
         if target.is_some_and(|p| !m.is_member(p)) {
@@ -472,6 +535,45 @@ impl RoomEngine {
             }
         }
         Ok(())
+    }
+
+    /// Pushes our name/capabilities into the manifest if they differ from it. `queue` = may
+    /// queue the request when no session is up (periodic retries only send over live sessions).
+    fn sync_local_info(&mut self, now: u64, queue: bool) {
+        let Some(m) = self.manifest.clone() else {
+            return;
+        };
+        let info = self.cfg.local.clone();
+        let Some(me) = m.member(info.id) else {
+            return;
+        };
+        if me.name == info.name && me.capabilities == info.capabilities {
+            return;
+        }
+        if m.coordinator == info.id {
+            self.apply_change(now, ChangeRequest::UpdateMember(info));
+            return;
+        }
+        let msg = ControlMessage::Request {
+            room_id: m.room_id,
+            epoch: m.epoch,
+            change: ChangeRequest::UpdateMember(info),
+        };
+        if queue {
+            self.send_to_coordinator(now, &m, msg);
+        } else if let Some(to) = self.coordinator_route(now, &m) {
+            self.send_if_connected(to, msg);
+        }
+    }
+
+    /// Coordinator only: removes a member; a removed speaker falls back to the coordinator
+    /// when that setting is on.
+    fn drop_member(&self, m: &mut RoomManifest, p: PeerId) {
+        let was_speaker = m.speaker == Some(p);
+        m.remove_member(p);
+        if was_speaker && self.cfg.fallback_speaker_to_coordinator {
+            m.speaker = Some(m.coordinator);
+        }
     }
 
     /// Coordinator only.
@@ -507,12 +609,22 @@ impl RoomEngine {
                 if !m.is_member(p) || p == m.coordinator {
                     return;
                 }
-                m.remove_member(p);
+                self.drop_member(&mut m, p);
                 m.revision += 1;
                 removed = Some(p);
             }
             ChangeRequest::Rename(n) => {
                 m.name = n;
+                m.revision += 1;
+            }
+            ChangeRequest::UpdateMember(info) => {
+                match m.member_mut(info.id) {
+                    Some(x) if x.name != info.name || x.capabilities != info.capabilities => {
+                        x.name = info.name;
+                        x.capabilities = info.capabilities;
+                    }
+                    _ => return,
+                }
                 m.revision += 1;
             }
         }
@@ -546,6 +658,7 @@ impl RoomEngine {
         let Some(m) = self.manifest.clone() else {
             return;
         };
+        self.drop_queued_for_room(m.room_id);
         let local = self.local();
         if m.coordinator == local {
             let mut next = m.clone();
@@ -583,7 +696,13 @@ impl RoomEngine {
     fn install(&mut self, now: u64, new: RoomManifest) {
         let local = self.local();
         let old = self.manifest.take();
+        if let Some(o) = old.as_ref().filter(|o| o.room_id != new.room_id) {
+            let rid = o.room_id;
+            self.drop_queued_for_room(rid);
+        }
+        let old = old.filter(|o| o.room_id == new.room_id);
         if !new.is_member(local) {
+            self.drop_queued_for_room(new.room_id);
             self.reset_room_flags();
             self.event(RoomEvent::LeftRoom);
             self.emit_room();
@@ -628,6 +747,11 @@ impl RoomEngine {
                 }
                 if o.speaker != new.speaker {
                     self.event(RoomEvent::SpeakerChanged { peer: new.speaker });
+                    // The speaker left or was removed (not an explicit "no speaker" choice).
+                    if new.speaker.is_none() && o.speaker.is_some_and(|s| !new.is_member(s)) {
+                        let candidates = speaker_candidates(&new, |p| self.is_alive(now, p));
+                        self.event(RoomEvent::SpeakerLost { candidates });
+                    }
                 }
             }
         }
@@ -643,11 +767,15 @@ impl RoomEngine {
             self.speaker_lost_prompted = false;
         }
         for id in new.member_ids() {
-            if id != local {
-                self.last_seen.entry(id).or_insert(now);
-                if !self.sessions.contains(&id) {
-                    self.out.push(Output::Connect(id));
-                }
+            if id == local {
+                continue;
+            }
+            // Newly (re)added members get a fresh liveness grace period.
+            if !old.as_ref().is_some_and(|o| o.is_member(id)) {
+                self.last_seen.insert(id, now);
+            }
+            if !self.sessions.contains(&id) {
+                self.connect(id);
             }
         }
         self.manifest = Some(new);
@@ -750,7 +878,7 @@ impl RoomEngine {
                 self.coord_reports.remove(&from);
                 if cur.coordinator == local && cur.is_member(from) {
                     let mut next = cur;
-                    next.remove_member(from);
+                    self.drop_member(&mut next, from);
                     next.revision += 1;
                     self.publish(now, next);
                 }
@@ -877,24 +1005,24 @@ impl RoomEngine {
         self.active = (primary, secondary);
         self.event(RoomEvent::ActiveMicChanged { primary, secondary });
         self.emit_room();
-        let ids = m.member_ids();
-        self.broadcast_to(
-            &ids,
-            ControlMessage::ActiveMic {
-                room_id: m.room_id,
-                epoch: m.epoch,
-                primary,
-                secondary,
-            },
-        );
+        let msg = ControlMessage::ActiveMic {
+            room_id: m.room_id,
+            epoch: m.epoch,
+            primary,
+            secondary,
+        };
+        for id in m.member_ids() {
+            self.send_if_connected(id, msg.clone()); // stale by the time a session comes up
+        }
     }
 
     // ---------- timers ----------
     pub fn tick(&mut self, now: u64) {
         self.now = now;
-        if let Some((_, since)) = self.joining {
+        if let Some((rid, since)) = self.joining {
             if now.saturating_sub(since) > self.cfg.join_timeout_ms {
                 self.joining = None;
+                self.drop_queued_for_room(rid);
                 self.event(RoomEvent::Error {
                     message: "Could not join the room: the coordinator did not answer.".into(),
                 });
@@ -930,9 +1058,14 @@ impl RoomEngine {
                     }
                     self.out.push(Output::Send { to: id, msg });
                 } else {
-                    self.out.push(Output::Connect(id));
+                    self.connect(id);
                 }
             }
+            self.sync_local_info(now, false);
+        }
+
+        if self.online_members(now) != self.last_online {
+            self.emit_room();
         }
 
         if self.coordinator_lost(now, &m) {
@@ -970,21 +1103,19 @@ impl RoomEngine {
             self.coordinator_lost_prompted = false;
         }
 
-        let speaker_lost = match m.speaker {
-            Some(s) => !self.is_alive(now, s),
-            None => true,
-        };
-        if speaker_lost {
-            if m.coordinator == local
-                && self.cfg.fallback_speaker_to_coordinator
-                && m.speaker != Some(local)
-            {
-                self.apply_change(now, ChangeRequest::SetSpeaker(Some(local)));
-            } else if !self.speaker_lost_prompted {
-                self.speaker_lost_prompted = true;
-                let candidates = speaker_candidates(&m, |p| self.is_alive(now, p));
-                self.event(RoomEvent::SpeakerLost { candidates });
+        // Only a speaker that was chosen and went silent is "lost"; an explicit "no speaker"
+        // (None) is left alone.
+        match m.speaker {
+            Some(s) if !self.is_alive(now, s) => {
+                if m.coordinator == local && self.cfg.fallback_speaker_to_coordinator {
+                    self.apply_change(now, ChangeRequest::SetSpeaker(Some(local)));
+                } else if !self.speaker_lost_prompted {
+                    self.speaker_lost_prompted = true;
+                    let candidates = speaker_candidates(&m, |p| self.is_alive(now, p));
+                    self.event(RoomEvent::SpeakerLost { candidates });
+                }
             }
+            _ => self.speaker_lost_prompted = false,
         }
     }
 }
@@ -1593,5 +1724,230 @@ mod tests {
         n.advance(8_000);
         let m = n.converged(&[2, 3]);
         assert_eq!((m.coordinator, m.epoch), (PeerId(2), Epoch(2)));
+    }
+
+    #[test]
+    fn speaker_lost_prompts_again_after_speaker_recovers() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(1, Command::SetSpeaker(Some(PeerId(3))));
+        n.kill(3);
+        n.advance(6_000);
+        n.down.remove(&PeerId(3));
+        n.advance(3_000);
+        n.kill(3);
+        n.advance(6_000);
+        let prompts = n.events[&PeerId(1)]
+            .iter()
+            .filter(|e| matches!(e, RoomEvent::SpeakerLost { .. }))
+            .count();
+        assert_eq!(prompts, 2);
+    }
+
+    #[test]
+    fn room_snapshot_marks_silent_member_offline() {
+        let mut n = room(&[1, 2, 3]);
+        // Session stays up but nothing arrives from 3 any more.
+        n.cut.insert(k(PeerId(1), PeerId(3)));
+        n.advance(8_000);
+        let last = n.events[&PeerId(1)]
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                RoomEvent::RoomChanged(Some(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let online = |id| {
+            last.members
+                .iter()
+                .find(|m| m.id == PeerId(id))
+                .unwrap()
+                .online
+        };
+        assert!(!online(3));
+        assert!(online(1) && online(2));
+        n.cut.clear();
+        n.advance(2_000);
+        let snap = n.engines[&PeerId(1)].snapshot().unwrap();
+        assert!(snap.members.iter().all(|m| m.online));
+        assert!(n.events[&PeerId(1)].iter().rev().any(|e| matches!(e,
+            RoomEvent::RoomChanged(Some(s)) if s.members.iter().all(|m| m.online))));
+    }
+
+    #[test]
+    fn set_local_info_propagates_through_coordinator() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(
+            1,
+            Command::SetMicEnabled {
+                peer: PeerId(3),
+                enabled: false,
+            },
+        );
+        n.engines
+            .get_mut(&PeerId(3))
+            .unwrap()
+            .set_local_info(MemberInfo {
+                id: PeerId(3),
+                name: "Board Room".into(),
+                mic_enabled: true,
+                capabilities: Capabilities {
+                    driver_installed: false,
+                    ..Capabilities::full()
+                },
+            });
+        n.pump();
+        let m = n.converged(&[1, 2, 3]);
+        let me = m.member(PeerId(3)).unwrap();
+        assert_eq!(me.name, "Board Room");
+        assert!(!me.capabilities.driver_installed);
+        assert!(!me.mic_enabled, "mic setting stays as the room has it");
+        // The coordinator applies its own change directly.
+        n.engines
+            .get_mut(&PeerId(1))
+            .unwrap()
+            .set_local_info(MemberInfo {
+                id: PeerId(1),
+                name: "Host".into(),
+                mic_enabled: true,
+                capabilities: Capabilities::full(),
+            });
+        n.pump();
+        assert_eq!(
+            n.converged(&[1, 2, 3]).member(PeerId(1)).unwrap().name,
+            "Host"
+        );
+        // Unchanged info publishes nothing.
+        let v = n.converged(&[1, 2, 3]).version();
+        let info = n.manifest(2).unwrap().member(PeerId(2)).unwrap().clone();
+        n.engines.get_mut(&PeerId(2)).unwrap().set_local_info(info);
+        n.advance(2_000);
+        assert_eq!(n.converged(&[1, 2, 3]).version(), v);
+    }
+
+    #[test]
+    fn set_local_info_while_coordinator_unreachable_is_retried() {
+        let mut n = room(&[1, 2]);
+        n.cut.insert(k(PeerId(1), PeerId(2))); // request is lost
+        n.engines
+            .get_mut(&PeerId(2))
+            .unwrap()
+            .set_local_info(MemberInfo {
+                id: PeerId(2),
+                name: "Renamed".into(),
+                mic_enabled: true,
+                capabilities: Capabilities::full(),
+            });
+        n.pump();
+        n.cut.clear();
+        n.advance(2_000);
+        assert_eq!(
+            n.converged(&[1, 2]).member(PeerId(2)).unwrap().name,
+            "Renamed"
+        );
+    }
+
+    #[test]
+    fn active_mic_is_not_queued_for_unconnected_members() {
+        let mut n = room(&[1, 2, 3]);
+        n.drop_link(PeerId(1), PeerId(3));
+        let now = n.now;
+        let e1 = n.engines.get_mut(&PeerId(1)).unwrap();
+        e1.take_outputs();
+        e1.on_local_selection(now, Some(PeerId(2)), None);
+        let outs = e1.take_outputs();
+        assert!(outs.iter().any(|o| matches!(o,
+            Output::Send { to, msg: ControlMessage::ActiveMic { .. } } if *to == PeerId(2))));
+        assert!(!outs.iter().any(|o| matches!(o,
+            Output::Send { to, .. } | Output::Connect(to) if *to == PeerId(3))));
+        assert!(e1.queued.is_empty());
+    }
+
+    #[test]
+    fn leaving_drops_queued_messages_for_the_room() {
+        let mut n = room(&[1, 2, 3]);
+        n.cut.insert(k(PeerId(2), PeerId(3)));
+        n.drop_link(PeerId(2), PeerId(3));
+        let now = n.now;
+        let e2 = n.engines.get_mut(&PeerId(2)).unwrap();
+        e2.command(now, Command::Invite(PeerId(9))).unwrap(); // queued for an unknown peer
+        assert!(!e2.queued.is_empty());
+        e2.command(now, Command::Leave).unwrap();
+        // Only the Leave notice for the unreachable member remains queued.
+        let left: Vec<_> = e2.queued.values().flatten().collect();
+        assert_eq!(left.len(), 1);
+        assert!(matches!(left[0], ControlMessage::Leave { .. }));
+    }
+
+    #[test]
+    fn join_timeout_drops_queued_join_request() {
+        let mut n = Net::new(&[1, 2]);
+        n.cmd(1, Command::CreateRoom { name: "R".into() });
+        n.cmd(1, Command::Invite(PeerId(2)));
+        let room_id = n.invite_for(2);
+        n.kill(1);
+        n.cmd(
+            2,
+            Command::RespondToInvite {
+                room_id,
+                accept: true,
+            },
+        );
+        assert!(!n.engines[&PeerId(2)].queued.is_empty());
+        n.advance(11_000);
+        assert!(n.has_event(2, |e| matches!(e, RoomEvent::Error { .. })));
+        assert!(n.engines[&PeerId(2)].queued.is_empty());
+    }
+
+    #[test]
+    fn explicit_no_speaker_neither_prompts_nor_falls_back() {
+        let mut n = room(&[1, 2, 3]);
+        for e in n.engines.values_mut() {
+            e.set_fallback_speaker(true);
+        }
+        n.cmd(2, Command::SetSpeaker(None));
+        n.advance(6_000);
+        assert_eq!(n.converged(&[1, 2, 3]).speaker, None);
+        for i in 1..=3 {
+            assert!(!n.has_event(i, |e| matches!(e, RoomEvent::SpeakerLost { .. })));
+        }
+    }
+
+    #[test]
+    fn removing_the_speaker_prompts_or_falls_back() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(1, Command::SetSpeaker(Some(PeerId(3))));
+        n.cmd(1, Command::RemoveMember(PeerId(3)));
+        assert_eq!(n.converged(&[1, 2]).speaker, None);
+        assert!(n.has_event(2, |e| matches!(e, RoomEvent::SpeakerLost { .. })));
+
+        let mut n = room(&[1, 2, 3]);
+        n.engines
+            .get_mut(&PeerId(1))
+            .unwrap()
+            .set_fallback_speaker(true);
+        n.cmd(1, Command::SetSpeaker(Some(PeerId(3))));
+        n.cmd(3, Command::Leave);
+        assert_eq!(n.converged(&[1, 2]).speaker, Some(PeerId(1)));
+    }
+
+    #[test]
+    fn connect_is_emitted_once_per_peer_per_drain() {
+        let mut n = room(&[1, 2, 3]);
+        n.drop_link(PeerId(1), PeerId(3));
+        n.cut.insert(k(PeerId(1), PeerId(3)));
+        let now = n.now;
+        let e1 = n.engines.get_mut(&PeerId(1)).unwrap();
+        e1.take_outputs();
+        e1.command(now, Command::Rename("A".into())).unwrap();
+        e1.command(now, Command::SetSpeaker(Some(PeerId(2))))
+            .unwrap();
+        e1.tick(now + 1_000);
+        let connects = e1
+            .take_outputs()
+            .into_iter()
+            .filter(|o| matches!(o, Output::Connect(p) if *p == PeerId(3)))
+            .count();
+        assert_eq!(connects, 1);
     }
 }
