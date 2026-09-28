@@ -69,6 +69,10 @@ pub enum RoomError {
     NoSuchInvite,
     #[error("peer is not a room member")]
     NotMember,
+    /// The core's control thread did not take the command in time (busy, or called
+    /// re-entrantly from an event callback). The command was not applied.
+    #[error("timed out")]
+    Timeout,
 }
 
 #[derive(Clone, Debug, PartialEq)]

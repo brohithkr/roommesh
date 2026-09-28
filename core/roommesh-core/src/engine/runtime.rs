@@ -291,6 +291,7 @@ impl AudioRuntime {
         let (ctl_tx, ctl_rx) = unbounded::<RuntimeMsg>();
         let (pkt_tx, pkt_rx) = bounded::<RuntimeMsg>(PACKET_QUEUE);
         let shared = Arc::new(RuntimeShared::default());
+        let panic_events = events.clone();
         let dsp = Dsp::new(
             local,
             backend,
@@ -304,7 +305,13 @@ impl AudioRuntime {
             .name("roommesh-dsp".into())
             .spawn(move || {
                 raise_thread_qos();
-                dsp.run(ctl_rx, pkt_rx)
+                let run = std::panic::AssertUnwindSafe(move || dsp.run(ctl_rx, pkt_rx));
+                if std::panic::catch_unwind(run).is_err() {
+                    log::error!("roommesh-dsp panicked; audio has stopped");
+                    let _ = panic_events.send(RuntimeEvent::Error(
+                        "RoomMesh audio stopped working (internal error). Restart the app.".into(),
+                    ));
+                }
             })
             .expect("spawn dsp");
         Self {
@@ -1794,5 +1801,34 @@ mod tests {
         // A role change (new coordinator/epoch) forgets them all.
         d.handle(RuntimeMsg::Roles(roles(3, 3, 2)));
         assert!(d.outstanding_pings.is_empty());
+    }
+
+    struct PanickingVdev;
+    impl AudioBackend for PanickingVdev {
+        fn start_capture(&mut self, _: &DeviceSelector) -> Result<CaptureHandle, DeviceError> {
+            Err(DeviceError::NotFound)
+        }
+        fn stop_capture(&mut self) {}
+        fn start_playback(&mut self, _: &DeviceSelector) -> Result<PlaybackHandle, DeviceError> {
+            Err(DeviceError::NotFound)
+        }
+        fn stop_playback(&mut self) {}
+        fn open_virtual_device(&mut self) -> Result<Arc<SharedRegion>, VirtualDeviceError> {
+            panic!("injected DSP panic");
+        }
+    }
+
+    #[test]
+    fn dsp_thread_death_is_reported() {
+        let (rt, ev) = spawn_with(1, Box::new(PanickingVdev), no_aec());
+        let msg = ev
+            .iter()
+            .find_map(|e| match e {
+                RuntimeEvent::Error(m) => Some(m),
+                _ => None,
+            })
+            .expect("an error event");
+        assert!(msg.contains("audio stopped working"), "{msg}");
+        rt.shutdown(); // joins the dead thread without hanging
     }
 }

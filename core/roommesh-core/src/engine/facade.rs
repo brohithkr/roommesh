@@ -36,7 +36,7 @@ use crate::room::events::*;
 use crate::room::protocol::ControlMessage;
 use crate::room::state::{Capabilities, MemberInfo, PROTOCOL_VERSION};
 use crate::time::now_ns;
-use crossbeam_channel::{bounded, never, select, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, never, select, unbounded, Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -52,9 +52,19 @@ const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// Minimum spacing between two `connect` calls to the same peer.
 const CONNECT_INTERVAL_MS: u64 = 2_000;
 /// How long `Core::command` waits for the control thread's answer.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const COMMAND_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(3)
+};
 
-/// Receives every [`RoomEvent`], on the control thread. Must not block for long.
+/// Receives every [`RoomEvent`], on the control thread.
+///
+/// Contract: `on_event` must not block (hand the event to another queue/thread and return) and
+/// must not call back into the [`Core`] synchronously. In particular a synchronous
+/// [`Core::command`] from inside `on_event` is rejected at once with [`RoomError::Timeout`]:
+/// the control thread that would run it is the one delivering the event. Query methods
+/// (`room_snapshot`, `roles`, `metrics`, ...) only read caches and are fine.
 pub trait EventSink: Send + Sync {
     fn on_event(&self, event: RoomEvent);
 }
@@ -83,7 +93,10 @@ impl CoreConfig {
 
 enum CoreMsg {
     Transport(TransportEvent),
-    Command(Command, Sender<Result<(), RoomError>>),
+    /// A room command and where to answer it. The flag is claimed (set) by whichever side gets
+    /// there first: the control thread, which then runs it, or a timed-out caller, which
+    /// abandons it — so a command reported as timed out is never applied.
+    Command(Command, Sender<Result<(), RoomError>>, Arc<AtomicBool>),
     Policies {
         auto_elect: bool,
         fallback_speaker: bool,
@@ -106,10 +119,15 @@ struct Cache {
     is_coordinator: AtomicBool,
 }
 
+/// The RoomMesh core. The [`PeerTransport`] and [`EventSink`] given to [`Core::new`] must honour
+/// their non-blocking, non-re-entrant contracts (see their docs). Dropping the Core stops the
+/// control thread and joins the DSP thread.
 pub struct Core {
     local: PeerId,
     name: Mutex<String>,
     tx: Sender<CoreMsg>,
+    /// The control thread (re-entrant `command` calls from it fail fast).
+    control_thread: std::thread::ThreadId,
     transport: Arc<dyn PeerTransport>,
     sessions: RtSessions,
     runtime: AudioRuntime,
@@ -213,14 +231,27 @@ impl Core {
             last_quality_ms: 0,
             local: cfg.local_id,
         };
-        std::thread::Builder::new()
+        let control_thread = std::thread::Builder::new()
             .name("roommesh-control".into())
-            .spawn(move || ctl.run(rx, rt_ev_rx))
-            .expect("spawn control");
+            .spawn(move || {
+                let sink = ctl.sink.clone();
+                let run = std::panic::AssertUnwindSafe(move || ctl.run(rx, rt_ev_rx));
+                if std::panic::catch_unwind(run).is_err() {
+                    log::error!("roommesh-control panicked; room control has stopped");
+                    sink.on_event(RoomEvent::Error {
+                        message: "RoomMesh stopped working (internal error). Restart the app."
+                            .into(),
+                    });
+                }
+            })
+            .expect("spawn control")
+            .thread()
+            .id();
         Self {
             local: cfg.local_id,
             name: Mutex::new(cfg.name),
             tx,
+            control_thread,
             transport,
             sessions,
             runtime,
@@ -238,9 +269,11 @@ impl Core {
 
     /// Starts advertising and browsing.
     pub fn start(&self) {
+        // Never hold the name lock across the foreign call (it may call `set_local_info`).
+        let name = self.name.lock().clone();
         self.transport.start(LocalAdvertisement {
             peer_id: self.local,
-            name: self.name.lock().clone(),
+            name,
             protocol_version: PROTOCOL_VERSION,
         });
     }
@@ -331,13 +364,40 @@ impl Core {
     }
 
     /// Runs a room command on the control thread and waits (up to 3 s) for its result.
+    ///
+    /// On `Ok`, the caches behind [`room_snapshot`](Self::room_snapshot), [`nearby`](Self::nearby)
+    /// and [`roles`](Self::roles) already reflect the command (its events are delivered to the
+    /// sink right after). [`RoomError::Timeout`] means the command was not applied: the control
+    /// thread was busy for 3 s, or this was called from the control thread itself (i.e. from
+    /// inside [`EventSink::on_event`]), which fails immediately.
     pub fn command(&self, c: Command) -> Result<(), RoomError> {
-        let (tx, rx) = bounded(1);
-        if self.tx.send(CoreMsg::Command(c, tx)).is_err() {
-            return Err(RoomError::NotInRoom);
+        if std::thread::current().id() == self.control_thread {
+            log::error!("Core::command called re-entrantly from an event callback; rejected");
+            return Err(RoomError::Timeout);
         }
-        rx.recv_timeout(COMMAND_TIMEOUT)
-            .unwrap_or(Err(RoomError::NotInRoom))
+        let (tx, rx) = bounded(1);
+        let claim = Arc::new(AtomicBool::new(false));
+        if self
+            .tx
+            .send(CoreMsg::Command(c, tx, claim.clone()))
+            .is_err()
+        {
+            return Err(RoomError::NotInRoom); // control thread gone
+        }
+        match rx.recv_timeout(COMMAND_TIMEOUT) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                if !claim.swap(true, Ordering::SeqCst) {
+                    return Err(RoomError::Timeout); // abandoned: the control thread skips it
+                }
+                // The control thread took it just now; its answer is imminent.
+                rx.recv_timeout(COMMAND_TIMEOUT).unwrap_or_else(|_| {
+                    log::error!("room command started but its result never arrived");
+                    Err(RoomError::Timeout)
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(RoomError::NotInRoom),
+        }
     }
 
     pub fn room_snapshot(&self) -> Option<RoomSnapshot> {
@@ -464,8 +524,15 @@ impl ControlLoop {
         let now = now_ms();
         match m {
             CoreMsg::Transport(ev) => self.transport_event(now, ev),
-            CoreMsg::Command(c, reply) => {
-                let _ = reply.send(self.engine.command(now, c));
+            CoreMsg::Command(c, reply, claim) => {
+                if claim.swap(true, Ordering::SeqCst) {
+                    return; // the caller timed out and gave up on it
+                }
+                let result = self.engine.command(now, c);
+                // Caches first, so the caller sees them fresh on Ok; then the events.
+                let events = self.execute(now);
+                let _ = reply.send(result);
+                self.deliver(events);
             }
             CoreMsg::Policies {
                 auto_elect,
@@ -596,6 +663,20 @@ impl ControlLoop {
     }
 
     fn flush(&mut self, now: u64) {
+        let events = self.execute(now);
+        self.deliver(events);
+    }
+
+    fn deliver(&self, events: Vec<RoomEvent>) {
+        for e in events {
+            self.sink.on_event(e);
+        }
+    }
+
+    /// Executes the engine's pending outputs: sends, connects, cache and runtime updates.
+    /// Returns the events for the sink (delivered by the caller, after any command reply).
+    fn execute(&mut self, now: u64) -> Vec<RoomEvent> {
+        let mut events = Vec::new();
         for o in self.engine.take_outputs() {
             match o {
                 Output::Send { to, msg } => {
@@ -632,7 +713,7 @@ impl ControlLoop {
                         RoomEvent::NearbyChanged(n) => *self.cache.nearby.lock() = n.clone(),
                         _ => {}
                     }
-                    self.sink.on_event(e);
+                    events.push(e);
                 }
                 Output::Roles(r) => {
                     {
@@ -655,6 +736,7 @@ impl ControlLoop {
                 }
             }
         }
+        events
     }
 }
 
@@ -694,26 +776,39 @@ mod tests {
         events: Arc<Collector>,
     }
     impl Drop for Node {
-        /// Cores outlive the test (the pump thread holds them): quiesce their audio.
+        /// Quiesce audio before the Core drops.
         fn drop(&mut self) {
             self.core.stop_audio();
             self.core.stop();
         }
     }
 
-    fn node(net: &Arc<LoopbackNetwork>, id: u64, backend: Box<dyn AudioBackend>) -> Node {
+    /// A started Core on the loopback network. Its transport pump holds it weakly, so the Core
+    /// drops (joining its threads) with the last strong reference.
+    fn spawn_core(
+        net: &Arc<LoopbackNetwork>,
+        id: u64,
+        backend: Box<dyn AudioBackend>,
+        sink: Arc<dyn EventSink>,
+    ) -> Arc<Core> {
         let (tx, rx) = unbounded();
         let transport = net.transport(PeerId(id), tx);
-        let events = Arc::new(Collector::default());
         let cfg = CoreConfig::new(PeerId(id), format!("Mac {id}"));
-        let core = Arc::new(Core::new(cfg, transport, events.clone(), backend));
-        let c2 = core.clone();
+        let core = Arc::new(Core::new(cfg, transport, sink, backend));
+        let weak = Arc::downgrade(&core);
         std::thread::spawn(move || {
             for ev in rx {
-                c2.handle_transport_event(ev);
+                let Some(c) = weak.upgrade() else { break };
+                c.handle_transport_event(ev);
             }
         });
         core.start();
+        core
+    }
+
+    fn node(net: &Arc<LoopbackNetwork>, id: u64, backend: Box<dyn AudioBackend>) -> Node {
+        let events = Arc::new(Collector::default());
+        let core = spawn_core(net, id, backend, events.clone());
         Node { core, events }
     }
 
@@ -736,6 +831,127 @@ mod tests {
                 accept: true,
             })
             .unwrap();
+    }
+
+    /// Sink that can block the control thread or call back into the Core from `on_event`.
+    #[derive(Default)]
+    struct HookSink {
+        core: std::sync::OnceLock<std::sync::Weak<Core>>,
+        /// Next RoomChanged blocks the control thread this long.
+        block_ms: std::sync::atomic::AtomicU64,
+        /// Next event runs a command re-entrantly; its result and duration land here.
+        reenter: AtomicBool,
+        reentrant: Mutex<Option<(Result<(), RoomError>, Duration)>>,
+    }
+    impl EventSink for HookSink {
+        fn on_event(&self, e: RoomEvent) {
+            if matches!(e, RoomEvent::RoomChanged(_)) {
+                let ms = self.block_ms.swap(0, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            if self.reenter.swap(false, Ordering::SeqCst) {
+                if let Some(c) = self.core.get().and_then(|w| w.upgrade()) {
+                    let t = Instant::now();
+                    let r = c.command(Command::Rename("re-entrant".into()));
+                    *self.reentrant.lock() = Some((r, t.elapsed()));
+                }
+            }
+        }
+    }
+    fn hooked(net: &Arc<LoopbackNetwork>, id: u64) -> (Arc<Core>, Arc<HookSink>) {
+        let sink = Arc::new(HookSink::default());
+        let core = spawn_core(net, id, Box::new(NullAudio), sink.clone());
+        let _ = sink.core.set(Arc::downgrade(&core));
+        (core, sink)
+    }
+
+    #[test]
+    fn command_ok_means_caches_are_already_fresh() {
+        let net = LoopbackNetwork::new();
+        let (core, _sink) = hooked(&net, 1);
+        for i in 0..20 {
+            core.command(Command::CreateRoom {
+                name: format!("R{i}"),
+            })
+            .unwrap();
+            let snap = core.room_snapshot();
+            assert_eq!(snap.map(|s| s.name), Some(format!("R{i}")), "round {i}");
+            assert!(core.roles().is_coordinator, "round {i}");
+            core.command(Command::Leave).unwrap();
+            assert!(core.room_snapshot().is_none(), "round {i}");
+        }
+    }
+
+    #[test]
+    fn reentrant_command_from_the_sink_fails_fast() {
+        let net = LoopbackNetwork::new();
+        let (core, sink) = hooked(&net, 1);
+        sink.reenter.store(true, Ordering::SeqCst);
+        core.command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        wait("the sink ran", 3, || sink.reentrant.lock().is_some());
+        let (r, took) = sink.reentrant.lock().take().unwrap();
+        assert_eq!(r, Err(RoomError::Timeout));
+        assert!(took < Duration::from_millis(100), "took {took:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            core.room_snapshot().unwrap().name,
+            "R",
+            "must not be applied"
+        );
+    }
+
+    #[test]
+    fn timed_out_command_is_never_applied() {
+        let net = LoopbackNetwork::new();
+        let (core, sink) = hooked(&net, 1);
+        core.command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        // The next RoomChanged holds the control thread well past the command timeout.
+        sink.block_ms
+            .store(COMMAND_TIMEOUT.as_millis() as u64 * 3, Ordering::SeqCst);
+        core.command(Command::Rename("First".into())).unwrap();
+        let t = Instant::now();
+        assert_eq!(
+            core.command(Command::Rename("Second".into())),
+            Err(RoomError::Timeout)
+        );
+        assert!(t.elapsed() >= COMMAND_TIMEOUT);
+        wait("control thread free again", 5, || {
+            core.command(Command::Rename("First".into())).is_ok()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(core.room_snapshot().unwrap().name, "First");
+    }
+
+    /// Panics on the first RoomChanged; records every Error event.
+    #[derive(Default)]
+    struct PanicSink {
+        panicked: AtomicBool,
+        errors: Mutex<Vec<String>>,
+    }
+    impl EventSink for PanicSink {
+        fn on_event(&self, e: RoomEvent) {
+            match e {
+                RoomEvent::RoomChanged(_) if !self.panicked.swap(true, Ordering::SeqCst) => {
+                    panic!("injected control-thread panic")
+                }
+                RoomEvent::Error { message } => self.errors.lock().push(message),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn control_thread_death_is_reported() {
+        let net = LoopbackNetwork::new();
+        let sink = Arc::new(PanicSink::default());
+        let core = spawn_core(&net, 1, Box::new(NullAudio), sink.clone());
+        core.command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        wait("error event", 3, || !sink.errors.lock().is_empty());
+        assert!(sink.errors.lock()[0].contains("stopped working"));
+        assert!(core.command(Command::Leave).is_err());
     }
 
     #[test]

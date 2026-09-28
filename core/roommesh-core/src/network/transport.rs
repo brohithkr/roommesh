@@ -20,6 +20,12 @@ pub struct LocalAdvertisement {
 /// underlying connection is replaced (a reconnect, a network path switch that isn't seamless at
 /// the transport layer, ...), that must be reported as a `Disconnected(p)` followed by a fresh
 /// `Connected(p)` on *both* ends, never a silent substitution.
+///
+/// Threading contract: every method must be non-blocking (queue the work and return) and must
+/// not call back into the `Core` synchronously; incoming traffic is delivered later through
+/// `Core::handle_transport_event` from the transport's own thread/queue. `send_realtime` is
+/// called from the DSP thread and, for clock pongs, re-entrantly from inside
+/// `Core::on_realtime` on the delivering thread; `start`/`stop` run on the caller's thread.
 pub trait PeerTransport: Send + Sync {
     /// Advertise the local peer and browse for others (Bonjour `_roomaudio._tcp`/`_udp`).
     fn start(&self, advert: LocalAdvertisement);

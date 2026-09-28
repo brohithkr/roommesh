@@ -23,6 +23,10 @@ pub enum FfiError {
     NotMember,
     #[error("Invalid peer id")]
     InvalidPeerId,
+    /// The command was not applied (the core was busy, or it was called from inside an event
+    /// or transport callback). Safe to retry.
+    #[error("RoomMesh is busy — try again")]
+    Timeout,
 }
 
 impl From<RoomError> for FfiError {
@@ -32,6 +36,7 @@ impl From<RoomError> for FfiError {
             RoomError::NotInRoom => Self::NotInRoom,
             RoomError::NoSuchInvite => Self::NoSuchInvite,
             RoomError::NotMember => Self::NotMember,
+            RoomError::Timeout => Self::Timeout,
         }
     }
 }
@@ -521,6 +526,8 @@ mod tests {
         assert_eq!(a.coordinator.playout_delay_ns, 300_000_000);
         assert!(!a.coordinator.noise_suppression);
         assert!(matches!(FfiError::from(RoomError::NotMember), FfiError::NotMember));
+        assert!(matches!(FfiError::from(RoomError::Timeout), FfiError::Timeout));
+        assert_eq!(FfiError::Timeout.to_string(), "RoomMesh is busy — try again");
         assert!(parse_peer("00000000000000AB").is_err());
         assert_eq!(parse_peer("00000000000000ab").unwrap(), PeerId(0xab));
         let e = to_ffi_event(RoomEvent::CoordinatorLost { candidates: vec![PeerId(1), PeerId(2)] });
