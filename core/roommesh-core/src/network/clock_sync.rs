@@ -32,6 +32,10 @@ impl ClockEstimator {
     pub fn reset(&mut self) { self.samples.clear(); self.model = None; }
 
     pub fn add_sample(&mut self, s: ClockSample) {
+        // t4 < t1 (reply arrived before the request was sent) or t3 < t2 (coordinator replied
+        // before it received the request) is causally impossible; such a sample is corrupt
+        // (clock stepped backwards, malformed packet) and would poison the RTT/offset fit.
+        if s.t4 < s.t1 || s.t3 < s.t2 { return; }
         let (t1, t2, t3, t4) = (s.t1 as f64, s.t2 as f64, s.t3 as f64, s.t4 as f64);
         let rtt = ((t4 - t1) - (t3 - t2)).max(0.0);
         let offset = ((t2 - t1) + (t3 - t4)) / 2.0;
@@ -63,11 +67,16 @@ impl ClockEstimator {
 
     pub fn is_synced(&self) -> bool { self.samples.len() >= MIN_SAMPLES && self.model.is_some() }
 
+    /// Maps a local timestamp into the coordinator's clock domain. Returns `None` until a model
+    /// has been fit (see [`Self::is_synced`]); callers that need a value (rather than treating
+    /// `None` as "not yet synced, hold off") should check `is_synced()` first.
     pub fn to_coord(&self, local_ns: u64) -> Option<u64> {
         let m = self.model?;
         let l = local_ns as f64;
         Some((l + m.offset + m.drift * (l - m.reference)).max(0.0) as u64)
     }
+    /// Maps a coordinator timestamp into the local clock domain. See [`Self::to_coord`]; callers
+    /// should check [`Self::is_synced`] before relying on the result.
     pub fn to_local(&self, coord_ns: u64) -> Option<u64> {
         let m = self.model?;
         let c = coord_ns as f64;
@@ -118,6 +127,14 @@ mod tests {
         let mut est = ClockEstimator::new();
         assert!(est.to_coord(5).is_none());
         est.add_sample(ClockSample { t1: 0, t2: 10, t3: 11, t4: 20 });
+        assert!(!est.is_synced());
+    }
+    #[test]
+    fn ignores_causally_impossible_samples() {
+        let mut est = ClockEstimator::new();
+        est.add_sample(ClockSample { t1: 100, t2: 50, t3: 60, t4: 50 }); // t4 < t1
+        est.add_sample(ClockSample { t1: 0, t2: 50, t3: 40, t4: 100 }); // t3 < t2
+        assert!(est.min_rtt_ns().is_none());
         assert!(!est.is_synced());
     }
 }

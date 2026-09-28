@@ -28,12 +28,15 @@ pub enum SecureError {
     #[error("malformed frame")] Malformed,
     #[error("decryption failed")] Crypto,
     #[error("unsupported protocol version {0}")] Version(u16),
+    #[error("attempted to complete a handshake with ourselves")] SelfConnection,
     #[error(transparent)] Rt(#[from] RtError),
 }
 
 pub fn decode_hello(frame: &[u8]) -> Result<Hello, SecureError> {
     if frame.first() != Some(&FRAME_HELLO) { return Err(SecureError::Malformed); }
-    postcard::from_bytes(&frame[1..]).map_err(|_| SecureError::Malformed)
+    let (hello, rest) = postcard::take_from_bytes(&frame[1..]).map_err(|_| SecureError::Malformed)?;
+    if !rest.is_empty() { return Err(SecureError::Malformed); }
+    Ok(hello)
 }
 
 pub struct Handshake { local: PeerId, name: String, secret: StaticSecret, public: PublicKey }
@@ -57,6 +60,9 @@ impl Handshake {
     pub fn complete(&self, remote: &Hello) -> Result<Session, SecureError> {
         if remote.protocol_version != crate::room::state::PROTOCOL_VERSION {
             return Err(SecureError::Version(remote.protocol_version));
+        }
+        if remote.peer_id == self.local {
+            return Err(SecureError::SelfConnection);
         }
         let shared = self.secret.diffie_hellman(&PublicKey::from(remote.public_key));
         let local_is_low = self.local < remote.peer_id;
@@ -130,6 +136,9 @@ fn counter_nonce(c: u64) -> Nonce {
 fn rt_nonce(h: &RtHeader) -> Nonce {
     let mut n = [0u8; 12];
     n[0] = h.kind as u8;
+    // Low 3 bytes of the epoch (LE): without this, sequence numbers restart at epoch 0 on every
+    // coordinator handover would reuse (key, nonce) pairs from the previous epoch.
+    n[1..4].copy_from_slice(&h.epoch.0.to_le_bytes()[..3]);
     n[4..8].copy_from_slice(&h.stream.0.to_le_bytes());
     n[8..12].copy_from_slice(&h.sequence.to_le_bytes());
     *Nonce::from_slice(&n)
@@ -216,5 +225,62 @@ mod tests {
         let mut bad = p1.clone();
         bad[30] ^= 0xff; // header tamper (AAD)
         assert!(b.open_realtime(&bad).is_err());
+    }
+    #[test]
+    fn realtime_payload_tamper_detected() {
+        let (a, b) = pair();
+        let h = RtHeader { kind: PacketKind::Mic, epoch: Epoch(1), stream: StreamId::MIC, sender: PeerId(1),
+                           sequence: 1, sample_index: 0, timestamp_ns: 0, frame_count: 480 };
+        let p = a.seal_realtime(&h, b"hello world, this is voice data");
+        let mut bad = p.clone();
+        let last = bad.len() - 1; // last byte of the ciphertext/tag, not the header
+        bad[last] ^= 0xff;
+        assert!(b.open_realtime(&bad).is_err());
+    }
+    #[test]
+    fn epoch_changes_nonce_so_ciphertext_differs_for_same_plaintext() {
+        let (a, b) = pair();
+        let h = |epoch| RtHeader { kind: PacketKind::Mic, epoch: Epoch(epoch), stream: StreamId::MIC, sender: PeerId(1),
+                                   sequence: 5, sample_index: 0, timestamp_ns: 0, frame_count: 480 };
+        let p1 = a.seal_realtime(&h(1), b"same plaintext!!");
+        let p2 = a.seal_realtime(&h(2), b"same plaintext!!");
+        // Compare only the ciphertext body (excluding the header/AAD and the 16-byte tag): with
+        // the epoch folded into the nonce this must differ even though the plaintext is
+        // identical, otherwise the same (key, nonce) pair would be reused across epochs.
+        let body = |p: &[u8]| p[HEADER_LEN..p.len() - 16].to_vec();
+        assert_ne!(body(&p1), body(&p2));
+        let (h1, pl1) = b.open_realtime(&p1).unwrap();
+        let (h2, pl2) = b.open_realtime(&p2).unwrap();
+        assert_eq!(pl1, b"same plaintext!!");
+        assert_eq!(pl2, b"same plaintext!!");
+        assert_eq!(h1.epoch, Epoch(1));
+        assert_eq!(h2.epoch, Epoch(2));
+    }
+    #[test]
+    fn self_connection_rejected() {
+        let a = Handshake::new(PeerId(1), "A".into());
+        let hello = decode_hello(&a.hello()).unwrap();
+        match a.complete(&hello) {
+            Err(e) => assert_eq!(e, SecureError::SelfConnection),
+            Ok(_) => panic!("expected SelfConnection error"),
+        }
+    }
+    #[test]
+    fn protocol_version_mismatch_rejected() {
+        let a = Handshake::new(PeerId(1), "A".into());
+        let b = Handshake::new(PeerId(2), "B".into());
+        let mut hb = decode_hello(&b.hello()).unwrap();
+        hb.protocol_version += 1;
+        match a.complete(&hb) {
+            Err(e) => assert_eq!(e, SecureError::Version(hb.protocol_version)),
+            Ok(_) => panic!("expected Version error"),
+        }
+    }
+    #[test]
+    fn decode_hello_rejects_trailing_bytes() {
+        let a = Handshake::new(PeerId(1), "A".into());
+        let mut frame = a.hello();
+        frame.push(0xAB);
+        assert_eq!(decode_hello(&frame), Err(SecureError::Malformed));
     }
 }

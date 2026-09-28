@@ -42,13 +42,17 @@ pub enum ControlMessage {
 pub enum ProtocolError {
     #[error("malformed control message: {0}")]
     Malformed(#[from] postcard::Error),
+    #[error("trailing bytes after control message")]
+    TrailingBytes,
 }
 
 pub fn encode(msg: &ControlMessage) -> Vec<u8> {
     postcard::to_allocvec(msg).expect("control message serialization cannot fail")
 }
 pub fn decode(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
-    Ok(postcard::from_bytes(bytes)?)
+    let (msg, rest) = postcard::take_from_bytes(bytes)?;
+    if !rest.is_empty() { return Err(ProtocolError::TrailingBytes); }
+    Ok(msg)
 }
 
 #[cfg(test)]
@@ -75,5 +79,12 @@ mod tests {
             assert_eq!(decode(&bytes).unwrap(), msg);
         }
         assert!(decode(&[0xff, 0xff, 0xff]).is_err());
+    }
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let msg = ControlMessage::Leave { room_id: RoomId(1) };
+        let mut bytes = encode(&msg);
+        bytes.push(0x42);
+        assert!(matches!(decode(&bytes), Err(ProtocolError::TrailingBytes)));
     }
 }

@@ -117,9 +117,18 @@ pub fn evaluate_manifest(current: Option<&RoomManifest>, incoming: &RoomManifest
     if incoming.epoch > cur.epoch {
         return if cur.is_member(sender) { Accept } else { Reject(NotMember) };
     }
-    // same epoch
+    // same epoch, conflicting coordinators: lowest id wins the tie-break. Only a current member
+    // may assert this (an outsider can't force a coordinator change), and the manifest must
+    // actually be vouched for by the coordinator it names.
     if incoming.coordinator != cur.coordinator {
-        return if incoming.coordinator < cur.coordinator { Accept } else { Reject(LostTieBreak) };
+        if !cur.is_member(sender) {
+            return Reject(NotMember);
+        }
+        return if incoming.coordinator < cur.coordinator {
+            if sender == incoming.coordinator { Accept } else { Reject(NotCoordinator) }
+        } else {
+            Reject(LostTieBreak)
+        };
     }
     if sender != cur.coordinator {
         return Reject(NotCoordinator);
@@ -215,6 +224,36 @@ mod tests {
         b.coordinator = PeerId(2);
         assert_eq!(evaluate_manifest(Some(&a), &b, PeerId(2)), Acceptance::Accept);
         assert_eq!(evaluate_manifest(Some(&b), &a, PeerId(3)), Acceptance::Reject(RejectReason::LostTieBreak));
+    }
+    #[test]
+    fn same_epoch_conflict_from_non_member_rejected() {
+        let mut base = room();
+        base.upsert_member(member(2));
+        base.upsert_member(member(3));
+        let mut a = base.clone();
+        a.epoch = Epoch(5);
+        a.coordinator = PeerId(3);
+        let mut b = base.clone();
+        b.epoch = Epoch(5);
+        b.coordinator = PeerId(2);
+        // PeerId(2) has the lower coordinator id (would normally win the tie-break), but the
+        // manifest is claimed to come from PeerId(99), who isn't even a member of `a`.
+        assert_eq!(evaluate_manifest(Some(&a), &b, PeerId(99)), Acceptance::Reject(RejectReason::NotMember));
+    }
+    #[test]
+    fn same_epoch_conflict_not_vouched_by_named_coordinator_rejected() {
+        let mut base = room();
+        base.upsert_member(member(2));
+        base.upsert_member(member(3));
+        let mut a = base.clone();
+        a.epoch = Epoch(5);
+        a.coordinator = PeerId(3);
+        let mut b = base.clone();
+        b.epoch = Epoch(5);
+        b.coordinator = PeerId(2);
+        // PeerId(3) is a member and would win nothing here; the manifest names PeerId(2) as
+        // coordinator but is sent by PeerId(3), who isn't that coordinator.
+        assert_eq!(evaluate_manifest(Some(&a), &b, PeerId(3)), Acceptance::Reject(RejectReason::NotCoordinator));
     }
     #[test]
     fn coordinator_commands_validated_by_epoch() {

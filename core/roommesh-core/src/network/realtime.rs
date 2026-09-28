@@ -41,6 +41,7 @@ pub enum RtError {
 }
 
 pub fn header_bytes(h: &RtHeader, payload_len: usize) -> [u8; HEADER_LEN] {
+    debug_assert!(payload_len <= u16::MAX as usize, "payload_len {payload_len} does not fit in the u16 header field");
     let mut b = [0u8; HEADER_LEN];
     b[0..2].copy_from_slice(&RT_MAGIC.to_le_bytes());
     b[2] = RT_VERSION;
@@ -122,5 +123,14 @@ mod tests {
     fn header_bytes_is_prefix() {
         let pkt = encode_packet(&hdr(), &[5; 10]);
         assert_eq!(&pkt[..HEADER_LEN], &header_bytes(&hdr(), 10)[..]);
+    }
+    #[test]
+    fn rejects_bad_version_and_kind() {
+        let mut pkt = encode_packet(&hdr(), &[]);
+        pkt[2] = RT_VERSION + 1;
+        assert_eq!(decode_packet(&pkt).unwrap_err(), RtError::BadVersion);
+        let mut pkt = encode_packet(&hdr(), &[]);
+        pkt[3] = 0xff;
+        assert_eq!(decode_packet(&pkt).unwrap_err(), RtError::BadKind);
     }
 }

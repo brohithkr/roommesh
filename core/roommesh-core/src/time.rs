@@ -79,6 +79,7 @@ impl LinearFit {
     }
 
     pub fn push(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() { return; }
         if self.points.len() == self.capacity {
             self.points.pop_front();
         }
@@ -163,5 +164,14 @@ mod tests {
             f.push(i as f64, i as f64 * 5.0);
         }
         assert!((f.slope().unwrap() - 1.001).abs() < 1e-12); // clamped
+    }
+    #[test]
+    fn push_ignores_non_finite_samples() {
+        let mut f = LinearFit::new(10, 1.0, 0.001);
+        f.push(0.0, 0.0);
+        f.push(f64::NAN, 5.0);
+        f.push(1.0, f64::INFINITY);
+        f.push(f64::NEG_INFINITY, f64::NAN);
+        assert_eq!(f.len(), 1);
     }
 }

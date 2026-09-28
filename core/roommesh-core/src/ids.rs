@@ -20,7 +20,10 @@ macro_rules! hex_id {
                 format!("{:016x}", self.0)
             }
             pub fn from_hex(s: &str) -> Option<Self> {
-                if s.len() != 16 {
+                // Only accept the exact canonical lowercase form `to_hex()` produces: uppercase
+                // hex or stray characters (e.g. a leading '+' that `u64::from_str_radix` would
+                // otherwise happily accept as a sign) are rejected.
+                if s.len() != 16 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
                     return None;
                 }
                 u64::from_str_radix(s, 16).ok().map(Self)
@@ -46,7 +49,7 @@ hex_id!(RoomId);
 pub struct Epoch(pub u32);
 impl Epoch {
     pub fn next(self) -> Epoch {
-        Epoch(self.0 + 1)
+        Epoch(self.0.saturating_add(1))
     }
 }
 
@@ -70,6 +73,16 @@ mod tests {
         assert_eq!(PeerId::from_hex("xyz"), None);
     }
     #[test]
+    fn from_hex_rejects_non_canonical_input() {
+        assert_eq!(PeerId::from_hex("00ABCDEF01234567"), None); // uppercase
+        assert_eq!(PeerId::from_hex("+0abcdef01234567"), None); // sign char accepted by from_str_radix
+        // Every value's to_hex() output must still round-trip.
+        for v in [0u64, 1, u64::MAX, 0x00ab_cdef_0123_4567] {
+            let p = PeerId(v);
+            assert_eq!(PeerId::from_hex(&p.to_hex()), Some(p));
+        }
+    }
+    #[test]
     fn random_ids_differ() {
         assert_ne!(PeerId::random(), PeerId::random());
         assert_ne!(RoomId::random(), RoomId::random());
@@ -78,5 +91,6 @@ mod tests {
     fn epoch_orders_and_increments() {
         assert!(Epoch(41) < Epoch(42));
         assert_eq!(Epoch(41).next(), Epoch(42));
+        assert_eq!(Epoch(u32::MAX).next(), Epoch(u32::MAX)); // saturates, never wraps
     }
 }
