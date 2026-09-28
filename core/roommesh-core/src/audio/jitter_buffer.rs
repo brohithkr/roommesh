@@ -28,8 +28,13 @@ pub struct JitterStats {
     pub depth_packets: usize,
     /// EMA of time packets spent buffered before use.
     pub mean_wait_ns: f64,
+    /// Windowed loss ratio 0..1: EWMA (alpha = 1/100, ~1 s of frames) over frames reaching
+    /// playout (0) or lost (1: concealed, skipped, evicted or discarded). Use this for
+    /// current connection quality; `loss_ratio()` is cumulative since the stream started.
+    pub recent_loss: f64,
 }
 impl JitterStats {
+    /// Cumulative loss ratio since the stream started (see `recent_loss` for a windowed one).
     pub fn loss_ratio(&self) -> f64 {
         let total = self.received + self.lost;
         if total == 0 { 0.0 } else { self.lost as f64 / total as f64 }
@@ -41,12 +46,16 @@ impl JitterStats {
 /// long outage produces worse audio than a clean resync.
 pub const MAX_CONSECUTIVE_MISSING: u32 = 5;
 
+const RECENT_LOSS_ALPHA: f64 = 1.0 / 100.0;
+
 pub struct JitterBuffer {
     packets: BTreeMap<u64, BufferedPacket>,
     next_seq: Option<u64>,
     highest: Option<u64>,
     /// Timestamp of the last frame handed out (packet or concealment).
     last_ts: Option<u64>,
+    /// Largest timestamp of any accepted packet (sender-restart detection).
+    max_ts: Option<u64>,
     capacity: usize,
     frame_samples: u64,
     frame_ns: u64,
@@ -56,7 +65,7 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(capacity: usize, frame_samples: u64, frame_ns: u64) -> Self {
-        Self { packets: BTreeMap::new(), next_seq: None, highest: None, last_ts: None,
+        Self { packets: BTreeMap::new(), next_seq: None, highest: None, last_ts: None, max_ts: None,
                capacity, frame_samples, frame_ns, last_transit: None,
                stats: JitterStats::default() }
     }
@@ -66,6 +75,7 @@ impl JitterBuffer {
         self.next_seq = None;
         self.highest = None;
         self.last_ts = None;
+        self.max_ts = None;
         self.stats.depth_packets = 0;
         self.last_transit = None;
     }
@@ -85,10 +95,16 @@ impl JitterBuffer {
         let seq = self.extend(header.sequence);
         if let Some(next) = self.next_seq {
             if seq < next {
-                // Behind the playout point yet newer than anything played: the sender restarted
-                // its sequence counter (app restart, new uplink). Resync instead of rejecting.
+                // Behind the playout point yet clearly newer than anything ever received: the
+                // sender restarted its sequence counter (app restart, new uplink). Resync instead
+                // of rejecting. (Compared with the newest *received* timestamp, not the last
+                // played one: after a skip, a straggler from the skipped range is merely late.)
                 let restart_slack = MAX_CONSECUTIVE_MISSING as u64 * self.frame_ns;
-                if self.last_ts.is_some_and(|t| header.timestamp_ns > t.saturating_add(restart_slack)) {
+                if self.max_ts.is_some_and(|t| header.timestamp_ns > t.saturating_add(restart_slack)) {
+                    let discarded = self.packets.len() as u64;
+                    self.stats.received -= discarded;
+                    self.stats.lost += discarded;
+                    self.note_frames(discarded, true);
                     self.reset();
                     return self.push(header, payload, arrival_ns);
                 }
@@ -104,6 +120,7 @@ impl JitterBuffer {
         }
         self.last_transit = Some(transit);
         self.highest = Some(self.highest.map_or(seq, |h| h.max(seq)));
+        self.max_ts = Some(self.max_ts.map_or(header.timestamp_ns, |t| t.max(header.timestamp_ns)));
         if self.next_seq.is_none() { self.next_seq = Some(seq); }
         self.packets.insert(seq, BufferedPacket { seq, header, payload, arrival_ns });
         self.stats.received += 1;
@@ -115,8 +132,14 @@ impl JitterBuffer {
             // `lost` (not also under `received`), so `loss_ratio` reflects packets that failed
             // to reach playout rather than double-counting the same packet in both buckets.
             self.stats.received -= 1;
-            self.stats.lost += 1;
-            self.next_seq = self.packets.keys().next().copied();
+            // Playout jumps from `next_seq` to the new oldest packet: the evicted packet and
+            // any never-received sequence numbers in between are all lost.
+            let old_next = self.next_seq.unwrap_or(first).min(first);
+            let new_next = self.packets.keys().next().copied();
+            let jumped = new_next.map_or(1, |n| n - old_next);
+            self.stats.lost += jumped;
+            self.note_frames(jumped, true);
+            self.next_seq = new_next;
             result = PushResult::Overflow;
         }
         self.stats.depth_packets = self.packets.len();
@@ -137,6 +160,7 @@ impl JitterBuffer {
         if gap > MAX_CONSECUTIVE_MISSING as u64 {
             // Outage too long to conceal usefully: resync on the successor.
             self.stats.lost += gap;
+            self.note_frames(gap, true);
             self.next_seq = Some(first);
             return self.pop_due(deadline_ns, now_ns);
         }
@@ -147,13 +171,23 @@ impl JitterBuffer {
             let wait = now_ns.saturating_sub(p.arrival_ns) as f64;
             self.stats.mean_wait_ns += (wait - self.stats.mean_wait_ns) / 32.0;
             self.stats.depth_packets = self.packets.len();
+            self.note_frames(1, false);
             return Pop::Packet(p);
         }
         let sample_index = succ.header.sample_index.saturating_sub(gap * self.frame_samples);
         self.next_seq = Some(next + 1);
         self.last_ts = Some(due_ts);
         self.stats.lost += 1;
+        self.note_frames(1, true);
         Pop::Missing { seq: next, timestamp_ns: due_ts, sample_index }
+    }
+
+    /// Feeds `n` frames that were all lost (or all delivered) into the `recent_loss` EWMA.
+    fn note_frames(&mut self, n: u64, lost: bool) {
+        if n == 0 { return; }
+        let keep = (1.0 - RECENT_LOSS_ALPHA).powf(n as f64);
+        let target = if lost { 1.0 } else { 0.0 };
+        self.stats.recent_loss = self.stats.recent_loss * keep + target * (1.0 - keep);
     }
 
     pub fn peek(&self, seq: u64) -> Option<&BufferedPacket> { self.packets.get(&seq) }
@@ -281,5 +315,55 @@ mod tests {
         // One packet was evicted: it should count once, under `lost`, not also under `received`.
         assert_eq!(s.received, 2);
         assert_eq!(s.lost, 1);
+    }
+
+    #[test]
+    fn straggler_after_skip_is_late_not_a_restart() {
+        let mut b = jb();
+        b.push(h(0, 0), vec![], 0);
+        seq_of(b.pop_due(0, 0));
+        b.push(h(20, 20), vec![], 0);
+        b.push(h(21, 21), vec![], 0);
+        assert!(matches!(b.pop_due(15 * FRAME_NS, 0), Pop::NotReady), "gap skipped, 20 not due");
+        assert_eq!(b.stats().lost, 19);
+        assert_eq!(b.push(h(12, 12), vec![], 0), PushResult::Late);
+        assert_eq!(b.stats().depth_packets, 2);
+        assert_eq!(seq_of(b.pop_due(20 * FRAME_NS, 0)), 20);
+        assert_eq!(seq_of(b.pop_due(21 * FRAME_NS, 0)), 21);
+    }
+    #[test]
+    fn restart_discards_buffered_packets_as_lost() {
+        let mut b = jb();
+        for i in 0..10u64 { b.push(h(i as u32, i), vec![], 0); }
+        for _ in 0..5 { seq_of(b.pop_due(u64::MAX, 0)); } // 5..9 still buffered
+        assert_eq!(b.push(h(0, 500), vec![], 0), PushResult::Accepted);
+        let s = b.stats();
+        assert_eq!((s.received, s.lost, s.depth_packets), (6, 5, 1));
+        assert_eq!(seq_of(b.pop_due(u64::MAX, 0)), 0);
+    }
+    #[test]
+    fn overflow_counts_jumped_sequence_gap_as_lost() {
+        let mut b = JitterBuffer::new(2, 480, FRAME_NS);
+        b.push(h(0, 0), vec![], 0);
+        b.push(h(5, 5), vec![], 0); // 1..4 not (yet) received
+        b.push(h(6, 6), vec![], 0); // evicts 0; playout jumps 0 -> 5
+        let s = b.stats();
+        assert_eq!((s.received, s.lost), (2, 5));
+        assert_eq!(seq_of(b.pop_due(u64::MAX, 0)), 5);
+    }
+    #[test]
+    fn recent_loss_is_windowed_and_cumulative_is_kept() {
+        let mut b = jb();
+        let mut seen_high = 0.0f64;
+        // 500 frames with every 5th lost (20 %), then 500 clean frames; played out in real time.
+        for i in 0..1000u64 {
+            if i >= 500 || i % 5 != 1 { b.push(h(i as u32, i), vec![], 0); }
+            while !matches!(b.pop_due(i * FRAME_NS, 0), Pop::NotReady) {}
+            if i == 499 { seen_high = b.stats().recent_loss; }
+        }
+        let s = b.stats();
+        assert!((0.12..0.28).contains(&seen_high), "recent loss while lossy {seen_high}");
+        assert!(s.recent_loss < 0.01, "recent loss after recovery {}", s.recent_loss);
+        assert!((s.loss_ratio() - 0.1).abs() < 0.01, "cumulative {}", s.loss_ratio());
     }
 }
