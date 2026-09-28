@@ -1,9 +1,12 @@
 #include "SharedRegion.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -891,6 +894,104 @@ static void speakerSeqlockTest() {
     r.Destroy();
 }
 
+// Two-thread stress test for the speaker-ring seqlock (RingHeader::seq):
+// a writer thread calls the real WriteSpeaker in a loop with `nowNs`
+// derived from the write position (nowNs = 1000*(w+frames), so a
+// consistent (write_pos, write_host_ns) pair always satisfies
+// write_host_ns == 1000*write_pos); this thread concurrently runs the same
+// acquire/fence/recheck protocol as the Rust reader
+// (SpeakerReader::write_state in virtual_device.rs) and asserts every pair
+// it accepts (didn't exhaust its retries) is internally consistent - never
+// torn. Runs for ~200ms, which is enough for many thousands of writes and
+// reads to interleave on real hardware. Verified to fail (an inconsistent
+// pair gets accepted) if WriteSpeaker's odd-marker store is removed.
+static void speakerSeqlockStressTest() {
+    const std::string name = "/rmtest.seqstress." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+    RingHeader& h = l->speaker.h;
+
+    std::atomic<bool> stop{false};
+    float buf[2 * 7] = {0};
+    std::thread writer([&] {
+        uint64_t w = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            r.WriteSpeaker(buf, 7, 2, 1000 * (w + 7));
+            w += 7;
+        }
+    });
+
+    long accepted = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (std::chrono::steady_clock::now() < deadline) {
+        uint64_t w = 0, t = 0;
+        bool got = false;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            const uint64_t s1 = h.seq.load(std::memory_order_acquire);
+            if (s1 == 0) break;   // no write yet; nothing to check this iteration
+            if (s1 & 1) continue;  // odd: a write is in progress right now
+            w = h.write_pos.load(std::memory_order_relaxed);
+            t = h.write_host_ns.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint64_t s2 = h.seq.load(std::memory_order_relaxed);
+            if (s1 == s2) { got = true; break; }
+        }
+        if (!got) continue;  // exhausted retries, or nothing written yet: skip this sample
+        assert(t == 1000 * w);  // every accepted pair must be internally consistent, never torn
+        accepted++;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    writer.join();
+    assert(accepted > 0);  // sanity: the loop actually exercised the seqlock, not a no-op
+
+    r.Destroy();
+}
+
+// Fix: Create() must reset every mic-side tracking field, including
+// silenceFloor_ - a SharedRegion instance reused across more than one shm
+// region (e.g. a driver re-init calling Create() again) must not carry
+// stale bookkeeping from a previous session into a brand new region whose
+// write_pos starts back at 0. Drives silenceFloor_ up through a real
+// session (write a lot of audio, then let the heartbeat go stale so the
+// silence branch marks everything written so far as off-limits), re-
+// Creates the same SharedRegion object, and confirms fresh audio at the
+// new region's much smaller write positions is actually served rather than
+// being masked forever by the old session's now-meaningless floor.
+static void createTwiceResetsTrackingStateTest() {
+    const std::string name = "/rmtest.create2x." + std::to_string(getpid());
+    SharedRegion r;
+    assert(r.Create(name.c_str()));
+    SharedLayout* l = r.layout();
+
+    const uint64_t now1 = 10'000'000'000;
+    writeMic(l, 1.f, 20000, now1);  // w = 20000
+    float out[512];
+    r.ReadMic(1000, out, 512, now1);  // establishes a real anchor
+    for (float f : out) assert(f == 1.f);
+    r.ReadMic(2024, out, 512, now1 + 500'000'000);  // heartbeat now stale -> silence branch,
+    for (float f : out) assert(f == 0.f);           // silenceFloor_ marked up to 20000
+
+    // Re-Create the *same* SharedRegion object: a brand new shm region
+    // (same name - Create() unlinks any existing region at that name
+    // first), whose write_pos starts back at 0.
+    assert(r.Create(name.c_str()));
+    SharedLayout* l2 = r.layout();
+    assert(l2->mic.h.write_pos.load() == 0);
+
+    // Fresh audio at a small write position. Without resetting
+    // silenceFloor_ (left over at >= 20000 from the previous session), the
+    // new region's entire live range would sit below that stale floor and
+    // be masked to silence forever.
+    const uint64_t now2 = 20'000'000'000;
+    writeMic(l2, 2.f, 4800, now2);
+    r.ReadMic(1000, out, 512, now2);
+    for (float f : out) assert(f == 2.f);
+
+    r.Destroy();
+}
+
 // Fix (4): the app stores app_heartbeat_ns = 0 the instant it stops being
 // the room's coordinator, rather than leaving the last real timestamp
 // there. Reads must silence immediately when that happens - not only after
@@ -973,6 +1074,8 @@ int main() {
     anchorDepthForwardTrimSuiteTest();
     largeReaderStableNoResyncTest();
     speakerSeqlockTest();
+    speakerSeqlockStressTest();
+    createTwiceResetsTrackingStateTest();
     heartbeatZeroSilenceTest();
 
     std::puts("ring_test PASS");
