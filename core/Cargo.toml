@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["roommesh-core"]
+members = ["roommesh-core", "roommesh-devtool"]
 
 [workspace.package]
 edition = "2021"

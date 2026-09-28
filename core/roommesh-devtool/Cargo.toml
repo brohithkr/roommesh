@@ -1,0 +1,9 @@
+[package]
+name = "roommesh-devtool"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+roommesh-core = { path = "../roommesh-core" }
+cpal = "0.18"

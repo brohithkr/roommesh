@@ -1091,6 +1091,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "roommesh-devtool"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "roommesh-core",
+]
+
+[[package]]
 name = "rtrb"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
