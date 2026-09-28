@@ -68,4 +68,18 @@ final class IntegrationHelpersTests: XCTestCase {
         XCTAssertFalse(DriverInstaller.isUserCancel("0:103: execution error: rm: /x: Permission denied (1)"))
         XCTAssertEqual(DriverInstaller.errorMessage(fromOsascript: "0:57: execution error: ditto: boom (1)\n"), "ditto: boom")
     }
+    // MARK: launch at login
+    func testLaunchAtLoginActionIsIdempotent() {
+        // Re-asserting the current state (e.g. the revert after an error) must not re-register.
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: true, status: .enabled), .none)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: true, status: .requiresApproval), .none)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: false, status: .notRegistered), .none)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: false, status: .notFound), .none)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: true, status: .notRegistered), .register)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: true, status: .notFound), .register)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: false, status: .enabled), .unregister)
+        XCTAssertEqual(LaunchAtLogin.action(toggleOn: false, status: .requiresApproval), .unregister)
+        XCTAssertTrue(LaunchAtLogin.isOn(.requiresApproval), "registered, pending approval")
+        XCTAssertFalse(LaunchAtLogin.isOn(.notFound))
+    }
 }

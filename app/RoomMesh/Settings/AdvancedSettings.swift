@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct AdvancedSettings: View {
+    /// The Settings window widens to this on the Advanced tab so all metric columns fit.
+    static let width: CGFloat = 800
     @Environment(AppModel.self) private var model
     private func fmt(_ v: Float?, _ unit: String, _ digits: Int = 1) -> String {
         guard let v else { return "—" }
@@ -17,16 +19,18 @@ struct AdvancedSettings: View {
             TimelineView(.periodic(from: .now, by: 1)) { _ in
                 let rows = model.metrics()
                 Table(rows) {
-                    TableColumn("Mac") { Text($0.name.isEmpty ? $0.peerId : $0.name) }
-                    TableColumn("RTT") { Text(fmt($0.rttMs, " ms")) }
-                    TableColumn("Jitter") { Text(fmt($0.jitterMs, " ms")) }
-                    TableColumn("Loss") { Text(fmt($0.lossPct, "%")) }
-                    TableColumn("Offset") { Text(fmt($0.clockOffsetMs, " ms", 2)) }
-                    TableColumn("Drift") { Text(fmt($0.driftPpm, " ppm")) }
-                    TableColumn("Buffer") { Text(fmt($0.bufferMs, " ms")) }
-                    TableColumn("Score") { Text(fmt($0.micScore, "", 2)) }
-                    TableColumn("AEC") { Text(fmt($0.aecErleDb, " dB")) }
-                    TableColumn("Active") { Text($0.isActive ? "●" : "") }
+                    TableColumn("Mac") { Text($0.name.isEmpty ? $0.peerId : $0.name).lineLimit(1) }.width(min: 90, ideal: 110)
+                    TableColumn("RTT") { Text(fmt($0.rttMs, " ms")) }.width(52)
+                    TableColumn("Jitter") { Text(fmt($0.jitterMs, " ms")) }.width(52)
+                    TableColumn("Loss") { Text(fmt($0.lossPct, "%")) }.width(44)
+                    TableColumn("Offset") { Text(fmt($0.clockOffsetMs, " ms", 2)) }.width(64)
+                    TableColumn("Drift") { Text(fmt($0.driftPpm, " ppm")) }.width(60)
+                    TableColumn("Buffer") { Text(fmt($0.bufferMs, " ms")) }.width(54)
+                    TableColumn("Score") { Text(fmt($0.micScore, "", 2)) }.width(40)
+                    TableColumn("AEC") { Text(fmt($0.aecErleDb, " dB")) }.width(52)
+                    TableColumn("Active") { m in
+                        Text(m.isActive ? "●" : "").accessibilityLabel(m.isActive ? "Active" : "Not active")
+                    }.width(44)
                 }
             }
         }

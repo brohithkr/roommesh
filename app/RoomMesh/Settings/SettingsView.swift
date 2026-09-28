@@ -10,6 +10,6 @@ struct SettingsView: View {
             NetworkSettings().tabItem { Label("Network", systemImage: "network") }.tag(SettingsTab.network)
             AdvancedSettings().tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }.tag(SettingsTab.advanced)
         }
-        .frame(width: 560, height: 420)
+        .frame(width: model.settingsTab == .advanced ? AdvancedSettings.width : 560, height: 420)
     }
 }

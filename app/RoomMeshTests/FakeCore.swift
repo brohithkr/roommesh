@@ -32,7 +32,8 @@ final class FakeCore: RoomMeshCoreProtocol, @unchecked Sendable {
     func setLocalInfo(name: String, driverInstalled: Bool) {}
     func getRoomState() -> FfiRoomState? { room }
     func getNearbyPeers() -> [FfiNearbyPeer] { [] }
-    func getPeerMetrics() -> [FfiPeerMetrics] { [] }
+    var metrics: [FfiPeerMetrics] = []
+    func getPeerMetrics() -> [FfiPeerMetrics] { metrics }
     func getActiveMicrophones() -> [String] { [] }
     func virtualDeviceAvailable() -> Bool { true }
 }

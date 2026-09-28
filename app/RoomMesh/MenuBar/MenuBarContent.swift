@@ -29,8 +29,8 @@ struct MenuBarContent: View {
             Divider()
             Button("Invite Nearby Device…") { model.showInviteSheet = true; MainWindowController.shared.show() }
             Button("Manage Room…") { MainWindowController.shared.show() }
-            Button("Audio Diagnostics…") { model.settingsTab = .advanced; openSettings(); NSApp.activate(ignoringOtherApps: true) }
-            Button("Settings…") { model.settingsTab = .general; openSettings(); NSApp.activate(ignoringOtherApps: true) }
+            Button("Audio Diagnostics…") { model.settingsTab = .advanced; NSApp.activate(); openSettings() }
+            Button("Settings…") { model.settingsTab = .general; NSApp.activate(); openSettings() }
                 .keyboardShortcut(",")
             Divider()
             Button("Leave Room") { model.leaveRoom() }
@@ -44,7 +44,7 @@ struct MenuBarContent: View {
             Divider()
             Button("Create Room") { model.createRoom(name: model.defaultRoomName) }
             Button("Open RoomMesh…") { MainWindowController.shared.show() }
-            Button("Settings…") { openSettings(); NSApp.activate(ignoringOtherApps: true) }.keyboardShortcut(",")
+            Button("Settings…") { NSApp.activate(); openSettings() }.keyboardShortcut(",")
         }
         Divider()
         Button("Quit RoomMesh") { NSApp.terminate(nil) }.keyboardShortcut("q")

@@ -14,7 +14,7 @@ struct FailurePromptView: View {
             if candidates.isEmpty {
                 Text("No other Mac is available right now.").foregroundStyle(.secondary)
             } else {
-                Picker("", selection: $choice) {
+                Picker(kind == .coordinator ? "New coordinator" : "New room speaker", selection: $choice) {
                     ForEach(candidates, id: \.self) { id in Text(model.name(of: id) ?? id).tag(id) }
                 }
                 .pickerStyle(.radioGroup)

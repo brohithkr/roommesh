@@ -9,11 +9,11 @@ struct AudioSettingsView: View {
             Section("Devices") {
                 Picker("Microphone", selection: $settings.inputDevice) {
                     Text("System Default").tag(String?.none)
-                    ForEach(devices.filter(\.isInput), id: \.name) { Text($0.name).tag(Optional($0.name)) }
+                    ForEach(DeviceRow.rows(devices.filter(\.isInput))) { Text($0.name).tag(Optional($0.name)) }
                 }
                 Picker("Speaker (when this Mac is the room speaker)", selection: $settings.outputDevice) {
                     Text("System Default").tag(String?.none)
-                    ForEach(devices.filter(\.isOutput), id: \.name) { Text($0.name).tag(Optional($0.name)) }
+                    ForEach(DeviceRow.rows(devices.filter(\.isOutput))) { Text($0.name).tag(Optional($0.name)) }
                 }
             }
             Section("Processing") {
@@ -41,5 +41,14 @@ struct AudioSettingsView: View {
         }
         .formStyle(.grouped)
         .onAppear { devices = listAudioDevices(); model.refreshStatus() }
+    }
+}
+
+/// Device names aren't unique (two identical USB mics), so rows are keyed by index + name.
+struct DeviceRow: Identifiable {
+    let id: String
+    let name: String
+    static func rows(_ devices: [FfiAudioDevice]) -> [DeviceRow] {
+        devices.enumerated().map { DeviceRow(id: "\($0.offset):\($0.element.name)", name: $0.element.name) }
     }
 }
