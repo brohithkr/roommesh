@@ -986,7 +986,10 @@ mod tests {
         wait("the DSP coordinates", 3, dsp_coordinates);
         core.command(Command::Rename("boom".into())).unwrap();
         wait("the control thread's error event", 3, || {
-            sink.errors.lock().iter().any(|m| m.contains("stopped working"))
+            sink.errors
+                .lock()
+                .iter()
+                .any(|m| m.contains("stopped working"))
         });
         // No room, no roles, no clock-ping answers, and audio stops.
         assert!(core.room_snapshot().is_none());
@@ -1223,7 +1226,10 @@ mod tests {
         let c = test_cipher();
         let mut w = ReplayWindow::default();
         assert!(w.accept(&c, Epoch(2), 5));
-        assert!(!w.accept(&c, Epoch(1), 0), "a ping from an older epoch is stale");
+        assert!(
+            !w.accept(&c, Epoch(1), 0),
+            "a ping from an older epoch is stale"
+        );
         assert!(
             !w.accept(&c, Epoch(2), 5),
             "the already-answered new-epoch ping must stay answered"
@@ -1246,7 +1252,10 @@ mod tests {
         assert!(w.accept(&c1, e, 200));
         assert!(!w.accept(&c1, e, 12), "older than the window");
         assert!(w.accept(&c1, Epoch(2), 12), "new epoch resets");
-        assert!(w.accept(&c2, Epoch(1), 0), "new key resets, whatever the epoch");
+        assert!(
+            w.accept(&c2, Epoch(1), 0),
+            "new key resets, whatever the epoch"
+        );
         assert!(!w.accept(&c2, Epoch(1), 0));
     }
 
