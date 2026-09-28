@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["roommesh-core", "roommesh-devtool"]
+members = ["roommesh-core", "roommesh-devtool", "uniffi-bindgen"]
 
 [workspace.package]
 edition = "2021"
