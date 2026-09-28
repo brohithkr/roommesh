@@ -6,7 +6,7 @@ use crate::network::secure::{
 };
 use crate::room::protocol::{self, ControlMessage, ProtocolError};
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub type RtSessions = Arc<RwLock<HashMap<PeerId, Arc<RtCipher>>>>;
@@ -77,8 +77,10 @@ pub struct ControlChannel {
     /// consumed the moment it's actually used to accept a Hello. Also gates whether an
     /// unsolicited HELLO_REQUEST is allowed to tear down an existing session (see
     /// `on_hello_request`) -- without a recent `on_connected`, a HELLO_REQUEST can't be trusted
-    /// to mean the peer actually needs a new handshake.
-    fresh: HashSet<PeerId>,
+    /// to mean the peer actually needs a new handshake. Maps to when it was set: `stalled()`
+    /// expires it after the watchdog timeout, so a redundant Connected on a session that then
+    /// carries no authenticated traffic (which would clear it) can't be exploited indefinitely.
+    fresh: HashMap<PeerId, u64>,
     /// The public key of the last opening Hello we accepted from each peer (higher-id role
     /// only). Lets a byte-identical retransmitted opening Hello be recognized and silently
     /// ignored instead of either erroring (log spam over a harmless network-level duplicate) or
@@ -95,7 +97,7 @@ impl ControlChannel {
             sessions: HashMap::new(),
             rt: Arc::default(),
             awaiting: HashMap::new(),
-            fresh: HashSet::new(),
+            fresh: HashMap::new(),
             answered: HashMap::new(),
         }
     }
@@ -137,7 +139,7 @@ impl ControlChannel {
     /// different keys could never agree on one session, and a reply to the earlier attempt would
     /// be unable to complete the (now superseded) later one.
     pub fn on_connected(&mut self, peer: PeerId, now_ms: u64) -> Option<Vec<u8>> {
-        self.fresh.insert(peer);
+        self.fresh.insert(peer, now_ms);
         if self.sessions.contains_key(&peer) {
             return None;
         }
@@ -210,7 +212,7 @@ impl ControlChannel {
             // could tear down (and force a re-key of) an otherwise healthy, SAS-verified
             // session -- a denial-of-service/downgrade vector. Without that evidence, just
             // ignore the request.
-            if !self.fresh.contains(&peer) {
+            if !self.fresh.contains_key(&peer) {
                 return FrameOutcome::default();
             }
             self.drop_session(peer);
@@ -281,7 +283,7 @@ impl ControlChannel {
                 // -- a stray replay, a forged Hello, a late retransmission -- is rejected
                 // outright rather than silently tearing down (and re-keying) a perfectly good
                 // session.
-                let fresh = self.fresh.contains(&peer);
+                let fresh = self.fresh.contains_key(&peer);
                 if self.sessions.contains_key(&peer) && !fresh {
                     return Err(ControlError::UnexpectedHello);
                 }
@@ -327,7 +329,9 @@ impl ControlChannel {
     /// gets a given stalled peer reported at most once per `timeout_ms` window rather than on
     /// every poll. A handshake started by `on_hello_request` (which has no `now_ms` to stamp
     /// with) is stamped lazily on its first poll here instead of being reported immediately.
+    /// Also expires `fresh` flags set at least `timeout_ms` ago.
     pub fn stalled(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<PeerId> {
+        self.fresh.retain(|_, set| now_ms.saturating_sub(*set) < timeout_ms);
         let mut out = Vec::new();
         for (&peer, started) in self.awaiting.iter_mut() {
             match *started {
@@ -698,6 +702,26 @@ mod tests {
         // answered) is silently ignored rather than erroring (F4).
         assert!(b.on_frame(a.local, &dup).unwrap().event.is_none());
         assert!(a.has_session(b.local) && b.has_session(a.local));
+    }
+    #[test]
+    fn fresh_flag_on_an_existing_session_expires_after_the_watchdog_timeout() {
+        let mut a = ControlChannel::new(PeerId(1), "A".into());
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        up(&mut a, &mut b);
+        let sas = a.sas(PeerId(2));
+        // A late/redundant Connected with no traffic after it: the flag must not linger.
+        assert!(a.on_connected(PeerId(2), 1_000).is_none());
+        assert_eq!(a.stalled(5_999, 5_000), Vec::new());
+        assert!(a.fresh.contains_key(&PeerId(2)), "still within the window");
+        assert_eq!(a.stalled(6_000, 5_000), Vec::new());
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        assert!(out.event.is_none() && out.reply.is_none(), "expired: the request is ignored");
+        assert_eq!(a.sas(PeerId(2)), sas);
+        // Within the window a HELLO_REQUEST is still honoured.
+        a.on_connected(PeerId(2), 10_000);
+        a.stalled(12_000, 5_000);
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        assert!(matches!(out.event, Some(ControlEvent::SessionDown(p)) if p == PeerId(2)));
     }
     #[test]
     fn p1_injected_hello_request_does_not_disrupt_a_verified_session() {
