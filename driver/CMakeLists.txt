@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
+set(CMAKE_OSX_DEPLOYMENT_TARGET 14.2 CACHE STRING "")
+project(RoomMeshDriver CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OSX_DEPLOYMENT_TARGET 14.2)
+
+enable_testing()
+add_executable(ring_test tests/ring_test.cpp src/SharedRegion.cpp)
+target_include_directories(ring_test PRIVATE src)
+target_compile_options(ring_test PRIVATE -UNDEBUG)
+add_test(NAME ring_test COMMAND ring_test)
