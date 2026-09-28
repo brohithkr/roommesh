@@ -120,18 +120,11 @@ pub fn evaluate_manifest(current: Option<&RoomManifest>, incoming: &RoomManifest
     if incoming.epoch > cur.epoch {
         return if cur.is_member(sender) { Accept } else { Reject(NotMember) };
     }
-    // same epoch, conflicting coordinators: lowest id wins the tie-break. Only a current member
-    // may assert this (an outsider can't force a coordinator change), and the manifest must
-    // actually be vouched for by the coordinator it names.
+    // same epoch
     if incoming.coordinator != cur.coordinator {
-        if !cur.is_member(sender) {
-            return Reject(NotMember);
-        }
-        return if incoming.coordinator < cur.coordinator {
-            if sender == incoming.coordinator { Accept } else { Reject(NotCoordinator) }
-        } else {
-            Reject(LostTieBreak)
-        };
+        if !cur.is_member(sender) { return Reject(NotMember); }
+        if sender != incoming.coordinator { return Reject(NotCoordinator); }
+        return if incoming.coordinator < cur.coordinator { Accept } else { Reject(LostTieBreak) };
     }
     if sender != cur.coordinator {
         return Reject(NotCoordinator);
