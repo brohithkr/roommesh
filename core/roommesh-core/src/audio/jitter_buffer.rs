@@ -36,14 +36,17 @@ impl JitterStats {
     }
 }
 
+/// The longest gap (in frames) that is concealed by synthesizing `Pop::Missing` entries. A due
+/// gap longer than this is skipped (counted as `lost`) instead of concealed, since concealing a
+/// long outage produces worse audio than a clean resync.
 pub const MAX_CONSECUTIVE_MISSING: u32 = 5;
 
 pub struct JitterBuffer {
     packets: BTreeMap<u64, BufferedPacket>,
     next_seq: Option<u64>,
     highest: Option<u64>,
-    last_popped: Option<(u64, u64, u64)>, // (seq, timestamp, sample_index)
-    consecutive_missing: u32,
+    /// Timestamp of the last frame handed out (packet or concealment).
+    last_ts: Option<u64>,
     capacity: usize,
     frame_samples: u64,
     frame_ns: u64,
@@ -53,8 +56,8 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(capacity: usize, frame_samples: u64, frame_ns: u64) -> Self {
-        Self { packets: BTreeMap::new(), next_seq: None, highest: None, last_popped: None,
-               consecutive_missing: 0, capacity, frame_samples, frame_ns, last_transit: None,
+        Self { packets: BTreeMap::new(), next_seq: None, highest: None, last_ts: None,
+               capacity, frame_samples, frame_ns, last_transit: None,
                stats: JitterStats::default() }
     }
 
@@ -62,8 +65,8 @@ impl JitterBuffer {
         self.packets.clear();
         self.next_seq = None;
         self.highest = None;
-        self.last_popped = None;
-        self.consecutive_missing = 0;
+        self.last_ts = None;
+        self.stats.depth_packets = 0;
         self.last_transit = None;
     }
 
@@ -81,7 +84,17 @@ impl JitterBuffer {
     pub fn push(&mut self, header: RtHeader, payload: Vec<u8>, arrival_ns: u64) -> PushResult {
         let seq = self.extend(header.sequence);
         if let Some(next) = self.next_seq {
-            if seq < next { self.stats.late += 1; return PushResult::Late; }
+            if seq < next {
+                // Behind the playout point yet newer than anything played: the sender restarted
+                // its sequence counter (app restart, new uplink). Resync instead of rejecting.
+                let restart_slack = MAX_CONSECUTIVE_MISSING as u64 * self.frame_ns;
+                if self.last_ts.is_some_and(|t| header.timestamp_ns > t.saturating_add(restart_slack)) {
+                    self.reset();
+                    return self.push(header, payload, arrival_ns);
+                }
+                self.stats.late += 1;
+                return PushResult::Late;
+            }
         }
         if self.packets.contains_key(&seq) { self.stats.duplicates += 1; return PushResult::Duplicate; }
         let transit = arrival_ns as f64 - header.timestamp_ns as f64;
@@ -98,6 +111,10 @@ impl JitterBuffer {
         while self.packets.len() > self.capacity {
             let first = *self.packets.keys().next().unwrap();
             self.packets.remove(&first);
+            // The evicted packet did arrive but never reaches playout: count it only under
+            // `lost` (not also under `received`), so `loss_ratio` reflects packets that failed
+            // to reach playout rather than double-counting the same packet in both buckets.
+            self.stats.received -= 1;
             self.stats.lost += 1;
             self.next_seq = self.packets.keys().next().copied();
             result = PushResult::Overflow;
@@ -107,50 +124,36 @@ impl JitterBuffer {
     }
 
     /// Returns the next in-order packet whose timestamp is `<= deadline_ns`, or declares it
-    /// missing once a successor proves it should have arrived.
+    /// missing once a buffered successor proves it was sent. A due gap longer than
+    /// `MAX_CONSECUTIVE_MISSING` frames is skipped (counted as lost) instead of concealed.
     pub fn pop_due(&mut self, deadline_ns: u64, now_ns: u64) -> Pop {
         let Some(next) = self.next_seq else { return Pop::NotReady };
-        if let Some(p) = self.packets.get(&next) {
-            if p.header.timestamp_ns > deadline_ns { return Pop::NotReady; }
-            let p = self.packets.remove(&next).unwrap();
-            self.next_seq = Some(next + 1);
-            self.consecutive_missing = 0;
-            self.last_popped = Some((next, p.header.timestamp_ns, p.header.sample_index));
+        // Only a buffered successor proves `next` was sent; with none, wait.
+        let Some((&first, succ)) = self.packets.iter().next() else { return Pop::NotReady };
+        let gap = first - next;
+        let due_ts = succ.header.timestamp_ns.saturating_sub(gap * self.frame_ns);
+        // Not due yet: a reordered packet may still fill the gap.
+        if due_ts > deadline_ns { return Pop::NotReady; }
+        if gap > MAX_CONSECUTIVE_MISSING as u64 {
+            // Outage too long to conceal usefully: resync on the successor.
+            self.stats.lost += gap;
+            self.next_seq = Some(first);
+            return self.pop_due(deadline_ns, now_ns);
+        }
+        if gap == 0 {
+            let p = self.packets.remove(&first).unwrap();
+            self.next_seq = Some(first + 1);
+            self.last_ts = Some(p.header.timestamp_ns);
             let wait = now_ns.saturating_sub(p.arrival_ns) as f64;
             self.stats.mean_wait_ns += (wait - self.stats.mean_wait_ns) / 32.0;
             self.stats.depth_packets = self.packets.len();
             return Pop::Packet(p);
         }
-        // Without a buffered successor we have no direct evidence `next` was actually sent and
-        // skipped; only synthesize a loss from `last_popped` extrapolation when the caller
-        // explicitly asks for an unbounded/forced drain (deadline_ns == u64::MAX, e.g. a stall
-        // watchdog trying to push the resync state machine along). A normal, finitely-deadlined
-        // playout call just waits (NotReady) — the sender may simply have gone silent.
-        let inferred = if let Some((&s, p)) = self.packets.iter().next() {
-            let d = s - next;
-            Some((p.header.timestamp_ns.saturating_sub(d * self.frame_ns),
-                  p.header.sample_index.saturating_sub(d * self.frame_samples)))
-        } else if deadline_ns == u64::MAX {
-            if let Some((ls, lts, lsi)) = self.last_popped {
-                if self.consecutive_missing >= MAX_CONSECUTIVE_MISSING {
-                    self.reset(); // sender stopped; resync on the next packet
-                    return Pop::NotReady;
-                }
-                let d = next - ls;
-                Some((lts + d * self.frame_ns, lsi + d * self.frame_samples))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let Some((ts, si)) = inferred else { return Pop::NotReady };
-        if ts > deadline_ns { return Pop::NotReady; }
+        let sample_index = succ.header.sample_index.saturating_sub(gap * self.frame_samples);
         self.next_seq = Some(next + 1);
-        self.last_popped = Some((next, ts, si));
-        self.consecutive_missing += 1;
+        self.last_ts = Some(due_ts);
         self.stats.lost += 1;
-        Pop::Missing { seq: next, timestamp_ns: ts, sample_index: si }
+        Pop::Missing { seq: next, timestamp_ns: due_ts, sample_index }
     }
 
     pub fn peek(&self, seq: u64) -> Option<&BufferedPacket> { self.packets.get(&seq) }
@@ -224,10 +227,41 @@ mod tests {
         let mut b = jb();
         b.push(h(0, 0), vec![], 0);
         seq_of(b.pop_due(u64::MAX, 0));
-        for _ in 0..MAX_CONSECUTIVE_MISSING { assert!(matches!(b.pop_due(u64::MAX, 0), Pop::Missing { .. })); }
         assert!(matches!(b.pop_due(u64::MAX, 0), Pop::NotReady));
         b.push(h(100, 100), vec![], 0);
         assert_eq!(seq_of(b.pop_due(u64::MAX, 0)), 100);
+    }
+    #[test]
+    fn short_gap_concealed_long_gap_skipped() {
+        let mut b = jb();
+        b.push(h(0, 0), vec![], 0);
+        seq_of(b.pop_due(0, 0));
+        b.push(h(1 + MAX_CONSECUTIVE_MISSING, 1 + MAX_CONSECUTIVE_MISSING as u64), vec![], 0);
+        for _ in 0..MAX_CONSECUTIVE_MISSING { assert!(matches!(b.pop_due(u64::MAX, 0), Pop::Missing { .. })); }
+        seq_of(b.pop_due(u64::MAX, 0));
+        b.push(h(1000, 1000), vec![], 0);
+        assert!(matches!(b.pop_due(999 * FRAME_NS, 0), Pop::NotReady), "skip must not pop early");
+        assert_eq!(seq_of(b.pop_due(1000 * FRAME_NS, 0)), 1000);
+        assert_eq!(b.stats().lost, MAX_CONSECUTIVE_MISSING as u64 + 1000 - 7);
+    }
+    #[test]
+    fn long_reorder_is_not_skipped_before_due() {
+        let mut b = jb();
+        b.push(h(0, 0), vec![], 0);
+        seq_of(b.pop_due(0, 0));
+        b.push(h(20, 20), vec![], 0); // 1..19 still in flight
+        assert!(matches!(b.pop_due(FRAME_NS / 2, 0), Pop::NotReady));
+        b.push(h(1, 1), vec![], 0);
+        assert_eq!(seq_of(b.pop_due(FRAME_NS, 0)), 1);
+        assert_eq!(b.stats().lost, 0);
+    }
+    #[test]
+    fn resyncs_when_sender_restarts_sequence() {
+        let mut b = jb();
+        for i in 0..50u64 { b.push(h(i as u32, i), vec![], 0); seq_of(b.pop_due(u64::MAX, 0)); }
+        assert_eq!(b.push(h(10, 10), vec![], 0), PushResult::Late);
+        assert_eq!(b.push(h(0, 200), vec![], 0), PushResult::Accepted);
+        assert_eq!(seq_of(b.pop_due(u64::MAX, 0)), 0);
     }
     #[test]
     fn jitter_statistic_grows_with_variable_delay() {
@@ -237,5 +271,15 @@ mod tests {
             b.push(h(i as u32, i), vec![], i * FRAME_NS + delay);
         }
         assert!(b.stats().jitter_ns > 3_000_000.0);
+    }
+    #[test]
+    fn overflow_drop_not_double_counted() {
+        let mut b = JitterBuffer::new(2, 480, FRAME_NS);
+        // Push 3 packets into a capacity-2 buffer without popping: the oldest is evicted.
+        for i in [5u64, 6, 7] { b.push(h(i as u32, i), vec![], 0); }
+        let s = b.stats();
+        // One packet was evicted: it should count once, under `lost`, not also under `received`.
+        assert_eq!(s.received, 2);
+        assert_eq!(s.lost, 1);
     }
 }
