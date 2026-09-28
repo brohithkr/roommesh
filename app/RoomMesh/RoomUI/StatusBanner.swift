@@ -4,17 +4,17 @@ struct StatusBanner: View {
     @Environment(AppModel.self) private var model
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if Permissions.microphone == .denied {
+            if model.micPermission == .denied {
                 banner("Microphone access is off for RoomMesh.", action: "Open Settings") { Permissions.openPrivacySettings("Privacy_Microphone") }
             }
             if model.localNetworkDenied {
                 banner("Local Network access is off, so nearby Macs can't be found.", action: "Open Settings") { Permissions.openPrivacySettings("Privacy_LocalNetwork") }
             }
-            if DriverInstaller.needsInstall {
+            if let op = model.driverOperation {
+                banner(op == .install ? "Installing the RoomMesh audio driver…" : "Removing the RoomMesh audio driver…", action: nil) {}
+            } else if model.needsDriverInstall {
                 banner(model.driverInstalled ? "An updated RoomMesh audio driver is available." : "Install the RoomMesh audio driver to use this Mac as coordinator.",
-                       action: "Install…") {
-                    do { try DriverInstaller.install() } catch { model.lastError = describe(error) }
-                }
+                       action: "Install…") { model.installDriver() }
             } else if model.isLocalCoordinator && !model.virtualDeviceAvailable {
                 banner("RoomMesh Microphone is not reachable yet. If this persists, reinstall the driver.", action: nil) {}
             }

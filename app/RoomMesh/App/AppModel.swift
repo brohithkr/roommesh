@@ -49,11 +49,29 @@ final class AppModel {
     var qualities: [String: FfiQuality] = [:]
     var driverInstalled = false
     var virtualDeviceAvailable = false
+    /// Cached by `refreshStatus` (the CoreAudio / hash / TCC checks are too costly per render).
+    var needsDriverInstall = false
+    var installedDriverVersion: String?
+    var micPermission: MicPermission = .undetermined
+    /// Non-nil while an install/uninstall runs behind the admin prompt.
+    var driverOperation: DriverOperation?
     var localNetworkDenied = false
     var settingsTab: SettingsTab = .general
 
     @ObservationIgnored var presentWindow: () -> Void = { MainWindowController.shared.show() }
     @ObservationIgnored var notifyInvite: (String, String) -> Void = { Notifications.shared.inviteReceived(roomName: $0, from: $1) }
+    /// Blocking privileged driver work, run off the main thread. Returns false if the user cancelled.
+    @ObservationIgnored var driverWork: @Sendable (DriverOperation) throws -> Bool = { try DriverInstaller.perform($0) }
+    /// Asks before restarting coreaudiod while in a room (it interrupts the room's audio).
+    @ObservationIgnored var confirmAudioRestart: () -> Bool = {
+        let alert = NSAlert()
+        alert.messageText = "Restart audio on this Mac?"
+        alert.informativeText = "Changing the RoomMesh driver restarts macOS audio, which briefly interrupts the room's audio and any meeting on this Mac."
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+    @ObservationIgnored var devicesPresent: () -> Bool = { VirtualDeviceStatus.installed }
     @ObservationIgnored private var transport: AppleP2PTransport?
     @ObservationIgnored private var sink: CoreSink?
     @ObservationIgnored private var noticeGeneration = 0
@@ -193,12 +211,70 @@ final class AppModel {
     func setUseMyMic(_ on: Bool) { setMicEnabled(localPeerId, on) }
     func toggleMute() { isMuted.toggle(); core?.setLocalMute(muted: isMuted) }
     func metrics() -> [FfiPeerMetrics] { core?.getPeerMetrics() ?? [] }
+    /// Polled every 2 s and after driver changes; assigns only on change so views don't re-render needlessly.
     func refreshStatus() {
-        virtualDeviceAvailable = core?.virtualDeviceAvailable() ?? false
+        let available = core?.virtualDeviceAvailable() ?? false
+        if available != virtualDeviceAvailable { virtualDeviceAvailable = available }
+        let mic = Permissions.microphone
+        if mic != micPermission { micPermission = mic }
         let installed = VirtualDeviceStatus.installed
+        let needs = DriverInstaller.needsInstall(bundled: DriverInstaller.bundledDriverURL,
+                                                 installed: VirtualDeviceStatus.installedDriverURL, devicesPresent: installed)
+        if needs != needsDriverInstall { needsDriverInstall = needs }
+        let version = VirtualDeviceStatus.installedVersion
+        if version != installedDriverVersion { installedDriverVersion = version }
         if installed != driverInstalled {
             driverInstalled = installed
             core?.setLocalInfo(name: Host.current().localizedName ?? "Mac", driverInstalled: installed)
+        }
+    }
+
+    // MARK: driver install / uninstall
+    func installDriver() { runDriverOperation(.install) }
+    func uninstallDriver() { runDriverOperation(.uninstall) }
+
+    private func runDriverOperation(_ op: DriverOperation) {
+        guard driverOperation == nil else { return }
+        if inRoom, !confirmAudioRestart() { return }
+        driverOperation = op
+        let work = driverWork
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try work(op) }
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.finishDriverOperation(op, result) }
+            }
+        }
+    }
+
+    private func finishDriverOperation(_ op: DriverOperation, _ result: Result<Bool, Error>) {
+        switch result {
+        case .failure(let error):
+            driverOperation = nil
+            lastError = describe(error)
+            refreshStatus()
+        case .success(false): // user dismissed the admin prompt
+            driverOperation = nil
+        case .success(true) where op == .install:
+            awaitDevices(attempt: 0)
+        case .success(true):
+            driverOperation = nil
+            refreshStatus()
+        }
+    }
+
+    /// coreaudiod takes a moment to load the plug-in: poll for the devices for ~5 s.
+    private func awaitDevices(attempt: Int) {
+        let present = devicesPresent()
+        if present || attempt >= 10 {
+            driverOperation = nil
+            refreshStatus()
+            if !present {
+                showNotice("The RoomMesh devices haven't appeared yet. Restart the Mac to finish installing the driver.", clearAfter: 20)
+            }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            MainActor.assumeIsolated { self?.awaitDevices(attempt: attempt + 1) }
         }
     }
 

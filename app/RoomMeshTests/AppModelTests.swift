@@ -18,6 +18,8 @@ final class AppModelTests: XCTestCase {
         model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
         model.presentWindow = {}
         model.notifyInvite = { _, _ in }
+        model.driverWork = { _ in XCTFail("driver work must be stubbed per test"); return false }
+        model.confirmAudioRestart = { XCTFail("unexpected confirmation"); return false }
         model.attach(core: core)
     }
 
@@ -246,5 +248,39 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.localNetworkDenied)
         fire(transport.onLocalNetworkAllowed)
         XCTAssertFalse(model.localNetworkDenied, "access granted later clears the banner")
+    }
+    // MARK: driver install/uninstall
+    /// Waits until the model has finished its background driver operation.
+    func waitForDriverOperation() {
+        let e = expectation(description: "driver operation finished")
+        Task { @MainActor [model] in
+            while model?.driverOperation != nil { try? await Task.sleep(for: .milliseconds(10)) }
+            e.fulfill()
+        }
+        wait(for: [e], timeout: 5)
+    }
+    func testDriverInstallInRoomNeedsConfirmation() {
+        model.apply(.roomChanged(state: sampleRoom()))
+        var asked = 0
+        model.confirmAudioRestart = { asked += 1; return false }
+        model.driverWork = { _ in XCTFail("declined: must not run"); return true }
+        model.installDriver()
+        XCTAssertEqual(asked, 1)
+        XCTAssertNil(model.driverOperation)
+    }
+    func testDriverInstallCancelledByUserIsSilent() {
+        model.driverWork = { op in XCTAssertEqual(op, .install); return false } // osascript -128
+        model.installDriver()
+        XCTAssertEqual(model.driverOperation, .install, "busy while the admin prompt is up")
+        model.installDriver() // ignored while busy
+        waitForDriverOperation()
+        XCTAssertNil(model.lastError)
+        XCTAssertNil(model.notice)
+    }
+    func testDriverUninstallFailureSurfacesMessage() {
+        model.driverWork = { _ in throw DriverInstaller.InstallError.failed("rm: denied") }
+        model.uninstallDriver()
+        waitForDriverOperation()
+        XCTAssertEqual(model.lastError, "rm: denied")
     }
 }

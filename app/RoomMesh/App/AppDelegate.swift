@@ -12,11 +12,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Notifications.shared.onInviteAction = { accept in Task { @MainActor in AppModel.shared.respondToInvite(accept: accept) } }
             Notifications.shared.onOpen = { Task { @MainActor in MainWindowController.shared.show() } }
             model.bootstrap(driverInstalled: VirtualDeviceStatus.installed)
+            model.refreshStatus()
             if Permissions.microphone == .undetermined { Task { _ = await Permissions.requestMicrophone() } }
             if model.settings.showWindowAtLaunch && !Self.launchedAsLoginItem { MainWindowController.shared.show() }
-            statusTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-                Task { @MainActor in AppModel.shared.refreshStatus() }
+            // .common mode: keep polling while a menu is open or a control is tracking.
+            let timer = Timer(timeInterval: 2, repeats: true) { _ in
+                MainActor.assumeIsolated { AppModel.shared.refreshStatus() }
             }
+            RunLoop.main.add(timer, forMode: .common)
+            statusTimer = timer
         }
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

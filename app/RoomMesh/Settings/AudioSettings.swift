@@ -23,20 +23,23 @@ struct AudioSettingsView: View {
                 Toggle("If the room speaker disconnects, use the coordinator Mac", isOn: $settings.fallbackSpeakerToCoordinator)
             }
             Section("RoomMesh audio driver") {
-                LabeledContent("Status", value: VirtualDeviceStatus.installed
-                               ? "Installed (\(VirtualDeviceStatus.installedVersion ?? "unknown version"))" : "Not installed")
+                LabeledContent("Status", value: model.driverOperation?.progressLabel
+                               ?? (model.driverInstalled ? "Installed (\(model.installedDriverVersion ?? "unknown version"))" : "Not installed"))
                 LabeledContent("Meeting app setup", value: "Microphone: RoomMesh Microphone · Speaker: RoomMesh Speaker")
                 HStack {
-                    Button(VirtualDeviceStatus.installed ? "Reinstall…" : "Install…") {
-                        do { try DriverInstaller.install() } catch { model.lastError = describe(error) }
+                    Button(model.driverInstalled ? "Reinstall…" : "Install…") { model.installDriver() }
+                    if model.driverInstalled {
+                        Button("Uninstall…") { model.uninstallDriver() }
                     }
-                    if VirtualDeviceStatus.installed {
-                        Button("Uninstall…") { do { try DriverInstaller.uninstall() } catch { model.lastError = describe(error) } }
-                    }
+                    if model.driverOperation != nil { ProgressView().controlSize(.small) }
+                }
+                .disabled(model.driverOperation != nil)
+                if let err = model.lastError {
+                    Text(err).font(.caption).foregroundStyle(.red)
                 }
             }
         }
         .formStyle(.grouped)
-        .onAppear { devices = listAudioDevices() }
+        .onAppear { devices = listAudioDevices(); model.refreshStatus() }
     }
 }
