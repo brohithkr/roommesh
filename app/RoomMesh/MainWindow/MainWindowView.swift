@@ -14,12 +14,15 @@ struct MainWindowView: View {
         .frame(width: 380)
         .frame(minHeight: 480)
         .sheet(item: $model.activeSheet) { sheet in
-            switch sheet {
-            case .incomingInvite(let invite): IncomingInviteView(invite: invite)
-            case .coordinatorLost(let c): FailurePromptView(kind: .coordinator, candidates: c)
-            case .speakerLost(let c): FailurePromptView(kind: .speaker, candidates: c)
-            case .invite: InviteSheet()
+            Group {
+                switch sheet {
+                case .incomingInvite(let invite): IncomingInviteView(invite: invite)
+                case .coordinatorLost(let c): FailurePromptView(kind: .coordinator, candidates: c)
+                case .speakerLost(let c): FailurePromptView(kind: .speaker, candidates: c)
+                case .invite: InviteSheet()
+                }
             }
+            .onAppear { model.sheetDidPresent(sheet) }
         }
     }
 }

@@ -48,8 +48,13 @@ final class SettingsStore {
                     fallbackSpeakerToCoordinator: fallbackSpeakerToCoordinator)
     }
 
+    /// Peer ids are 16 lowercase hex characters (what `generatePeerId()` produces and the core accepts).
+    nonisolated static func isValidPeerId(_ id: String) -> Bool {
+        id.utf8.count == 16 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
     func peerId() -> String {
-        if let id = d.string(forKey: "peerId"), id.count == 16 { return id }
+        if let id = d.string(forKey: "peerId"), Self.isValidPeerId(id) { return id }
         let id = generatePeerId()
         d.set(id, forKey: "peerId")
         return id

@@ -2,7 +2,6 @@ import SwiftUI
 
 struct InviteSheet: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
     @State private var invited: Set<String> = []
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -25,7 +24,7 @@ struct InviteSheet: View {
                         .disabled(invited.contains(p.id))
                 }
             }
-            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+            HStack { Spacer(); Button("Done") { model.dismiss(.invite) }.keyboardShortcut(.defaultAction) }
         }
         .padding(20)
         .frame(width: 360)

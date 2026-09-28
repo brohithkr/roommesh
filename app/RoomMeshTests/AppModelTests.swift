@@ -5,13 +5,25 @@ import XCTest
 final class AppModelTests: XCTestCase {
     var core: FakeCore!
     var model: AppModel!
+    private var suites: [String] = []
+
+    /// A fresh preferences suite, removed again in tearDown.
+    func makeDefaults(_ name: String = "test.\(UUID())") -> UserDefaults {
+        if !suites.contains(name) { suites.append(name) }
+        return UserDefaults(suiteName: name)!
+    }
 
     override func setUp() async throws {
         core = FakeCore()
-        model = AppModel(settings: SettingsStore(defaults: UserDefaults(suiteName: "test.\(UUID())")!))
+        model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
         model.presentWindow = {}
         model.notifyInvite = { _, _ in }
         model.attach(core: core)
+    }
+
+    override func tearDown() async throws {
+        for name in suites { UserDefaults.standard.removePersistentDomain(forName: name) }
+        suites = []
     }
 
     func testDerivedRoomInfo() {
@@ -60,7 +72,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.lastError, "not in a room")
     }
     func testSettingsMapToFfi() {
-        let s = SettingsStore(defaults: UserDefaults(suiteName: "test.\(UUID())")!)
+        let s = SettingsStore(defaults: makeDefaults())
         XCTAssertEqual(s.ffi.micLatencyMs, 70, "matches the core default")
         s.allowSimultaneousTalkers = true
         s.micLatencyMs = 90
@@ -68,17 +80,38 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(s.ffi.micLatencyMs, 90)
         XCTAssertEqual(s.peerId(), s.peerId(), "peer id is persisted")
     }
-    func testEventRelayPreservesOrderAcrossThreads() {
-        model.apply(.roomChanged(state: sampleRoom()))
+    func testEventRelayPreservesPerThreadOrder() {
+        // Several "Rust threads" each emit a numbered sequence; every thread's events must be applied
+        // in emission order. Per-event `Task { @MainActor }` hops reorder these; the main queue does not.
+        let threads = 4, perThread = 300
+        var applied: [Int: [Int]] = [:]
+        let done = expectation(description: "all events applied")
+        var count = 0
+        let relay = EventRelay { event in
+            guard case .error(let m) = event else { return }
+            let parts = m.split(separator: ":").compactMap { Int($0) }
+            applied[parts[0], default: []].append(parts[1])
+            count += 1
+            if count == threads * perThread { done.fulfill() }
+        }
+        for t in 0..<threads {
+            Thread.detachNewThread {
+                for i in 0..<perThread { relay.onEvent(event: .error(message: "\(t):\(i)")) }
+            }
+        }
+        wait(for: [done], timeout: 10)
+        for t in 0..<threads { XCTAssertEqual(applied[t], Array(0..<perThread), "thread \(t) events reordered") }
+    }
+    func testEventRelayDeliversToModel() {
         let relay = EventRelay(model: model)
         let done = expectation(description: "relayed")
         DispatchQueue.global().async {
-            relay.onEvent(event: .leftRoom)
             relay.onEvent(event: .roomChanged(state: sampleRoom()))
+            relay.onEvent(event: .leftRoom)
             DispatchQueue.main.async { done.fulfill() }
         }
         wait(for: [done], timeout: 2)
-        XCTAssertEqual(model.room?.roomId, "00000000000000ff", "roomChanged must be applied after leftRoom")
+        XCTAssertNil(model.room, "leftRoom must be applied after roomChanged")
     }
     func testNoticeIsTransientAndClearsError() {
         model.lastError = "old"
@@ -95,5 +128,123 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(MenuBarIcon.symbol(for: .connected), "mic.circle.fill")
         XCTAssertEqual(MenuBarIcon.symbol(for: .muted), "mic.slash.circle.fill")
         XCTAssertEqual(MenuBarIcon.symbol(for: .warning), "exclamationmark.circle.fill")
+    }
+    // MARK: sheet dismissal
+    func testStaleDismissDoesNotDeclineANewInvite() {
+        model.apply(.coordinatorLost(candidates: ["000000000000000b"]))
+        model.sheetDidPresent(model.activeSheet!)
+        // An invite arrives while SwiftUI is dismissing the coordinator prompt.
+        model.apply(.inviteReceived(roomId: "00000000000000ff", roomName: "R", fromPeer: "000000000000000b", fromName: "Amaan", sas: "123 456"))
+        model.activeSheet = nil
+        XCTAssertFalse(core.calls.contains { $0.hasPrefix("respond:") }, "the invite must not be auto-declined")
+        guard case .incomingInvite = model.activeSheet else { return XCTFail("invite must still be shown") }
+    }
+    func testStaleDismissAfterRespondKeepsQueuedPrompt() {
+        model.apply(.inviteReceived(roomId: "00000000000000ff", roomName: "R", fromPeer: "000000000000000b", fromName: "Amaan", sas: "123 456"))
+        model.apply(.speakerLost(candidates: ["000000000000000a"]))
+        model.sheetDidPresent(model.activeSheet!)
+        model.respondToInvite(accept: true)
+        model.activeSheet = nil // the invite sheet's own dismissal
+        guard case .speakerLost = model.activeSheet else { return XCTFail("queued speaker prompt must survive") }
+    }
+    func testDismissingThePresentedSheetClearsIt() {
+        model.apply(.inviteReceived(roomId: "00000000000000ff", roomName: "R", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        model.sheetDidPresent(model.activeSheet!)
+        model.activeSheet = nil
+        XCTAssertEqual(core.calls.last, "respond:00000000000000ff:false", "closing the invite declines it")
+        model.apply(.coordinatorLost(candidates: []))
+        model.sheetDidPresent(model.activeSheet!)
+        model.activeSheet = nil
+        XCTAssertNil(model.activeSheet)
+    }
+    func testExplicitDismissOnlyClearsTheNamedSheet() {
+        model.showInviteSheet = true
+        model.apply(.speakerLost(candidates: ["000000000000000a"]))
+        model.dismiss(.invite)
+        XCTAssertFalse(model.showInviteSheet)
+        guard case .speakerLost = model.activeSheet else { return XCTFail("speaker prompt untouched") }
+    }
+
+    // MARK: priority, icon, health
+    func testCoordinatorLostOutranksSpeakerLost() {
+        model.apply(.speakerLost(candidates: ["000000000000000a"]))
+        model.apply(.coordinatorLost(candidates: ["000000000000000b"]))
+        guard case .coordinatorLost = model.activeSheet else { return XCTFail("coordinator prompt first") }
+        model.setCoordinator("000000000000000b")
+        guard case .speakerLost = model.activeSheet else { return XCTFail("speaker prompt next") }
+    }
+    func testWarningIconWhileCoordinatorLost() {
+        model.apply(.roomChanged(state: sampleRoom()))
+        model.apply(.coordinatorLost(candidates: ["000000000000000b"]))
+        XCTAssertEqual(model.iconState, .warning)
+    }
+    func testHealthGood() {
+        model.apply(.roomChanged(state: sampleRoom()))
+        model.apply(.connectionQualityChanged(peerId: "000000000000000b", quality: .excellent))
+        model.apply(.connectionQualityChanged(peerId: "000000000000000c", quality: .good))
+        XCTAssertEqual(model.health, .good)
+        XCTAssertEqual(model.iconState, .connected)
+    }
+    func testHealthIgnoresOfflineMembers() {
+        model.apply(.roomChanged(state: sampleRoom()))
+        model.apply(.connectionQualityChanged(peerId: "000000000000000d", quality: .disconnected)) // Puyan is offline
+        XCTAssertEqual(model.health, .excellent)
+    }
+    func testLeftRoomResetsRoomScopedState() {
+        model.apply(.roomChanged(state: sampleRoom()))
+        model.showInviteSheet = true
+        model.apply(.aecStatusChanged(converged: true))
+        model.apply(.leftRoom)
+        XCTAssertFalse(model.showInviteSheet)
+        XCTAssertFalse(model.aecConverged)
+        XCTAssertNil(model.activeSheet)
+    }
+
+    // MARK: settings
+    func testSettingsPersistAcrossInstances() {
+        let name = "test.\(UUID())"
+        let a = SettingsStore(defaults: makeDefaults(name))
+        a.inputDevice = "USB Mic"
+        a.echoCancellation = false
+        a.micLatencyMs = 120
+        a.fallbackSpeakerToCoordinator = true
+        let id = a.peerId()
+        let b = SettingsStore(defaults: makeDefaults(name))
+        XCTAssertEqual(b.inputDevice, "USB Mic")
+        XCTAssertFalse(b.echoCancellation)
+        XCTAssertEqual(b.micLatencyMs, 120)
+        XCTAssertTrue(b.fallbackSpeakerToCoordinator)
+        XCTAssertEqual(b.peerId(), id)
+    }
+    func testInvalidStoredPeerIdIsRegenerated() {
+        let d = makeDefaults()
+        for bad in ["ZZZZZZZZZZZZZZZZ", "00ABCDEF01234567", "short", "00abcdef012345678"] {
+            d.set(bad, forKey: "peerId")
+            let id = SettingsStore(defaults: d).peerId()
+            XCTAssertNotEqual(id, bad)
+            XCTAssertTrue(SettingsStore.isValidPeerId(id), "\(id) is not 16 lowercase hex")
+            XCTAssertEqual(d.string(forKey: "peerId"), id, "regenerated id is persisted")
+        }
+        d.set("00abcdef01234567", forKey: "peerId")
+        XCTAssertEqual(SettingsStore(defaults: d).peerId(), "00abcdef01234567")
+    }
+    func testChangingASettingPushesItToTheCore() {
+        model.settings.noiseSuppression = false
+        XCTAssertEqual(core.calls.last, "settings")
+    }
+    // MARK: transport permission callbacks
+    func testLocalNetworkDeniedThenAllowed() {
+        let transport = AppleP2PTransport() // never started: no network
+        model.observe(transport: transport)
+        /// Fires a transport callback off-main (as Network.framework does), then waits until its main hop ran.
+        func fire(_ callback: (@Sendable () -> Void)?) {
+            let e = expectation(description: "callback applied")
+            DispatchQueue.global().async { callback?(); DispatchQueue.main.async { e.fulfill() } }
+            wait(for: [e], timeout: 2)
+        }
+        fire(transport.onLocalNetworkDenied)
+        XCTAssertTrue(model.localNetworkDenied)
+        fire(transport.onLocalNetworkAllowed)
+        XCTAssertFalse(model.localNetworkDenied, "access granted later clears the banner")
     }
 }

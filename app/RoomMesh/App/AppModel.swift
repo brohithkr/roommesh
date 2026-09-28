@@ -57,6 +57,8 @@ final class AppModel {
     @ObservationIgnored private var transport: AppleP2PTransport?
     @ObservationIgnored private var sink: CoreSink?
     @ObservationIgnored private var noticeGeneration = 0
+    /// Id of the sheet SwiftUI last presented (see `sheetDidPresent`).
+    @ObservationIgnored private(set) var presentedSheetID: String?
 
     /// `nil` → the app's persisted settings. (A `SettingsStore(...)` default argument would be
     /// evaluated outside the main actor.)
@@ -72,10 +74,7 @@ final class AppModel {
                                         listener: EventRelay(model: self), settings: settings.ffi)
             let sink = CoreSink(core: core)
             transport.sink = sink
-            transport.onLocalNetworkDenied = { [weak self] in
-                DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.localNetworkDenied = true } }
-            }
-            settings.onChange = { [weak self] in guard let self else { return }; self.core?.updateSettings(settings: self.settings.ffi) }
+            observe(transport: transport)
             self.transport = transport
             self.sink = sink
             attach(core: core)
@@ -90,6 +89,17 @@ final class AppModel {
     func attach(core: any RoomMeshCoreProtocol) {
         self.core = core
         localPeerId = core.localPeerId()
+        settings.onChange = { [weak self] in guard let self else { return }; self.core?.updateSettings(settings: self.settings.ffi) }
+    }
+
+    /// Local-network permission signals from the transport (delivered off-main).
+    func observe(transport: AppleP2PTransport) {
+        transport.onLocalNetworkDenied = { [weak self] in
+            DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.localNetworkDenied = true } }
+        }
+        transport.onLocalNetworkAllowed = { [weak self] in
+            DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.localNetworkDenied = false } }
+        }
     }
 
     func shutdown() {
@@ -116,7 +126,7 @@ final class AppModel {
     var invitableNearby: [FfiNearbyPeer] { nearby.filter { !$0.inMyRoom } }
 
     var health: RoomHealth {
-        let ids = Set(room?.members.map(\.id) ?? [])
+        let ids = Set(room?.members.filter(\.online).map(\.id) ?? [])
         let qs = qualities.filter { ids.contains($0.key) }.values
         if qs.contains(.degraded) || qs.contains(.disconnected) { return .degraded }
         if qs.contains(.good) { return .good }
@@ -137,14 +147,26 @@ final class AppModel {
             return showInviteSheet ? .invite : nil
         }
         set {
-            guard newValue == nil else { return }
-            switch activeSheet {
-            case .incomingInvite: respondToInvite(accept: false)
-            case .coordinatorLost: coordinatorLostCandidates = nil
-            case .speakerLost: speakerLostCandidates = nil
-            case .invite: showInviteSheet = false
-            case nil: break
-            }
+            // SwiftUI writes nil when the user (or `dismiss()`) closes the presented sheet. The write
+            // carries no identity, so act only if the presented sheet is still the one the model would
+            // show; otherwise the state changed underneath (a new invite, a queued prompt) and the
+            // write is stale.
+            guard newValue == nil, let current = activeSheet, current.id == presentedSheetID else { return }
+            dismiss(current)
+        }
+    }
+
+    /// Called by the sheet content when it appears, so a later nil write can be matched to it.
+    func sheetDidPresent(_ sheet: ActiveSheet) { presentedSheetID = sheet.id }
+
+    /// Closes exactly `sheet` (closing an invite declines it); other pending sheets are untouched.
+    func dismiss(_ sheet: ActiveSheet) {
+        if presentedSheetID == sheet.id { presentedSheetID = nil }
+        switch sheet {
+        case .incomingInvite(let i): if incomingInvite?.id == i.id { respondToInvite(accept: false) }
+        case .coordinatorLost: coordinatorLostCandidates = nil
+        case .speakerLost: speakerLostCandidates = nil
+        case .invite: showInviteSheet = false
         }
     }
 
@@ -211,7 +233,9 @@ final class AppModel {
         case .speakerChanged(let p): if p != nil { speakerLostCandidates = nil }
         case .connectionQualityChanged(let p, let q): qualities[p] = q
         case .aecStatusChanged(let c): aecConverged = c
-        case .leftRoom: room = nil; coordinatorLostCandidates = nil; speakerLostCandidates = nil; qualities = [:]
+        case .leftRoom:
+            room = nil; coordinatorLostCandidates = nil; speakerLostCandidates = nil; qualities = [:]
+            showInviteSheet = false; aecConverged = false
         case .error(let m): lastError = m
         case .notice(let m): showNotice(m)
         case .peerJoined, .peerLeft, .activeMicChanged: break // reflected by the following .roomChanged
