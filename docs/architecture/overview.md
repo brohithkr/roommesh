@@ -1,3 +1,25 @@
+> **Note: this is the original architecture, kept verbatim below.** RoomMesh implements it with
+> the amendments agreed in the implementation plan
+> ([`docs/superpowers/plans/2026-09-28-roommesh.md`](../superpowers/plans/2026-09-28-roommesh.md),
+> "Decisions & amendments"). Where the two differ, the amendments win. The main ones:
+>
+> - **Naming:** the product is **RoomMesh** (bundle id `io.github.brohithkr.RoomMesh`), with virtual
+>   devices **RoomMesh Microphone** and **RoomMesh Speaker**.
+> - **Everyone joins the meeting:** every Mac in the room joins Meet/Zoom with the RoomMesh
+>   devices selected. The app's role (coordinator, room speaker, or neither) decides what those
+>   devices actually carry, so a role change never touches the meeting app's settings.
+> - **Shared-memory driver:** a single libASPL AudioServerPlugIn exchanges audio with the app
+>   through a POSIX shared-memory region (`/roommesh.v1`) holding a mic ring and a speaker ring.
+>   No privileged daemon is involved.
+> - **Security added:** each connection runs an X25519 handshake, then ChaCha20-Poly1305 for
+>   control and realtime traffic. Invites show a 6-digit SAS code on both Macs. See
+>   [`docs/security.md`](../security.md).
+> - **Automatic failover:** coordinator failover elects a new coordinator automatically by
+>   default. A setting switches back to the manual "Select new coordinator" prompt. A failed
+>   room speaker always prompts.
+
+---
+
 # Distributed Room Audio — Final Architecture
 
 ## 1. Product Model
