@@ -1,37 +1,67 @@
 //! Equal-power fade gains (sin curve) and linear ramps used for mic transitions.
 use std::f32::consts::FRAC_PI_2;
 
-pub struct FadeGain { pos: f32, target: f32, step: f32 }
+pub struct FadeGain {
+    pos: f32,
+    target: f32,
+    step: f32,
+}
 
 impl FadeGain {
     pub fn new(fade_samples: usize, initially_on: bool) -> Self {
         let p = if initially_on { 1.0 } else { 0.0 };
-        Self { pos: p, target: p, step: 1.0 / fade_samples.max(1) as f32 }
+        Self {
+            pos: p,
+            target: p,
+            step: 1.0 / fade_samples.max(1) as f32,
+        }
     }
-    pub fn set_on(&mut self, on: bool) { self.target = if on { 1.0 } else { 0.0 }; }
-    pub fn is_on(&self) -> bool { self.target > 0.5 }
-    pub fn is_silent(&self) -> bool { self.pos == 0.0 && self.target == 0.0 }
+    pub fn set_on(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+    pub fn is_on(&self) -> bool {
+        self.target > 0.5
+    }
+    pub fn is_silent(&self) -> bool {
+        self.pos == 0.0 && self.target == 0.0
+    }
     #[inline]
     #[allow(clippy::should_implement_trait)] // `next()` is this plan's public API name, not an Iterator.
     pub fn next(&mut self) -> f32 {
-        if self.pos < self.target { self.pos = (self.pos + self.step).min(self.target); }
-        else if self.pos > self.target { self.pos = (self.pos - self.step).max(self.target); }
+        if self.pos < self.target {
+            self.pos = (self.pos + self.step).min(self.target);
+        } else if self.pos > self.target {
+            self.pos = (self.pos - self.step).max(self.target);
+        }
         (self.pos * FRAC_PI_2).sin()
     }
 }
 
-pub struct LinearRamp { value: f32, target: f32, step: f32 }
+pub struct LinearRamp {
+    value: f32,
+    target: f32,
+    step: f32,
+}
 
 impl LinearRamp {
     pub fn new(initial: f32, ramp_samples: usize) -> Self {
-        Self { value: initial, target: initial, step: 1.0 / ramp_samples.max(1) as f32 }
+        Self {
+            value: initial,
+            target: initial,
+            step: 1.0 / ramp_samples.max(1) as f32,
+        }
     }
-    pub fn set_target(&mut self, t: f32) { self.target = t; }
+    pub fn set_target(&mut self, t: f32) {
+        self.target = t;
+    }
     #[inline]
     #[allow(clippy::should_implement_trait)] // `next()` is this plan's public API name, not an Iterator.
     pub fn next(&mut self) -> f32 {
-        if self.value < self.target { self.value = (self.value + self.step).min(self.target); }
-        else if self.value > self.target { self.value = (self.value - self.step).max(self.target); }
+        if self.value < self.target {
+            self.value = (self.value + self.step).min(self.target);
+        } else if self.value > self.target {
+            self.value = (self.value - self.step).max(self.target);
+        }
         self.value
     }
 }

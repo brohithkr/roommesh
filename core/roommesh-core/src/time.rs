@@ -79,7 +79,9 @@ impl LinearFit {
     }
 
     pub fn push(&mut self, x: f64, y: f64) {
-        if !x.is_finite() || !y.is_finite() { return; }
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         if self.points.len() == self.capacity {
             self.points.pop_front();
         }
@@ -114,7 +116,11 @@ impl LinearFit {
             sxx += dx * dx;
             sxy += dx * dy;
         }
-        let raw = if sxx > 0.0 { sxy / sxx } else { self.nominal_slope };
+        let raw = if sxx > 0.0 {
+            sxy / sxx
+        } else {
+            self.nominal_slope
+        };
         let a = self.nominal_slope * (1.0 - self.max_dev);
         let b = self.nominal_slope * (1.0 + self.max_dev);
         self.slope = raw.clamp(a.min(b), a.max(b));

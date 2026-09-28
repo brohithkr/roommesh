@@ -74,6 +74,10 @@ mod tests {
         assert_eq!(offset_of!(SharedHeader, generation), 16);
         assert_eq!(offset_of!(SharedHeader, app_heartbeat_ns), 32);
         assert_eq!(offset_of!(SharedHeader, mic_clients), 40);
-        assert_eq!(offset_of!(RingHeader, seq), 32, "occupies the original reserved[0] slot");
+        assert_eq!(
+            offset_of!(RingHeader, seq),
+            32,
+            "occupies the original reserved[0] slot"
+        );
     }
 }

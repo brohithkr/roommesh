@@ -15,7 +15,11 @@ pub struct AudioFrame {
 
 impl AudioFrame {
     pub fn silent(sample_index: u64, timestamp_ns: u64) -> Self {
-        Self { sample_index, timestamp_ns, samples: vec![0.0; FRAME_SAMPLES] }
+        Self {
+            sample_index,
+            timestamp_ns,
+            samples: vec![0.0; FRAME_SAMPLES],
+        }
     }
 }
 
@@ -24,7 +28,10 @@ mod tests {
     use super::*;
     #[test]
     fn frame_constants_consistent() {
-        assert_eq!(FRAME_SAMPLES as u64 * 1_000_000_000 / SAMPLE_RATE as u64, FRAME_NS);
+        assert_eq!(
+            FRAME_SAMPLES as u64 * 1_000_000_000 / SAMPLE_RATE as u64,
+            FRAME_NS
+        );
         assert_eq!(AudioFrame::silent(0, 0).samples.len(), FRAME_SAMPLES);
     }
 }

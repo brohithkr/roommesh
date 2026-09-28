@@ -31,7 +31,11 @@ pub struct Vad {
     speech: bool,
 }
 
-impl Default for Vad { fn default() -> Self { Self::new() } }
+impl Default for Vad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Vad {
     pub fn new() -> Self {
@@ -39,8 +43,21 @@ impl Vad {
         let input = fft.make_input_vec();
         let spectrum = fft.make_output_vec();
         let power = vec![0.0f32; spectrum.len()];
-        let window = (0..480).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / 479.0).cos()).collect();
-        Self { fft, window, input, spectrum, power, noise_floor_db: -60.0, prob: 0.0, hangover: 0, frames: 0, speech: false }
+        let window = (0..480)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / 479.0).cos())
+            .collect();
+        Self {
+            fft,
+            window,
+            input,
+            spectrum,
+            power,
+            noise_floor_db: -60.0,
+            prob: 0.0,
+            hangover: 0,
+            frames: 0,
+            speech: false,
+        }
     }
 
     pub fn process(&mut self, frame: &[f32]) -> VadResult {
@@ -51,12 +68,18 @@ impl Vad {
             // glitching source doesn't get stuck reporting "speaking" forever. Never touch the
             // noise floor estimate, though -- it has nothing sane to learn from this frame.
             self.prob *= 0.6;
-            if !self.prob.is_finite() { self.prob = 0.0; }
+            if !self.prob.is_finite() {
+                self.prob = 0.0;
+            }
             if self.prob > 0.6 {
                 self.speech = true;
                 self.hangover = 15;
             } else if self.prob < 0.4 {
-                if self.hangover > 0 { self.hangover -= 1; } else { self.speech = false; }
+                if self.hangover > 0 {
+                    self.hangover -= 1;
+                } else {
+                    self.speech = false;
+                }
             }
             return VadResult {
                 speech_prob: self.prob,
@@ -67,13 +90,19 @@ impl Vad {
             };
         }
         for (i, x) in self.input.iter_mut().enumerate() {
-            *x = if i < frame.len() && i < 480 { frame[i] * self.window[i] } else { 0.0 };
+            *x = if i < frame.len() && i < 480 {
+                frame[i] * self.window[i]
+            } else {
+                0.0
+            };
         }
         let _ = self.fft.process(&mut self.input, &mut self.spectrum);
         let lo = (300.0 / BIN_HZ) as usize;
         let voice_hi = (3400.0 / BIN_HZ) as usize;
         let flat_hi = (4000.0 / BIN_HZ) as usize;
-        for (p, c) in self.power.iter_mut().zip(self.spectrum.iter()) { *p = c.norm_sqr() + 1e-12; }
+        for (p, c) in self.power.iter_mut().zip(self.spectrum.iter()) {
+            *p = c.norm_sqr() + 1e-12;
+        }
         let power = &self.power;
         let band = &power[lo..=flat_hi];
         let geo = (band.iter().map(|p| p.ln()).sum::<f32>() / band.len() as f32).exp();
@@ -94,18 +123,32 @@ impl Vad {
         let snr_db = level_db - self.noise_floor_db;
 
         let mut logit = 0.4 * (snr_db - 8.0) + 6.0 * (0.35 - flatness) + 3.0 * (band_ratio - 0.5);
-        if level_db < -75.0 { logit = -10.0; }
+        if level_db < -75.0 {
+            logit = -10.0;
+        }
         let inst = 1.0 / (1.0 + (-logit).exp());
         self.prob = 0.6 * self.prob + 0.4 * inst;
-        if !self.prob.is_finite() { self.prob = 0.0; }
+        if !self.prob.is_finite() {
+            self.prob = 0.0;
+        }
         if self.prob > 0.6 {
             self.speech = true;
             self.hangover = 15;
         } else if self.prob < 0.4 {
-            if self.hangover > 0 { self.hangover -= 1; } else { self.speech = false; }
+            if self.hangover > 0 {
+                self.hangover -= 1;
+            } else {
+                self.speech = false;
+            }
         }
         self.frames += 1;
-        VadResult { speech_prob: self.prob, is_speech: self.speech, level_db, noise_floor_db: self.noise_floor_db, snr_db }
+        VadResult {
+            speech_prob: self.prob,
+            is_speech: self.speech,
+            level_db,
+            noise_floor_db: self.noise_floor_db,
+            snr_db,
+        }
     }
 }
 
@@ -113,46 +156,75 @@ impl Vad {
 mod tests {
     use super::*;
     struct Rng(u64);
-    impl Rng { fn uni(&mut self) -> f32 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; (self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0 } }
-    fn amp(db: f32) -> f32 { 10f32.powf(db / 20.0) * 3f32.sqrt() }
-    fn noise(rng: &mut Rng, db: f32) -> Vec<f32> { (0..480).map(|_| rng.uni() * amp(db)).collect() }
+    impl Rng {
+        fn uni(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+    }
+    fn amp(db: f32) -> f32 {
+        10f32.powf(db / 20.0) * 3f32.sqrt()
+    }
+    fn noise(rng: &mut Rng, db: f32) -> Vec<f32> {
+        (0..480).map(|_| rng.uni() * amp(db)).collect()
+    }
     fn voiced(frame: usize, rng: &mut Rng, noise_db: f32) -> Vec<f32> {
-        (0..480).map(|k| {
-            let t = (frame * 480 + k) as f32 / 48_000.0;
-            let env = 0.55 + 0.45 * (2.0 * std::f32::consts::PI * 4.0 * t).sin();
-            let v: f32 = (1..=10).map(|h| (2.0 * std::f32::consts::PI * 140.0 * h as f32 * t).sin() / h as f32).sum();
-            0.08 * env * v + rng.uni() * amp(noise_db)
-        }).collect()
+        (0..480)
+            .map(|k| {
+                let t = (frame * 480 + k) as f32 / 48_000.0;
+                let env = 0.55 + 0.45 * (2.0 * std::f32::consts::PI * 4.0 * t).sin();
+                let v: f32 = (1..=10)
+                    .map(|h| (2.0 * std::f32::consts::PI * 140.0 * h as f32 * t).sin() / h as f32)
+                    .sum();
+                0.08 * env * v + rng.uni() * amp(noise_db)
+            })
+            .collect()
     }
     #[test]
     fn silence_is_not_speech() {
         let mut v = Vad::new();
-        for _ in 0..100 { let r = v.process(&[0.0; 480]); assert!(r.speech_prob.is_finite()); assert!(!r.is_speech); }
+        for _ in 0..100 {
+            let r = v.process(&[0.0; 480]);
+            assert!(r.speech_prob.is_finite());
+            assert!(!r.is_speech);
+        }
     }
     #[test]
     fn stationary_noise_is_not_speech() {
         let mut v = Vad::new();
         let mut rng = Rng(42);
-        let res: Vec<VadResult> = (0..200).map(|_| v.process(&noise(&mut rng, -40.0))).collect();
+        let res: Vec<VadResult> = (0..200)
+            .map(|_| v.process(&noise(&mut rng, -40.0)))
+            .collect();
         assert_eq!(res[100..].iter().filter(|r| r.is_speech).count(), 0);
     }
     #[test]
     fn voiced_signal_detected_then_released() {
         let mut v = Vad::new();
         let mut rng = Rng(7);
-        for _ in 0..100 { v.process(&noise(&mut rng, -50.0)); }
-        let speech: Vec<VadResult> = (0..100).map(|f| v.process(&voiced(f, &mut rng, -50.0))).collect();
+        for _ in 0..100 {
+            v.process(&noise(&mut rng, -50.0));
+        }
+        let speech: Vec<VadResult> = (0..100)
+            .map(|f| v.process(&voiced(f, &mut rng, -50.0)))
+            .collect();
         let frac = speech[10..].iter().filter(|r| r.is_speech).count() as f32 / 90.0;
         assert!(frac > 0.8, "speech fraction {frac}");
         assert!(speech[50].snr_db > 15.0);
-        let after: Vec<VadResult> = (0..100).map(|_| v.process(&noise(&mut rng, -50.0))).collect();
+        let after: Vec<VadResult> = (0..100)
+            .map(|_| v.process(&noise(&mut rng, -50.0)))
+            .collect();
         assert!(after[70..].iter().all(|r| !r.is_speech));
     }
     #[test]
     fn non_finite_frame_is_handled_without_corrupting_state() {
         let mut v = Vad::new();
         let mut rng = Rng(3);
-        for _ in 0..20 { v.process(&noise(&mut rng, -40.0)); }
+        for _ in 0..20 {
+            v.process(&noise(&mut rng, -40.0));
+        }
         let prev = v.process(&noise(&mut rng, -40.0));
         let nan_frame = vec![f32::NAN; 480];
         let r = v.process(&nan_frame);
@@ -162,7 +234,10 @@ mod tests {
         assert!(r.speech_prob <= prev.speech_prob);
         assert_eq!(r.level_db, -120.0);
         assert_eq!(r.snr_db, 0.0);
-        assert_eq!(r.noise_floor_db, prev.noise_floor_db, "must never move the noise floor");
+        assert_eq!(
+            r.noise_floor_db, prev.noise_floor_db,
+            "must never move the noise floor"
+        );
         // Subsequent normal frames still behave sanely: state was not corrupted.
         let after = v.process(&noise(&mut rng, -40.0));
         assert!(after.speech_prob.is_finite());
@@ -172,16 +247,30 @@ mod tests {
     fn non_finite_frames_decay_speech_state_without_touching_noise_floor() {
         let mut v = Vad::new();
         let mut rng = Rng(7);
-        for _ in 0..100 { v.process(&noise(&mut rng, -50.0)); }
-        let last_speech = (0..100).map(|f| v.process(&voiced(f, &mut rng, -50.0))).last().unwrap();
-        assert!(last_speech.is_speech, "should be speaking before the glitch");
+        for _ in 0..100 {
+            v.process(&noise(&mut rng, -50.0));
+        }
+        let last_speech = (0..100)
+            .map(|f| v.process(&voiced(f, &mut rng, -50.0)))
+            .last()
+            .unwrap();
+        assert!(
+            last_speech.is_speech,
+            "should be speaking before the glitch"
+        );
         let noise_floor = last_speech.noise_floor_db;
         let mut r = last_speech;
         for _ in 0..30 {
             r = v.process(&[f32::NAN; 480]);
             assert!(r.speech_prob.is_finite());
-            assert_eq!(r.noise_floor_db, noise_floor, "non-finite frames must never move the noise floor");
+            assert_eq!(
+                r.noise_floor_db, noise_floor,
+                "non-finite frames must never move the noise floor"
+            );
         }
-        assert!(!r.is_speech, "a broken source must not be reported as speaking forever");
+        assert!(
+            !r.is_speech,
+            "a broken source must not be reported as speaking forever"
+        );
     }
 }

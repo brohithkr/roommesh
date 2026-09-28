@@ -146,23 +146,61 @@ pub struct FfiSettings {
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum FfiEvent {
-    NearbyChanged { peers: Vec<FfiNearbyPeer> },
-    RoomChanged { state: Option<FfiRoomState> },
-    PeerJoined { peer_id: String, name: String },
-    PeerLeft { peer_id: String },
-    CoordinatorChanged { peer_id: String, epoch: u32 },
-    SpeakerChanged { peer_id: Option<String> },
-    ActiveMicChanged { primary: Option<String>, secondary: Option<String> },
-    InviteReceived { room_id: String, room_name: String, from_peer: String, from_name: String, sas: String },
-    InviteDeclined { peer_id: String },
-    CoordinatorLost { candidates: Vec<String> },
-    SpeakerLost { candidates: Vec<String> },
-    ConnectionQualityChanged { peer_id: String, quality: FfiQuality },
-    AecStatusChanged { converged: bool },
+    NearbyChanged {
+        peers: Vec<FfiNearbyPeer>,
+    },
+    RoomChanged {
+        state: Option<FfiRoomState>,
+    },
+    PeerJoined {
+        peer_id: String,
+        name: String,
+    },
+    PeerLeft {
+        peer_id: String,
+    },
+    CoordinatorChanged {
+        peer_id: String,
+        epoch: u32,
+    },
+    SpeakerChanged {
+        peer_id: Option<String>,
+    },
+    ActiveMicChanged {
+        primary: Option<String>,
+        secondary: Option<String>,
+    },
+    InviteReceived {
+        room_id: String,
+        room_name: String,
+        from_peer: String,
+        from_name: String,
+        sas: String,
+    },
+    InviteDeclined {
+        peer_id: String,
+    },
+    CoordinatorLost {
+        candidates: Vec<String>,
+    },
+    SpeakerLost {
+        candidates: Vec<String>,
+    },
+    ConnectionQualityChanged {
+        peer_id: String,
+        quality: FfiQuality,
+    },
+    AecStatusChanged {
+        converged: bool,
+    },
     LeftRoom,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Informational status (e.g. "Microphone recovered"); show it unobtrusively, not as an error.
-    Notice { message: String },
+    Notice {
+        message: String,
+    },
 }
 
 fn quality(x: ConnectionQuality) -> FfiQuality {
@@ -175,7 +213,13 @@ fn quality(x: ConnectionQuality) -> FfiQuality {
 }
 
 fn nearby(n: NearbyPeer) -> FfiNearbyPeer {
-    FfiNearbyPeer { id: hex(n.id), name: n.name, connected: n.connected, in_my_room: n.in_my_room, sas: n.sas }
+    FfiNearbyPeer {
+        id: hex(n.id),
+        name: n.name,
+        connected: n.connected,
+        in_my_room: n.in_my_room,
+        sas: n.sas,
+    }
 }
 
 fn room(s: RoomSnapshot) -> FfiRoomState {
@@ -230,18 +274,33 @@ fn hexes(v: Vec<PeerId>) -> Vec<String> {
 
 pub fn to_ffi_event(e: RoomEvent) -> FfiEvent {
     match e {
-        RoomEvent::NearbyChanged(v) => FfiEvent::NearbyChanged { peers: v.into_iter().map(nearby).collect() },
+        RoomEvent::NearbyChanged(v) => FfiEvent::NearbyChanged {
+            peers: v.into_iter().map(nearby).collect(),
+        },
         RoomEvent::RoomChanged(s) => FfiEvent::RoomChanged { state: s.map(room) },
-        RoomEvent::PeerJoined { peer, name } => FfiEvent::PeerJoined { peer_id: hex(peer), name },
+        RoomEvent::PeerJoined { peer, name } => FfiEvent::PeerJoined {
+            peer_id: hex(peer),
+            name,
+        },
         RoomEvent::PeerLeft { peer } => FfiEvent::PeerLeft { peer_id: hex(peer) },
-        RoomEvent::CoordinatorChanged { peer, epoch } => {
-            FfiEvent::CoordinatorChanged { peer_id: hex(peer), epoch: epoch.0 }
-        }
-        RoomEvent::SpeakerChanged { peer } => FfiEvent::SpeakerChanged { peer_id: ohex(peer) },
-        RoomEvent::ActiveMicChanged { primary, secondary } => {
-            FfiEvent::ActiveMicChanged { primary: ohex(primary), secondary: ohex(secondary) }
-        }
-        RoomEvent::InviteReceived { room_id, room_name, from, from_name, sas } => FfiEvent::InviteReceived {
+        RoomEvent::CoordinatorChanged { peer, epoch } => FfiEvent::CoordinatorChanged {
+            peer_id: hex(peer),
+            epoch: epoch.0,
+        },
+        RoomEvent::SpeakerChanged { peer } => FfiEvent::SpeakerChanged {
+            peer_id: ohex(peer),
+        },
+        RoomEvent::ActiveMicChanged { primary, secondary } => FfiEvent::ActiveMicChanged {
+            primary: ohex(primary),
+            secondary: ohex(secondary),
+        },
+        RoomEvent::InviteReceived {
+            room_id,
+            room_name,
+            from,
+            from_name,
+            sas,
+        } => FfiEvent::InviteReceived {
             room_id: room_id.to_hex(),
             room_name,
             from_peer: hex(from),
@@ -249,10 +308,17 @@ pub fn to_ffi_event(e: RoomEvent) -> FfiEvent {
             sas,
         },
         RoomEvent::InviteDeclined { peer } => FfiEvent::InviteDeclined { peer_id: hex(peer) },
-        RoomEvent::CoordinatorLost { candidates } => FfiEvent::CoordinatorLost { candidates: hexes(candidates) },
-        RoomEvent::SpeakerLost { candidates } => FfiEvent::SpeakerLost { candidates: hexes(candidates) },
+        RoomEvent::CoordinatorLost { candidates } => FfiEvent::CoordinatorLost {
+            candidates: hexes(candidates),
+        },
+        RoomEvent::SpeakerLost { candidates } => FfiEvent::SpeakerLost {
+            candidates: hexes(candidates),
+        },
         RoomEvent::ConnectionQualityChanged { peer, quality: q } => {
-            FfiEvent::ConnectionQualityChanged { peer_id: hex(peer), quality: quality(q) }
+            FfiEvent::ConnectionQualityChanged {
+                peer_id: hex(peer),
+                quality: quality(q),
+            }
         }
         RoomEvent::AecStatusChanged { converged } => FfiEvent::AecStatusChanged { converged },
         RoomEvent::LeftRoom => FfiEvent::LeftRoom,
@@ -271,7 +337,11 @@ fn selector(name: &Option<String>) -> DeviceSelector {
 /// Maps the app's settings onto the audio runtime configuration (everything not exposed in the
 /// UI keeps the runtime defaults).
 pub fn audio_settings(s: &FfiSettings) -> AudioSettings {
-    let mut a = AudioSettings { input: selector(&s.input_device), output: selector(&s.output_device), ..Default::default() };
+    let mut a = AudioSettings {
+        input: selector(&s.input_device),
+        output: selector(&s.output_device),
+        ..Default::default()
+    };
     a.coordinator.arbitration.allow_multi = s.allow_simultaneous_talkers;
     a.coordinator.use_webrtc_aec = s.echo_cancellation;
     a.coordinator.noise_suppression = s.noise_suppression;
@@ -281,7 +351,10 @@ pub fn audio_settings(s: &FfiSettings) -> AudioSettings {
 }
 
 fn capabilities(driver_installed: bool) -> Capabilities {
-    Capabilities { driver_installed, ..Capabilities::full() }
+    Capabilities {
+        driver_installed,
+        ..Capabilities::full()
+    }
 }
 
 /// Implemented in Swift by `AppleP2PTransport` (Network.framework, peer-to-peer enabled).
@@ -398,7 +471,8 @@ impl RoomMeshCore {
     // ---- transport -> core (malformed peer ids are dropped) ----
     pub fn on_peer_discovered(&self, peer_id: String, name: String) {
         if let Ok(peer) = parse_peer(&peer_id) {
-            self.core.handle_transport_event(TransportEvent::Discovered { peer, name });
+            self.core
+                .handle_transport_event(TransportEvent::Discovered { peer, name });
         }
     }
     pub fn on_peer_lost(&self, peer_id: String) {
@@ -408,17 +482,20 @@ impl RoomMeshCore {
     }
     pub fn on_connected(&self, peer_id: String) {
         if let Ok(p) = parse_peer(&peer_id) {
-            self.core.handle_transport_event(TransportEvent::Connected(p));
+            self.core
+                .handle_transport_event(TransportEvent::Connected(p));
         }
     }
     pub fn on_disconnected(&self, peer_id: String) {
         if let Ok(p) = parse_peer(&peer_id) {
-            self.core.handle_transport_event(TransportEvent::Disconnected(p));
+            self.core
+                .handle_transport_event(TransportEvent::Disconnected(p));
         }
     }
     pub fn on_control_frame(&self, peer_id: String, frame: Vec<u8>) {
         if let Ok(peer) = parse_peer(&peer_id) {
-            self.core.handle_transport_event(TransportEvent::Control { peer, frame });
+            self.core
+                .handle_transport_event(TransportEvent::Control { peer, frame });
         }
     }
     pub fn on_realtime_packet(&self, packet: Vec<u8>) {
@@ -433,23 +510,37 @@ impl RoomMeshCore {
         Ok(self.core.command(Command::Invite(parse_peer(&peer_id)?))?)
     }
     pub fn respond_to_invite(&self, room_id: String, accept: bool) -> Result<(), FfiError> {
-        Ok(self.core.command(Command::RespondToInvite { room_id: parse_room(&room_id)?, accept })?)
+        Ok(self.core.command(Command::RespondToInvite {
+            room_id: parse_room(&room_id)?,
+            accept,
+        })?)
     }
     pub fn leave_room(&self) -> Result<(), FfiError> {
         Ok(self.core.command(Command::Leave)?)
     }
     pub fn set_coordinator(&self, peer_id: String) -> Result<(), FfiError> {
-        Ok(self.core.command(Command::SetCoordinator(parse_peer(&peer_id)?))?)
+        Ok(self
+            .core
+            .command(Command::SetCoordinator(parse_peer(&peer_id)?))?)
     }
     pub fn set_speaker(&self, peer_id: Option<String>) -> Result<(), FfiError> {
         let p = peer_id.map(|s| parse_peer(&s)).transpose()?;
         Ok(self.core.command(Command::SetSpeaker(p))?)
     }
-    pub fn set_peer_microphone_enabled(&self, peer_id: String, enabled: bool) -> Result<(), FfiError> {
-        Ok(self.core.command(Command::SetMicEnabled { peer: parse_peer(&peer_id)?, enabled })?)
+    pub fn set_peer_microphone_enabled(
+        &self,
+        peer_id: String,
+        enabled: bool,
+    ) -> Result<(), FfiError> {
+        Ok(self.core.command(Command::SetMicEnabled {
+            peer: parse_peer(&peer_id)?,
+            enabled,
+        })?)
     }
     pub fn remove_member(&self, peer_id: String) -> Result<(), FfiError> {
-        Ok(self.core.command(Command::RemoveMember(parse_peer(&peer_id)?))?)
+        Ok(self
+            .core
+            .command(Command::RemoveMember(parse_peer(&peer_id)?))?)
     }
     pub fn rename_room(&self, name: String) -> Result<(), FfiError> {
         Ok(self.core.command(Command::Rename(name))?)
@@ -470,10 +561,14 @@ impl RoomMeshCore {
     }
     pub fn update_settings(&self, settings: FfiSettings) {
         self.core.update_audio_settings(audio_settings(&settings));
-        self.core.set_policies(settings.auto_elect_coordinator, settings.fallback_speaker_to_coordinator);
+        self.core.set_policies(
+            settings.auto_elect_coordinator,
+            settings.fallback_speaker_to_coordinator,
+        );
     }
     pub fn set_local_info(&self, name: String, driver_installed: bool) {
-        self.core.set_local_info(name, capabilities(driver_installed));
+        self.core
+            .set_local_info(name, capabilities(driver_installed));
     }
 
     // ---- queries ----
@@ -489,7 +584,13 @@ impl RoomMeshCore {
     pub fn get_active_microphones(&self) -> Vec<String> {
         self.core
             .room_snapshot()
-            .map(|s| [s.active_primary, s.active_secondary].into_iter().flatten().map(hex).collect())
+            .map(|s| {
+                [s.active_primary, s.active_secondary]
+                    .into_iter()
+                    .flatten()
+                    .map(hex)
+                    .collect()
+            })
             .unwrap_or_default()
     }
     pub fn virtual_device_available(&self) -> bool {
@@ -501,7 +602,12 @@ impl RoomMeshCore {
 pub fn list_audio_devices() -> Vec<FfiAudioDevice> {
     list_devices()
         .into_iter()
-        .map(|d| FfiAudioDevice { name: d.name, is_input: d.is_input, is_output: d.is_output, is_default: d.is_default })
+        .map(|d| FfiAudioDevice {
+            name: d.name,
+            is_input: d.is_input,
+            is_output: d.is_output,
+            is_default: d.is_default,
+        })
         .collect()
 }
 
@@ -515,18 +621,28 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::room::events::*;
     #[test]
     fn settings_map_to_audio_config() {
-        let s = FfiSettings { input_device: Some("MacBook Pro Microphone".into()), output_device: None,
-            allow_simultaneous_talkers: true, echo_cancellation: false, noise_suppression: true,
-            mic_latency_ms: 70, playout_delay_ms: 90, auto_elect_coordinator: false, fallback_speaker_to_coordinator: true };
+        let s = FfiSettings {
+            input_device: Some("MacBook Pro Microphone".into()),
+            output_device: None,
+            allow_simultaneous_talkers: true,
+            echo_cancellation: false,
+            noise_suppression: true,
+            mic_latency_ms: 70,
+            playout_delay_ms: 90,
+            auto_elect_coordinator: false,
+            fallback_speaker_to_coordinator: true,
+        };
         let a = audio_settings(&s);
-        assert_eq!(a.input, DeviceSelector::Name("MacBook Pro Microphone".into()));
+        assert_eq!(
+            a.input,
+            DeviceSelector::Name("MacBook Pro Microphone".into())
+        );
         assert_eq!(a.output, DeviceSelector::Default);
         assert!(a.coordinator.arbitration.allow_multi);
         assert!(!a.coordinator.use_webrtc_aec);
@@ -535,34 +651,80 @@ mod tests {
     }
     #[test]
     fn events_convert_with_hex_ids() {
-        let e = to_ffi_event(RoomEvent::ActiveMicChanged { primary: Some(PeerId(0xab)), secondary: None });
-        match e { FfiEvent::ActiveMicChanged { primary, secondary } => { assert_eq!(primary.as_deref(), Some("00000000000000ab")); assert!(secondary.is_none()); } _ => panic!() }
-        assert!(matches!(to_ffi_event(RoomEvent::LeftRoom), FfiEvent::LeftRoom));
+        let e = to_ffi_event(RoomEvent::ActiveMicChanged {
+            primary: Some(PeerId(0xab)),
+            secondary: None,
+        });
+        match e {
+            FfiEvent::ActiveMicChanged { primary, secondary } => {
+                assert_eq!(primary.as_deref(), Some("00000000000000ab"));
+                assert!(secondary.is_none());
+            }
+            _ => panic!(),
+        }
+        assert!(matches!(
+            to_ffi_event(RoomEvent::LeftRoom),
+            FfiEvent::LeftRoom
+        ));
         assert_eq!(
-            to_ffi_event(RoomEvent::Notice { message: "Microphone recovered".into() }),
-            FfiEvent::Notice { message: "Microphone recovered".into() }
+            to_ffi_event(RoomEvent::Notice {
+                message: "Microphone recovered".into()
+            }),
+            FfiEvent::Notice {
+                message: "Microphone recovered".into()
+            }
         );
         assert!(parse_peer("nothex").is_err());
     }
     #[test]
     fn settings_clamp_and_errors_map() {
-        let s = FfiSettings { input_device: Some(String::new()), output_device: Some("Studio Display".into()),
-            allow_simultaneous_talkers: false, echo_cancellation: true, noise_suppression: false,
-            mic_latency_ms: 5, playout_delay_ms: 10_000, auto_elect_coordinator: true, fallback_speaker_to_coordinator: false };
+        let s = FfiSettings {
+            input_device: Some(String::new()),
+            output_device: Some("Studio Display".into()),
+            allow_simultaneous_talkers: false,
+            echo_cancellation: true,
+            noise_suppression: false,
+            mic_latency_ms: 5,
+            playout_delay_ms: 10_000,
+            auto_elect_coordinator: true,
+            fallback_speaker_to_coordinator: false,
+        };
         let a = audio_settings(&s);
         assert_eq!(a.input, DeviceSelector::Default);
         assert_eq!(a.output, DeviceSelector::Name("Studio Display".into()));
         assert_eq!(a.coordinator.mic_latency_ns, 30_000_000);
         assert_eq!(a.coordinator.playout_delay_ns, 300_000_000);
         assert!(!a.coordinator.noise_suppression);
-        assert!(matches!(FfiError::from(RoomError::NotMember), FfiError::NotMember));
-        assert!(matches!(FfiError::from(RoomError::Timeout), FfiError::Timeout));
-        assert_eq!(FfiError::Timeout.to_string(), "RoomMesh is busy — try again");
-        assert!(matches!(FfiError::from(RoomError::Internal), FfiError::Internal));
-        assert_eq!(FfiError::Internal.to_string(), "RoomMesh stopped unexpectedly — restart the app");
+        assert!(matches!(
+            FfiError::from(RoomError::NotMember),
+            FfiError::NotMember
+        ));
+        assert!(matches!(
+            FfiError::from(RoomError::Timeout),
+            FfiError::Timeout
+        ));
+        assert_eq!(
+            FfiError::Timeout.to_string(),
+            "RoomMesh is busy — try again"
+        );
+        assert!(matches!(
+            FfiError::from(RoomError::Internal),
+            FfiError::Internal
+        ));
+        assert_eq!(
+            FfiError::Internal.to_string(),
+            "RoomMesh stopped unexpectedly — restart the app"
+        );
         assert!(parse_peer("00000000000000AB").is_err());
         assert_eq!(parse_peer("00000000000000ab").unwrap(), PeerId(0xab));
-        let e = to_ffi_event(RoomEvent::CoordinatorLost { candidates: vec![PeerId(1), PeerId(2)] });
-        assert_eq!(e, FfiEvent::CoordinatorLost { candidates: vec!["0000000000000001".into(), "0000000000000002".into()] });
+        let e = to_ffi_event(RoomEvent::CoordinatorLost {
+            candidates: vec![PeerId(1), PeerId(2)],
+        });
+        assert_eq!(
+            e,
+            FfiEvent::CoordinatorLost {
+                candidates: vec!["0000000000000001".into(), "0000000000000002".into()]
+            }
+        );
     }
 }

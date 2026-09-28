@@ -8,7 +8,10 @@ use crate::time::LinearFit;
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReadStatus { pub filled: usize, pub missing: usize }
+pub struct ReadStatus {
+    pub filled: usize,
+    pub missing: usize,
+}
 
 pub struct TimelineReader {
     buf: VecDeque<f32>,
@@ -43,13 +46,18 @@ impl TimelineReader {
         // restarted: start a fresh segment instead of corrupting the fit.
         if let Some((oi, ot)) = self.origin {
             if let Some(pred) = self.fit.eval(first_index as f64 - oi as f64) {
-                if (pred + ot as f64 - timestamp_ns as f64).abs() > 20e6 { self.reset(); }
+                if (pred + ot as f64 - timestamp_ns as f64).abs() > 20e6 {
+                    self.reset();
+                }
             }
         }
         let mut idx = first_index;
         let mut data = samples;
         match self.next_index {
-            None => { self.buf.clear(); self.base_index = idx; }
+            None => {
+                self.buf.clear();
+                self.base_index = idx;
+            }
             Some(expected) if idx > expected => {
                 let gap = (idx - expected) as usize;
                 if gap > self.max_samples {
@@ -65,14 +73,19 @@ impl TimelineReader {
                 // before we ever reach this arm. What's left here is a plain overlap: trim the
                 // already-seen prefix and splice the rest onto the existing segment.
                 let overlap = (expected - idx) as usize;
-                if overlap >= data.len() { return; }
+                if overlap >= data.len() {
+                    return;
+                }
                 data = &data[overlap..];
                 idx = expected;
             }
             _ => {}
         }
         let (oi, ot) = *self.origin.get_or_insert((first_index, timestamp_ns));
-        self.fit.push(first_index as f64 - oi as f64, timestamp_ns as f64 - ot as f64);
+        self.fit.push(
+            first_index as f64 - oi as f64,
+            timestamp_ns as f64 - ot as f64,
+        );
         self.buf.extend(data.iter().copied());
         self.next_index = Some(idx + data.len() as u64);
         if self.buf.len() > self.max_samples {
@@ -91,7 +104,9 @@ impl TimelineReader {
     /// Timestamp of the newest sample that can be interpolated.
     pub fn available_until_ns(&self) -> Option<u64> {
         let (oi, ot) = self.origin?;
-        if self.buf.len() < 4 { return None; }
+        if self.buf.len() < 4 {
+            return None;
+        }
         let last = self.base_index + self.buf.len() as u64 - 3;
         Some((self.fit.eval(last as f64 - oi as f64)? + ot as f64) as u64)
     }
@@ -107,8 +122,14 @@ impl TimelineReader {
         let base = self.base_index as f64;
         for (k, o) in out.iter_mut().enumerate() {
             match sample_at(&self.buf, i0 + k as f64 * step - base) {
-                Some(v) => { *o = v; st.filled += 1; }
-                None => { *o = 0.0; st.missing += 1; }
+                Some(v) => {
+                    *o = v;
+                    st.filled += 1;
+                }
+                None => {
+                    *o = 0.0;
+                    st.missing += 1;
+                }
             }
         }
         let drop = ((i0 - base).floor() as i64 - 2).clamp(0, self.buf.len() as i64) as usize;
@@ -128,10 +149,12 @@ mod tests {
         for c in 0..chunks {
             let n0 = (c * chunk) as u64;
             let t0 = T0 + n0 as f64 * 1e9 / fs_true;
-            let s: Vec<f32> = (0..chunk).map(|k| {
-                let t = (n0 as f64 + k as f64) / fs_true;
-                (2.0 * PI * f * t).sin() as f32
-            }).collect();
+            let s: Vec<f32> = (0..chunk)
+                .map(|k| {
+                    let t = (n0 as f64 + k as f64) / fs_true;
+                    (2.0 * PI * f * t).sin() as f32
+                })
+                .collect();
             tl.push(n0, t0 as u64, &s);
         }
     }
@@ -170,16 +193,31 @@ mod tests {
         tl.push(960, (T0 + 20e6) as u64, &vec![0.5; 480]); // gap 480..960
         let st = tl.read((T0 + 12e6) as u64, 1e9 / 48_000.0, &mut out[..96]);
         assert_eq!(st.missing, 0);
-        assert!(out[..96].iter().all(|v| v.abs() < 1e-6), "gap must be zero-filled");
+        assert!(
+            out[..96].iter().all(|v| v.abs() < 1e-6),
+            "gap must be zero-filled"
+        );
         let mut late = vec![0.0f32; 480];
-        assert!(tl.read((T0 + 1e9) as u64, 1e9 / 48_000.0, &mut late).missing > 0);
+        assert!(
+            tl.read((T0 + 1e9) as u64, 1e9 / 48_000.0, &mut late)
+                .missing
+                > 0
+        );
     }
     #[test]
     fn restarts_segment_on_time_discontinuity() {
         let mut tl = TimelineReader::new(48_000, 5.0);
-        for c in 0..10u64 { tl.push(c * 480, (T0 + c as f64 * 10e6) as u64, &vec![0.1; 480]); }
+        for c in 0..10u64 {
+            tl.push(c * 480, (T0 + c as f64 * 10e6) as u64, &vec![0.1; 480]);
+        }
         // same index sequence continues but 2 s later (source paused)
-        for c in 10..20u64 { tl.push(c * 480, (T0 + 2e9 + c as f64 * 10e6) as u64, &vec![0.7; 480]); }
+        for c in 10..20u64 {
+            tl.push(
+                c * 480,
+                (T0 + 2e9 + c as f64 * 10e6) as u64,
+                &vec![0.7; 480],
+            );
+        }
         let mut out = vec![0.0f32; 48];
         let st = tl.read((T0 + 2e9 + 150e6) as u64, 1e9 / 48_000.0, &mut out);
         assert_eq!(st.missing, 0);

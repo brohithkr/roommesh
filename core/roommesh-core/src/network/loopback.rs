@@ -38,12 +38,25 @@ pub struct LoopbackNetwork {
 
 impl LoopbackNetwork {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { inner: Mutex::new(Inner::default()), emit: Mutex::new(()) })
+        Arc::new(Self {
+            inner: Mutex::new(Inner::default()),
+            emit: Mutex::new(()),
+        })
     }
 
     pub fn transport(self: &Arc<Self>, me: PeerId, sink: TransportSink) -> Arc<LoopbackTransport> {
-        self.inner.lock().nodes.insert(me, Node { name: String::new(), sink, advertised: false });
-        Arc::new(LoopbackTransport { net: self.clone(), me })
+        self.inner.lock().nodes.insert(
+            me,
+            Node {
+                name: String::new(),
+                sink,
+                advertised: false,
+            },
+        );
+        Arc::new(LoopbackTransport {
+            net: self.clone(),
+            me,
+        })
     }
 
     /// Looks up a node's sink (a cheap clone of the channel sender) without sending anything.
@@ -60,7 +73,10 @@ impl LoopbackNetwork {
     /// mirrors the order in which they acquired `inner`, instead of whichever thread happens to
     /// reach the send loop first. `inner` itself is still only held for the brief state
     /// read/mutate step, never across the (potentially blocking) sends.
-    fn with_lock_and_flush(&self, f: impl FnOnce(&mut Inner) -> Vec<(TransportSink, TransportEvent)>) {
+    fn with_lock_and_flush(
+        &self,
+        f: impl FnOnce(&mut Inner) -> Vec<(TransportSink, TransportEvent)>,
+    ) {
         let _order = self.emit.lock();
         let sends = {
             let mut g = self.inner.lock();
@@ -76,8 +92,12 @@ impl LoopbackNetwork {
             g.blocked.insert(key(a, b));
             let mut sends = Vec::new();
             if g.links.remove(&key(a, b)) {
-                if let Some(s) = Self::sink(g, a) { sends.push((s, TransportEvent::Disconnected(b))); }
-                if let Some(s) = Self::sink(g, b) { sends.push((s, TransportEvent::Disconnected(a))); }
+                if let Some(s) = Self::sink(g, a) {
+                    sends.push((s, TransportEvent::Disconnected(b)));
+                }
+                if let Some(s) = Self::sink(g, b) {
+                    sends.push((s, TransportEvent::Disconnected(a)));
+                }
             }
             sends
         });
@@ -133,7 +153,13 @@ impl PeerTransport for LoopbackTransport {
                     sends.push((s, TransportEvent::Discovered { peer: id, name }));
                 }
                 if let Some(s) = LoopbackNetwork::sink(g, id) {
-                    sends.push((s, TransportEvent::Discovered { peer: self.me, name: advert.name.clone() }));
+                    sends.push((
+                        s,
+                        TransportEvent::Discovered {
+                            peer: self.me,
+                            name: advert.name.clone(),
+                        },
+                    ));
                 }
             }
             sends
@@ -153,8 +179,12 @@ impl PeerTransport for LoopbackTransport {
             }
             g.links.insert(k);
             let mut sends = Vec::new();
-            if let Some(s) = LoopbackNetwork::sink(g, self.me) { sends.push((s, TransportEvent::Connected(peer))); }
-            if let Some(s) = LoopbackNetwork::sink(g, peer) { sends.push((s, TransportEvent::Connected(self.me))); }
+            if let Some(s) = LoopbackNetwork::sink(g, self.me) {
+                sends.push((s, TransportEvent::Connected(peer)));
+            }
+            if let Some(s) = LoopbackNetwork::sink(g, peer) {
+                sends.push((s, TransportEvent::Connected(self.me)));
+            }
             sends
         });
     }
@@ -162,8 +192,12 @@ impl PeerTransport for LoopbackTransport {
         self.net.with_lock_and_flush(|g| {
             let mut sends = Vec::new();
             if g.links.remove(&key(self.me, peer)) {
-                if let Some(s) = LoopbackNetwork::sink(g, self.me) { sends.push((s, TransportEvent::Disconnected(peer))); }
-                if let Some(s) = LoopbackNetwork::sink(g, peer) { sends.push((s, TransportEvent::Disconnected(self.me))); }
+                if let Some(s) = LoopbackNetwork::sink(g, self.me) {
+                    sends.push((s, TransportEvent::Disconnected(peer)));
+                }
+                if let Some(s) = LoopbackNetwork::sink(g, peer) {
+                    sends.push((s, TransportEvent::Disconnected(self.me)));
+                }
             }
             sends
         });
@@ -174,7 +208,13 @@ impl PeerTransport for LoopbackTransport {
                 return Vec::new();
             }
             match LoopbackNetwork::sink(g, peer) {
-                Some(s) => vec![(s, TransportEvent::Control { peer: self.me, frame })],
+                Some(s) => vec![(
+                    s,
+                    TransportEvent::Control {
+                        peer: self.me,
+                        frame,
+                    },
+                )],
                 None => Vec::new(),
             }
         });
@@ -211,19 +251,38 @@ mod tests {
         let (sb, rb) = unbounded();
         let ta = net.transport(PeerId(1), sa);
         let tb = net.transport(PeerId(2), sb);
-        ta.start(LocalAdvertisement { peer_id: PeerId(1), name: "A".into(), protocol_version: 1 });
-        tb.start(LocalAdvertisement { peer_id: PeerId(2), name: "B".into(), protocol_version: 1 });
-        assert!(ra.try_iter().any(|e| e == TransportEvent::Discovered { peer: PeerId(2), name: "B".into() }));
+        ta.start(LocalAdvertisement {
+            peer_id: PeerId(1),
+            name: "A".into(),
+            protocol_version: 1,
+        });
+        tb.start(LocalAdvertisement {
+            peer_id: PeerId(2),
+            name: "B".into(),
+            protocol_version: 1,
+        });
+        assert!(ra.try_iter().any(|e| e
+            == TransportEvent::Discovered {
+                peer: PeerId(2),
+                name: "B".into()
+            }));
         rb.try_iter().count();
         ta.connect(PeerId(2));
-        assert!(rb.try_iter().any(|e| e == TransportEvent::Connected(PeerId(1))));
+        assert!(rb
+            .try_iter()
+            .any(|e| e == TransportEvent::Connected(PeerId(1))));
         ta.send_control(PeerId(2), vec![1]);
         ta.send_realtime(PeerId(2), vec![2]);
         let got: Vec<_> = rb.try_iter().collect();
-        assert!(got.contains(&TransportEvent::Control { peer: PeerId(1), frame: vec![1] }));
+        assert!(got.contains(&TransportEvent::Control {
+            peer: PeerId(1),
+            frame: vec![1]
+        }));
         assert!(got.contains(&TransportEvent::Realtime(vec![2])));
         net.partition(PeerId(1), PeerId(2));
-        assert!(rb.try_iter().any(|e| e == TransportEvent::Disconnected(PeerId(1))));
+        assert!(rb
+            .try_iter()
+            .any(|e| e == TransportEvent::Disconnected(PeerId(1))));
         ta.send_realtime(PeerId(2), vec![3]);
         assert_eq!(rb.try_iter().count(), 0);
     }

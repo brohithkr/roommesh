@@ -16,11 +16,15 @@ pub struct VoiceEncoder {
 
 impl VoiceEncoder {
     pub fn new(bitrate_bps: i32) -> Result<Self, CodecError> {
-        let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)?;
+        let mut enc =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)?;
         enc.set_bitrate(opus::Bitrate::Bits(bitrate_bps))?;
         enc.set_inband_fec(true)?;
         enc.set_packet_loss_perc(10)?;
-        Ok(Self { enc, buf: vec![0u8; 1500] })
+        Ok(Self {
+            enc,
+            buf: vec![0u8; 1500],
+        })
     }
     pub fn encode(&mut self, frame: &[f32]) -> Result<Vec<u8>, CodecError> {
         if frame.len() != FRAME_SAMPLES {
@@ -37,14 +41,20 @@ pub struct VoiceDecoder {
 
 impl VoiceDecoder {
     pub fn new() -> Result<Self, CodecError> {
-        Ok(Self { dec: opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)? })
+        Ok(Self {
+            dec: opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)?,
+        })
     }
     pub fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize, CodecError> {
         Ok(self.dec.decode_float(packet, out, false)?)
     }
     /// Conceal one lost frame: FEC from the following packet when available, otherwise PLC.
     /// Always decodes exactly one `FRAME_SAMPLES`-sample frame, even into a larger buffer.
-    pub fn conceal(&mut self, next_packet: Option<&[u8]>, out: &mut [f32]) -> Result<usize, CodecError> {
+    pub fn conceal(
+        &mut self,
+        next_packet: Option<&[u8]>,
+        out: &mut [f32],
+    ) -> Result<usize, CodecError> {
         if out.len() < FRAME_SAMPLES {
             return Err(CodecError::FrameSize(out.len()));
         }
@@ -70,7 +80,10 @@ mod tests {
         let mut last = 0.0;
         for f in 0..50 {
             let frame: Vec<f32> = (0..FRAME_SAMPLES)
-                .map(|k| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * (f * 480 + k) as f32 / 48_000.0).sin())
+                .map(|k| {
+                    0.3 * (2.0 * std::f32::consts::PI * 440.0 * (f * 480 + k) as f32 / 48_000.0)
+                        .sin()
+                })
                 .collect();
             let pkt = enc.encode(&frame).unwrap();
             assert!(pkt.len() < 400);
@@ -105,6 +118,9 @@ mod tests {
     fn conceal_rejects_undersized_buffer() {
         let mut dec = VoiceDecoder::new().unwrap();
         let mut small = vec![0.0f32; 10];
-        assert!(matches!(dec.conceal(None, &mut small), Err(CodecError::FrameSize(10))));
+        assert!(matches!(
+            dec.conceal(None, &mut small),
+            Err(CodecError::FrameSize(10))
+        ));
     }
 }

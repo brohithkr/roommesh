@@ -45,7 +45,9 @@ hex_id!(PeerId);
 hex_id!(RoomId);
 
 /// Coordinator term. Strictly increases on every coordinator change.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize,
+)]
 pub struct Epoch(pub u32);
 impl Epoch {
     pub fn next(self) -> Epoch {
@@ -76,7 +78,7 @@ mod tests {
     fn from_hex_rejects_non_canonical_input() {
         assert_eq!(PeerId::from_hex("00ABCDEF01234567"), None); // uppercase
         assert_eq!(PeerId::from_hex("+0abcdef01234567"), None); // sign char accepted by from_str_radix
-        // Every value's to_hex() output must still round-trip.
+                                                                // Every value's to_hex() output must still round-trip.
         for v in [0u64, 1, u64::MAX, 0x00ab_cdef_0123_4567] {
             let p = PeerId(v);
             assert_eq!(PeerId::from_hex(&p.to_hex()), Some(p));

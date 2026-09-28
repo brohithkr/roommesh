@@ -20,20 +20,39 @@ pub struct ArbitrationConfig {
 }
 impl Default for ArbitrationConfig {
     fn default() -> Self {
-        Self { switch_margin: 0.15, confirm_ms: 150, min_hold_ms: 600, allow_multi: false,
-               multi_threshold: 0.6, multi_max_corr: 0.5, secondary_hangover_ms: 300,
-               primary_absence_grace_ms: 150, candidate_stale_ms: 250 }
+        Self {
+            switch_margin: 0.15,
+            confirm_ms: 150,
+            min_hold_ms: 600,
+            allow_multi: false,
+            multi_threshold: 0.6,
+            multi_max_corr: 0.5,
+            secondary_hangover_ms: 300,
+            primary_absence_grace_ms: 150,
+            candidate_stale_ms: 250,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MicObservation { pub peer: PeerId, pub score: f32, pub speaking: bool }
+pub struct MicObservation {
+    pub peer: PeerId,
+    pub score: f32,
+    pub speaking: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Selection { pub primary: Option<PeerId>, pub secondary: Option<PeerId> }
+pub struct Selection {
+    pub primary: Option<PeerId>,
+    pub secondary: Option<PeerId>,
+}
 impl Selection {
-    pub fn contains(&self, p: PeerId) -> bool { self.primary == Some(p) || self.secondary == Some(p) }
-    pub fn count(&self) -> usize { self.primary.is_some() as usize + self.secondary.is_some() as usize }
+    pub fn contains(&self, p: PeerId) -> bool {
+        self.primary == Some(p) || self.secondary == Some(p)
+    }
+    pub fn count(&self) -> usize {
+        self.primary.is_some() as usize + self.secondary.is_some() as usize
+    }
 }
 
 fn by_score(a: &&MicObservation, b: &&MicObservation) -> Ordering {
@@ -53,20 +72,39 @@ pub struct Arbiter {
 
 impl Arbiter {
     pub fn new(cfg: ArbitrationConfig) -> Self {
-        Self { cfg, primary: None, primary_since: 0, primary_absent_since: None, candidate: None, secondary: None }
+        Self {
+            cfg,
+            primary: None,
+            primary_since: 0,
+            primary_absent_since: None,
+            candidate: None,
+            secondary: None,
+        }
     }
-    pub fn set_config(&mut self, cfg: ArbitrationConfig) { self.cfg = cfg; }
+    pub fn set_config(&mut self, cfg: ArbitrationConfig) {
+        self.cfg = cfg;
+    }
     pub fn selection(&self) -> Selection {
-        Selection { primary: self.primary, secondary: self.secondary.map(|s| s.0) }
+        Selection {
+            primary: self.primary,
+            secondary: self.secondary.map(|s| s.0),
+        }
     }
 
-    pub fn update(&mut self, now_ms: u64, obs: &[MicObservation], corr: impl Fn(PeerId, PeerId) -> f32) -> Selection {
+    pub fn update(
+        &mut self,
+        now_ms: u64,
+        obs: &[MicObservation],
+        corr: impl Fn(PeerId, PeerId) -> f32,
+    ) -> Selection {
         let find = |p: PeerId| obs.iter().find(|o| o.peer == p);
         if self.primary.is_some_and(|p| find(p).is_none()) {
             let since = *self.primary_absent_since.get_or_insert(now_ms);
             if now_ms.saturating_sub(since) < self.cfg.primary_absence_grace_ms {
                 // Brief absence: hold the selection rather than cut to another mic mid-word.
-                if !obs.is_empty() { self.update_secondary(now_ms, obs, &corr); }
+                if !obs.is_empty() {
+                    self.update_secondary(now_ms, obs, &corr);
+                }
                 return self.selection();
             }
             self.primary = None;
@@ -94,12 +132,15 @@ impl Arbiter {
                         };
                         self.candidate = Some((c.peer, since, now_ms));
                         let confirmed = now_ms.saturating_sub(since) >= self.cfg.confirm_ms;
-                        let held = now_ms.saturating_sub(self.primary_since) >= self.cfg.min_hold_ms;
+                        let held =
+                            now_ms.saturating_sub(self.primary_since) >= self.cfg.min_hold_ms;
                         if confirmed && held {
                             self.primary = Some(c.peer);
                             self.primary_since = now_ms;
                             self.candidate = None;
-                            if self.secondary.is_some_and(|s| s.0 == c.peer) { self.secondary = None; }
+                            if self.secondary.is_some_and(|s| s.0 == c.peer) {
+                                self.secondary = None;
+                            }
                         }
                     }
                     // Keep a pending candidate through dips (pauses between syllables, onsets
@@ -112,7 +153,9 @@ impl Arbiter {
                                 && now_ms.saturating_sub(last) < self.cfg.candidate_stale_ms
                                 && find(cp).is_some_and(|o| o.score + margin >= cur.score)
                         });
-                        if !keep { self.candidate = None; }
+                        if !keep {
+                            self.candidate = None;
+                        }
                     }
                 }
             }
@@ -121,18 +164,36 @@ impl Arbiter {
         self.selection()
     }
 
-    fn update_secondary(&mut self, now_ms: u64, obs: &[MicObservation], corr: &impl Fn(PeerId, PeerId) -> f32) {
-        let Some(primary) = self.primary else { self.secondary = None; return };
-        if !self.cfg.allow_multi { self.secondary = None; return; }
+    fn update_secondary(
+        &mut self,
+        now_ms: u64,
+        obs: &[MicObservation],
+        corr: &impl Fn(PeerId, PeerId) -> f32,
+    ) {
+        let Some(primary) = self.primary else {
+            self.secondary = None;
+            return;
+        };
+        if !self.cfg.allow_multi {
+            self.secondary = None;
+            return;
+        }
         let primary_speaking = obs.iter().any(|o| o.peer == primary && o.speaking);
-        let qualifying = obs.iter()
-            .filter(|o| o.peer != primary && o.speaking && o.score >= self.cfg.multi_threshold
-                && corr(primary, o.peer) < self.cfg.multi_max_corr)
+        let qualifying = obs
+            .iter()
+            .filter(|o| {
+                o.peer != primary
+                    && o.speaking
+                    && o.score >= self.cfg.multi_threshold
+                    && corr(primary, o.peer) < self.cfg.multi_max_corr
+            })
             .max_by(by_score);
         match (qualifying, self.secondary) {
             (Some(q), _) if primary_speaking => self.secondary = Some((q.peer, now_ms)),
-            (_, Some((s, last))) if s != primary && obs.iter().any(|o| o.peer == s)
-                && now_ms.saturating_sub(last) < self.cfg.secondary_hangover_ms => {}
+            (_, Some((s, last)))
+                if s != primary
+                    && obs.iter().any(|o| o.peer == s)
+                    && now_ms.saturating_sub(last) < self.cfg.secondary_hangover_ms => {}
             _ => self.secondary = None,
         }
     }
@@ -146,19 +207,34 @@ mod tests {
     const B: PeerId = PeerId(2);
     const C: PeerId = PeerId(3);
     const D: PeerId = PeerId(4);
-    fn o(peer: PeerId, score: f32) -> MicObservation { MicObservation { peer, score, speaking: score > 0.3 } }
-    fn no_corr(_: PeerId, _: PeerId) -> f32 { 0.0 }
+    fn o(peer: PeerId, score: f32) -> MicObservation {
+        MicObservation {
+            peer,
+            score,
+            speaking: score > 0.3,
+        }
+    }
+    fn no_corr(_: PeerId, _: PeerId) -> f32 {
+        0.0
+    }
     fn run(arb: &mut Arbiter, from: u64, to: u64, obs: &[MicObservation]) -> Selection {
         let mut s = Selection::default();
         let mut t = from;
-        while t <= to { s = arb.update(t, obs, no_corr); t += 10; }
+        while t <= to {
+            s = arb.update(t, obs, no_corr);
+            t += 10;
+        }
         s
     }
 
     #[test]
     fn picks_best_initially() {
         let mut arb = Arbiter::new(ArbitrationConfig::default());
-        let s = arb.update(0, &[o(A, 0.27), o(B, 0.93), o(C, 0.41), o(D, 0.22)], no_corr);
+        let s = arb.update(
+            0,
+            &[o(A, 0.27), o(B, 0.93), o(C, 0.41), o(D, 0.22)],
+            no_corr,
+        );
         assert_eq!(s.primary, Some(B));
     }
     #[test]
@@ -181,7 +257,10 @@ mod tests {
         let mut arb = Arbiter::new(ArbitrationConfig::default());
         run(&mut arb, 0, 1000, &[o(B, 0.9), o(C, 0.1)]);
         run(&mut arb, 1010, 1060, &[o(B, 0.5), o(C, 0.95)]);
-        assert_eq!(run(&mut arb, 1070, 2000, &[o(B, 0.9), o(C, 0.1)]).primary, Some(B));
+        assert_eq!(
+            run(&mut arb, 1070, 2000, &[o(B, 0.9), o(C, 0.1)]).primary,
+            Some(B)
+        );
     }
     #[test]
     fn candidate_survives_pauses_between_syllables() {
@@ -192,7 +271,23 @@ mod tests {
         for _ in 0..3 {
             run(&mut arb, t, t + 70, &[o(B, 0.4), o(C, 0.9)]);
             t += 80;
-            run(&mut arb, t, t + 30, &[MicObservation { peer: B, score: 0.02, speaking: true }, MicObservation { peer: C, score: 0.02, speaking: true }]);
+            run(
+                &mut arb,
+                t,
+                t + 30,
+                &[
+                    MicObservation {
+                        peer: B,
+                        score: 0.02,
+                        speaking: true,
+                    },
+                    MicObservation {
+                        peer: C,
+                        score: 0.02,
+                        speaking: true,
+                    },
+                ],
+            );
             t += 40;
         }
         assert_eq!(arb.selection().primary, Some(C));
@@ -205,12 +300,20 @@ mod tests {
         let near = [o(B, 0.5), o(C, 0.45)]; // C within the margin of B, not leading
         run(&mut arb, 1010, 1080, &lead);
         run(&mut arb, 1090, 1120, &near);
-        assert_eq!(run(&mut arb, 1130, 1160, &lead).primary, Some(C), "kept through the dip");
+        assert_eq!(
+            run(&mut arb, 1130, 1160, &lead).primary,
+            Some(C),
+            "kept through the dip"
+        );
         let mut arb = Arbiter::new(ArbitrationConfig::default());
         run(&mut arb, 0, 1000, &[o(B, 0.9), o(C, 0.1)]);
         run(&mut arb, 1010, 1080, &lead);
         run(&mut arb, 1090, 1340, &near); // 250 ms without leading: stale
-        assert_eq!(run(&mut arb, 1350, 1450, &lead).primary, Some(B), "confirmation restarted");
+        assert_eq!(
+            run(&mut arb, 1350, 1450, &lead).primary,
+            Some(B),
+            "confirmation restarted"
+        );
         assert_eq!(run(&mut arb, 1460, 1500, &lead).primary, Some(C));
     }
     #[test]
@@ -225,10 +328,22 @@ mod tests {
     fn vanished_primary_replaced_after_grace() {
         let mut arb = Arbiter::new(ArbitrationConfig::default());
         arb.update(0, &[o(B, 0.9), o(C, 0.5)], no_corr);
-        assert_eq!(arb.update(10, &[o(C, 0.5)], no_corr).primary, Some(B), "held during grace");
+        assert_eq!(
+            arb.update(10, &[o(C, 0.5)], no_corr).primary,
+            Some(B),
+            "held during grace"
+        );
         assert_eq!(arb.update(150, &[o(C, 0.5)], no_corr).primary, Some(B));
-        assert_eq!(arb.update(160, &[o(C, 0.5)], no_corr).primary, Some(C), "replaced after 150 ms");
-        assert_eq!(arb.update(170, &[], no_corr).primary, Some(C), "empty obs also held");
+        assert_eq!(
+            arb.update(160, &[o(C, 0.5)], no_corr).primary,
+            Some(C),
+            "replaced after 150 ms"
+        );
+        assert_eq!(
+            arb.update(170, &[], no_corr).primary,
+            Some(C),
+            "empty obs also held"
+        );
         assert_eq!(arb.update(320, &[], no_corr), Selection::default());
     }
     #[test]
@@ -237,7 +352,10 @@ mod tests {
         run(&mut arb, 0, 1000, &[o(B, 0.9), o(C, 0.5)]);
         // B's packets are late for 100 ms: C is the only observation but must not take over.
         assert_eq!(run(&mut arb, 1010, 1110, &[o(C, 0.9)]).primary, Some(B));
-        assert_eq!(run(&mut arb, 1120, 1200, &[o(B, 0.9), o(C, 0.5)]).primary, Some(B));
+        assert_eq!(
+            run(&mut arb, 1120, 1200, &[o(B, 0.9), o(C, 0.5)]).primary,
+            Some(B)
+        );
         // The absence timer restarts after B came back.
         assert_eq!(run(&mut arb, 1210, 1350, &[o(C, 0.9)]).primary, Some(B));
     }
@@ -251,14 +369,27 @@ mod tests {
         let mut arb = Arbiter::new(cfg.clone());
         assert_eq!(arb.update(0, &obs, no_corr).secondary, Some(D));
         let mut arb = Arbiter::new(cfg);
-        assert_eq!(arb.update(0, &obs, |_, _| 0.9).secondary, None, "same talker heard twice");
+        assert_eq!(
+            arb.update(0, &obs, |_, _| 0.9).secondary,
+            None,
+            "same talker heard twice"
+        );
     }
     #[test]
     fn secondary_hangover() {
-        let cfg = ArbitrationConfig { allow_multi: true, ..Default::default() };
+        let cfg = ArbitrationConfig {
+            allow_multi: true,
+            ..Default::default()
+        };
         let mut arb = Arbiter::new(cfg);
         arb.update(0, &[o(B, 0.9), o(D, 0.8)], no_corr);
-        assert_eq!(arb.update(100, &[o(B, 0.9), o(D, 0.1)], no_corr).secondary, Some(D));
-        assert_eq!(arb.update(400, &[o(B, 0.9), o(D, 0.1)], no_corr).secondary, None);
+        assert_eq!(
+            arb.update(100, &[o(B, 0.9), o(D, 0.1)], no_corr).secondary,
+            Some(D)
+        );
+        assert_eq!(
+            arb.update(400, &[o(B, 0.9), o(D, 0.1)], no_corr).secondary,
+            None
+        );
     }
 }

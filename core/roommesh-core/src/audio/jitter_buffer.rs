@@ -4,16 +4,30 @@ use crate::network::realtime::RtHeader;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
-pub struct BufferedPacket { pub seq: u64, pub header: RtHeader, pub payload: Vec<u8>, pub arrival_ns: u64 }
+pub struct BufferedPacket {
+    pub seq: u64,
+    pub header: RtHeader,
+    pub payload: Vec<u8>,
+    pub arrival_ns: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PushResult { Accepted, Duplicate, Late, Overflow }
+pub enum PushResult {
+    Accepted,
+    Duplicate,
+    Late,
+    Overflow,
+}
 
 #[derive(Debug)]
 pub enum Pop {
     Packet(BufferedPacket),
     /// `seq` did not arrive before its deadline. Conceal it (Opus PLC, or FEC from `peek(seq+1)`).
-    Missing { seq: u64, timestamp_ns: u64, sample_index: u64 },
+    Missing {
+        seq: u64,
+        timestamp_ns: u64,
+        sample_index: u64,
+    },
     NotReady,
 }
 
@@ -37,7 +51,11 @@ impl JitterStats {
     /// Cumulative loss ratio since the stream started (see `recent_loss` for a windowed one).
     pub fn loss_ratio(&self) -> f64 {
         let total = self.received + self.lost;
-        if total == 0 { 0.0 } else { self.lost as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.lost as f64 / total as f64
+        }
     }
 }
 
@@ -65,9 +83,18 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(capacity: usize, frame_samples: u64, frame_ns: u64) -> Self {
-        Self { packets: BTreeMap::new(), next_seq: None, highest: None, last_ts: None, max_ts: None,
-               capacity, frame_samples, frame_ns, last_transit: None,
-               stats: JitterStats::default() }
+        Self {
+            packets: BTreeMap::new(),
+            next_seq: None,
+            highest: None,
+            last_ts: None,
+            max_ts: None,
+            capacity,
+            frame_samples,
+            frame_ns,
+            last_transit: None,
+            stats: JitterStats::default(),
+        }
     }
 
     pub fn reset(&mut self) {
@@ -82,11 +109,15 @@ impl JitterBuffer {
 
     fn extend(&self, seq: u32) -> u64 {
         const WRAP: i128 = 1 << 32;
-        let Some(h) = self.highest else { return seq as u64 + (1u64 << 32) };
+        let Some(h) = self.highest else {
+            return seq as u64 + (1u64 << 32);
+        };
         let h = h as i128;
         let mut best = (h & !(WRAP - 1)) | seq as i128;
         for c in [best - WRAP, best + WRAP] {
-            if c >= 0 && (c - h).abs() < (best - h).abs() { best = c; }
+            if c >= 0 && (c - h).abs() < (best - h).abs() {
+                best = c;
+            }
         }
         best as u64
     }
@@ -100,7 +131,10 @@ impl JitterBuffer {
                 // of rejecting. (Compared with the newest *received* timestamp, not the last
                 // played one: after a skip, a straggler from the skipped range is merely late.)
                 let restart_slack = MAX_CONSECUTIVE_MISSING as u64 * self.frame_ns;
-                if self.max_ts.is_some_and(|t| header.timestamp_ns > t.saturating_add(restart_slack)) {
+                if self
+                    .max_ts
+                    .is_some_and(|t| header.timestamp_ns > t.saturating_add(restart_slack))
+                {
                     let discarded = self.packets.len() as u64;
                     self.stats.received -= discarded;
                     self.stats.lost += discarded;
@@ -112,7 +146,10 @@ impl JitterBuffer {
                 return PushResult::Late;
             }
         }
-        if self.packets.contains_key(&seq) { self.stats.duplicates += 1; return PushResult::Duplicate; }
+        if self.packets.contains_key(&seq) {
+            self.stats.duplicates += 1;
+            return PushResult::Duplicate;
+        }
         let transit = arrival_ns as f64 - header.timestamp_ns as f64;
         if let Some(prev) = self.last_transit {
             let d = (transit - prev).abs();
@@ -120,9 +157,22 @@ impl JitterBuffer {
         }
         self.last_transit = Some(transit);
         self.highest = Some(self.highest.map_or(seq, |h| h.max(seq)));
-        self.max_ts = Some(self.max_ts.map_or(header.timestamp_ns, |t| t.max(header.timestamp_ns)));
-        if self.next_seq.is_none() { self.next_seq = Some(seq); }
-        self.packets.insert(seq, BufferedPacket { seq, header, payload, arrival_ns });
+        self.max_ts = Some(
+            self.max_ts
+                .map_or(header.timestamp_ns, |t| t.max(header.timestamp_ns)),
+        );
+        if self.next_seq.is_none() {
+            self.next_seq = Some(seq);
+        }
+        self.packets.insert(
+            seq,
+            BufferedPacket {
+                seq,
+                header,
+                payload,
+                arrival_ns,
+            },
+        );
         self.stats.received += 1;
         let mut result = PushResult::Accepted;
         while self.packets.len() > self.capacity {
@@ -150,13 +200,19 @@ impl JitterBuffer {
     /// missing once a buffered successor proves it was sent. A due gap longer than
     /// `MAX_CONSECUTIVE_MISSING` frames is skipped (counted as lost) instead of concealed.
     pub fn pop_due(&mut self, deadline_ns: u64, now_ns: u64) -> Pop {
-        let Some(next) = self.next_seq else { return Pop::NotReady };
+        let Some(next) = self.next_seq else {
+            return Pop::NotReady;
+        };
         // Only a buffered successor proves `next` was sent; with none, wait.
-        let Some((&first, succ)) = self.packets.iter().next() else { return Pop::NotReady };
+        let Some((&first, succ)) = self.packets.iter().next() else {
+            return Pop::NotReady;
+        };
         let gap = first - next;
         let due_ts = succ.header.timestamp_ns.saturating_sub(gap * self.frame_ns);
         // Not due yet: a reordered packet may still fill the gap.
-        if due_ts > deadline_ns { return Pop::NotReady; }
+        if due_ts > deadline_ns {
+            return Pop::NotReady;
+        }
         if gap > MAX_CONSECUTIVE_MISSING as u64 {
             // Outage too long to conceal usefully: resync on the successor.
             self.stats.lost += gap;
@@ -174,24 +230,37 @@ impl JitterBuffer {
             self.note_frames(1, false);
             return Pop::Packet(p);
         }
-        let sample_index = succ.header.sample_index.saturating_sub(gap * self.frame_samples);
+        let sample_index = succ
+            .header
+            .sample_index
+            .saturating_sub(gap * self.frame_samples);
         self.next_seq = Some(next + 1);
         self.last_ts = Some(due_ts);
         self.stats.lost += 1;
         self.note_frames(1, true);
-        Pop::Missing { seq: next, timestamp_ns: due_ts, sample_index }
+        Pop::Missing {
+            seq: next,
+            timestamp_ns: due_ts,
+            sample_index,
+        }
     }
 
     /// Feeds `n` frames that were all lost (or all delivered) into the `recent_loss` EWMA.
     fn note_frames(&mut self, n: u64, lost: bool) {
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         let keep = (1.0 - RECENT_LOSS_ALPHA).powf(n as f64);
         let target = if lost { 1.0 } else { 0.0 };
         self.stats.recent_loss = self.stats.recent_loss * keep + target * (1.0 - keep);
     }
 
-    pub fn peek(&self, seq: u64) -> Option<&BufferedPacket> { self.packets.get(&seq) }
-    pub fn stats(&self) -> JitterStats { self.stats }
+    pub fn peek(&self, seq: u64) -> Option<&BufferedPacket> {
+        self.packets.get(&seq)
+    }
+    pub fn stats(&self) -> JitterStats {
+        self.stats
+    }
 }
 
 #[cfg(test)]
@@ -202,16 +271,33 @@ mod tests {
     use crate::network::realtime::{PacketKind, RtHeader};
 
     fn h(seq: u32, i: u64) -> RtHeader {
-        RtHeader { kind: PacketKind::Mic, epoch: Epoch(1), stream: StreamId::MIC, sender: PeerId(1),
-                   sequence: seq, sample_index: i * 480, timestamp_ns: i * FRAME_NS, frame_count: 480 }
+        RtHeader {
+            kind: PacketKind::Mic,
+            epoch: Epoch(1),
+            stream: StreamId::MIC,
+            sender: PeerId(1),
+            sequence: seq,
+            sample_index: i * 480,
+            timestamp_ns: i * FRAME_NS,
+            frame_count: 480,
+        }
     }
-    fn jb() -> JitterBuffer { JitterBuffer::new(64, 480, FRAME_NS) }
-    fn seq_of(p: Pop) -> u32 { match p { Pop::Packet(p) => p.header.sequence, other => panic!("{other:?}") } }
+    fn jb() -> JitterBuffer {
+        JitterBuffer::new(64, 480, FRAME_NS)
+    }
+    fn seq_of(p: Pop) -> u32 {
+        match p {
+            Pop::Packet(p) => p.header.sequence,
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn in_order_and_deadline() {
         let mut b = jb();
-        for i in 0..3 { assert_eq!(b.push(h(i as u32, i), vec![], 0), PushResult::Accepted); }
+        for i in 0..3 {
+            assert_eq!(b.push(h(i as u32, i), vec![], 0), PushResult::Accepted);
+        }
         assert!(matches!(b.pop_due(0, 0), Pop::Packet(_)));
         assert!(matches!(b.pop_due(FRAME_NS - 1, 0), Pop::NotReady));
         assert_eq!(seq_of(b.pop_due(FRAME_NS, 0)), 1);
@@ -234,7 +320,14 @@ mod tests {
         b.push(h(2, 2), vec![], 0);
         seq_of(b.pop_due(u64::MAX, 0));
         match b.pop_due(2 * FRAME_NS, 0) {
-            Pop::Missing { timestamp_ns, sample_index, .. } => { assert_eq!(timestamp_ns, FRAME_NS); assert_eq!(sample_index, 480); }
+            Pop::Missing {
+                timestamp_ns,
+                sample_index,
+                ..
+            } => {
+                assert_eq!(timestamp_ns, FRAME_NS);
+                assert_eq!(sample_index, 480);
+            }
             other => panic!("{other:?}"),
         }
         assert_eq!(seq_of(b.pop_due(u64::MAX, 0)), 2);
@@ -252,7 +345,9 @@ mod tests {
     fn sequence_wraparound() {
         let mut b = jb();
         let seqs = [u32::MAX - 1, u32::MAX, 0, 1];
-        for (i, s) in seqs.iter().enumerate() { b.push(h(*s, i as u64), vec![], 0); }
+        for (i, s) in seqs.iter().enumerate() {
+            b.push(h(*s, i as u64), vec![], 0);
+        }
         let got: Vec<u32> = (0..4).map(|_| seq_of(b.pop_due(u64::MAX, 0))).collect();
         assert_eq!(got, seqs.to_vec());
     }
@@ -270,11 +365,23 @@ mod tests {
         let mut b = jb();
         b.push(h(0, 0), vec![], 0);
         seq_of(b.pop_due(0, 0));
-        b.push(h(1 + MAX_CONSECUTIVE_MISSING, 1 + MAX_CONSECUTIVE_MISSING as u64), vec![], 0);
-        for _ in 0..MAX_CONSECUTIVE_MISSING { assert!(matches!(b.pop_due(u64::MAX, 0), Pop::Missing { .. })); }
+        b.push(
+            h(
+                1 + MAX_CONSECUTIVE_MISSING,
+                1 + MAX_CONSECUTIVE_MISSING as u64,
+            ),
+            vec![],
+            0,
+        );
+        for _ in 0..MAX_CONSECUTIVE_MISSING {
+            assert!(matches!(b.pop_due(u64::MAX, 0), Pop::Missing { .. }));
+        }
         seq_of(b.pop_due(u64::MAX, 0));
         b.push(h(1000, 1000), vec![], 0);
-        assert!(matches!(b.pop_due(999 * FRAME_NS, 0), Pop::NotReady), "skip must not pop early");
+        assert!(
+            matches!(b.pop_due(999 * FRAME_NS, 0), Pop::NotReady),
+            "skip must not pop early"
+        );
         assert_eq!(seq_of(b.pop_due(1000 * FRAME_NS, 0)), 1000);
         assert_eq!(b.stats().lost, MAX_CONSECUTIVE_MISSING as u64 + 1000 - 7);
     }
@@ -292,7 +399,10 @@ mod tests {
     #[test]
     fn resyncs_when_sender_restarts_sequence() {
         let mut b = jb();
-        for i in 0..50u64 { b.push(h(i as u32, i), vec![], 0); seq_of(b.pop_due(u64::MAX, 0)); }
+        for i in 0..50u64 {
+            b.push(h(i as u32, i), vec![], 0);
+            seq_of(b.pop_due(u64::MAX, 0));
+        }
         assert_eq!(b.push(h(10, 10), vec![], 0), PushResult::Late);
         assert_eq!(b.push(h(0, 200), vec![], 0), PushResult::Accepted);
         assert_eq!(seq_of(b.pop_due(u64::MAX, 0)), 0);
@@ -310,7 +420,9 @@ mod tests {
     fn overflow_drop_not_double_counted() {
         let mut b = JitterBuffer::new(2, 480, FRAME_NS);
         // Push 3 packets into a capacity-2 buffer without popping: the oldest is evicted.
-        for i in [5u64, 6, 7] { b.push(h(i as u32, i), vec![], 0); }
+        for i in [5u64, 6, 7] {
+            b.push(h(i as u32, i), vec![], 0);
+        }
         let s = b.stats();
         // One packet was evicted: it should count once, under `lost`, not also under `received`.
         assert_eq!(s.received, 2);
@@ -324,7 +436,10 @@ mod tests {
         seq_of(b.pop_due(0, 0));
         b.push(h(20, 20), vec![], 0);
         b.push(h(21, 21), vec![], 0);
-        assert!(matches!(b.pop_due(15 * FRAME_NS, 0), Pop::NotReady), "gap skipped, 20 not due");
+        assert!(
+            matches!(b.pop_due(15 * FRAME_NS, 0), Pop::NotReady),
+            "gap skipped, 20 not due"
+        );
         assert_eq!(b.stats().lost, 19);
         assert_eq!(b.push(h(12, 12), vec![], 0), PushResult::Late);
         assert_eq!(b.stats().depth_packets, 2);
@@ -334,8 +449,12 @@ mod tests {
     #[test]
     fn restart_discards_buffered_packets_as_lost() {
         let mut b = jb();
-        for i in 0..10u64 { b.push(h(i as u32, i), vec![], 0); }
-        for _ in 0..5 { seq_of(b.pop_due(u64::MAX, 0)); } // 5..9 still buffered
+        for i in 0..10u64 {
+            b.push(h(i as u32, i), vec![], 0);
+        }
+        for _ in 0..5 {
+            seq_of(b.pop_due(u64::MAX, 0));
+        } // 5..9 still buffered
         assert_eq!(b.push(h(0, 500), vec![], 0), PushResult::Accepted);
         let s = b.stats();
         assert_eq!((s.received, s.lost, s.depth_packets), (6, 5, 1));
@@ -357,13 +476,28 @@ mod tests {
         let mut seen_high = 0.0f64;
         // 500 frames with every 5th lost (20 %), then 500 clean frames; played out in real time.
         for i in 0..1000u64 {
-            if i >= 500 || i % 5 != 1 { b.push(h(i as u32, i), vec![], 0); }
+            if i >= 500 || i % 5 != 1 {
+                b.push(h(i as u32, i), vec![], 0);
+            }
             while !matches!(b.pop_due(i * FRAME_NS, 0), Pop::NotReady) {}
-            if i == 499 { seen_high = b.stats().recent_loss; }
+            if i == 499 {
+                seen_high = b.stats().recent_loss;
+            }
         }
         let s = b.stats();
-        assert!((0.12..0.28).contains(&seen_high), "recent loss while lossy {seen_high}");
-        assert!(s.recent_loss < 0.01, "recent loss after recovery {}", s.recent_loss);
-        assert!((s.loss_ratio() - 0.1).abs() < 0.01, "cumulative {}", s.loss_ratio());
+        assert!(
+            (0.12..0.28).contains(&seen_high),
+            "recent loss while lossy {seen_high}"
+        );
+        assert!(
+            s.recent_loss < 0.01,
+            "recent loss after recovery {}",
+            s.recent_loss
+        );
+        assert!(
+            (s.loss_ratio() - 0.1).abs() < 0.01,
+            "cumulative {}",
+            s.loss_ratio()
+        );
     }
 }

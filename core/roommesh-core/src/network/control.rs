@@ -2,7 +2,8 @@
 //! shared table of realtime ciphers used by the audio runtime.
 use crate::ids::PeerId;
 use crate::network::secure::{
-    decode_hello, Handshake, RtCipher, SecureError, Session, FRAME_HELLO, FRAME_HELLO_REQUEST, FRAME_SEALED,
+    decode_hello, Handshake, RtCipher, SecureError, Session, FRAME_HELLO, FRAME_HELLO_REQUEST,
+    FRAME_SEALED,
 };
 use crate::room::protocol::{self, ControlMessage, ProtocolError};
 use parking_lot::RwLock;
@@ -13,8 +14,15 @@ pub type RtSessions = Arc<RwLock<HashMap<PeerId, Arc<RtCipher>>>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlEvent {
-    SessionUp { peer: PeerId, name: String, sas: String },
-    Message { from: PeerId, msg: ControlMessage },
+    SessionUp {
+        peer: PeerId,
+        name: String,
+        sas: String,
+    },
+    Message {
+        from: PeerId,
+        msg: ControlMessage,
+    },
     /// The session was torn down as part of a legitimate in-band re-open (a HELLO_REQUEST we
     /// answered after finding our side stale, or `on_disconnected`). The underlying transport
     /// connection is either already known to be gone, or still fine and about to carry a fresh
@@ -117,7 +125,13 @@ impl ControlChannel {
     fn start_handshake(&mut self, peer: PeerId) -> Vec<u8> {
         let hs = Handshake::new(self.local, self.name.clone());
         let hello = hs.hello();
-        self.pending.insert(peer, Pending { hs, hello_bytes: hello.clone() });
+        self.pending.insert(
+            peer,
+            Pending {
+                hs,
+                hello_bytes: hello.clone(),
+            },
+        );
         hello
     }
 
@@ -167,7 +181,10 @@ impl ControlChannel {
                 Ok(self.on_hello_request(peer))
             }
             Some(&FRAME_SEALED) => {
-                let s = self.sessions.get_mut(&peer).ok_or(ControlError::NoSession)?;
+                let s = self
+                    .sessions
+                    .get_mut(&peer)
+                    .ok_or(ControlError::NoSession)?;
                 match s.open_control(frame) {
                     Ok(pt) => {
                         // An authenticated frame proves the session is genuinely current: clear
@@ -176,7 +193,10 @@ impl ControlChannel {
                         // can't exploit it to force a re-open (see `on_hello_request`/`on_hello`).
                         self.fresh.remove(&peer);
                         let msg = protocol::decode(&pt)?;
-                        Ok(FrameOutcome { event: Some(ControlEvent::Message { from: peer, msg }), reply: None })
+                        Ok(FrameOutcome {
+                            event: Some(ControlEvent::Message { from: peer, msg }),
+                            reply: None,
+                        })
                     }
                     // A sealed frame that fails to decrypt/authenticate means our session state
                     // has desynced from the peer's in a way that isn't explained by a stray
@@ -185,7 +205,10 @@ impl ControlChannel {
                     // session and tell the caller to disconnect the transport too.
                     Err(SecureError::Crypto) => {
                         self.drop_session(peer);
-                        Ok(FrameOutcome { event: Some(ControlEvent::SessionFailed(peer)), reply: None })
+                        Ok(FrameOutcome {
+                            event: Some(ControlEvent::SessionFailed(peer)),
+                            reply: None,
+                        })
                     }
                     Err(e) => Err(e.into()),
                 }
@@ -203,7 +226,10 @@ impl ControlChannel {
         if let Some(p) = self.pending.get(&peer) {
             // Already mid-handshake: resend the exact same opening Hello (idempotent) rather
             // than generating fresh key material, so a reply to either copy still completes it.
-            return FrameOutcome { event: None, reply: Some(p.hello_bytes.clone()) };
+            return FrameOutcome {
+                event: None,
+                reply: Some(p.hello_bytes.clone()),
+            };
         }
         if self.sessions.contains_key(&peer) {
             // We think we have a session, and our peer is asking us for a Hello. Only honor
@@ -219,13 +245,19 @@ impl ControlChannel {
             let hello = self.start_handshake(peer);
             // `on_frame` has no `now_ms` to stamp this with; `stalled()` stamps it lazily.
             self.awaiting.insert(peer, None);
-            return FrameOutcome { event: Some(ControlEvent::SessionDown(peer)), reply: Some(hello) };
+            return FrameOutcome {
+                event: Some(ControlEvent::SessionDown(peer)),
+                reply: Some(hello),
+            };
         }
         // Cold start: neither pending nor session -- begin a fresh handshake, likewise watched
         // lazily by the watchdog.
         let hello = self.start_handshake(peer);
         self.awaiting.insert(peer, None);
-        FrameOutcome { event: None, reply: Some(hello) }
+        FrameOutcome {
+            event: None,
+            reply: Some(hello),
+        }
     }
 
     fn on_hello(&mut self, peer: PeerId, frame: &[u8]) -> Result<FrameOutcome, ControlError> {
@@ -244,7 +276,11 @@ impl ControlChannel {
                 // A reply to one of our own opening Hellos: only accept it if it actually
                 // answers our current pending handshake, and never answer a reply with another
                 // Hello -- that would turn every stray/late reply into a new round.
-                let Some(p) = self.pending.get(&peer).filter(|p| p.hs.public_key() == expected) else {
+                let Some(p) = self
+                    .pending
+                    .get(&peer)
+                    .filter(|p| p.hs.public_key() == expected)
+                else {
                     return Ok(FrameOutcome::default());
                 };
                 // Don't consume the pending handshake until `complete` actually succeeds: on a
@@ -261,7 +297,10 @@ impl ControlChannel {
                 };
                 self.rt.write().insert(peer, session.realtime());
                 self.sessions.insert(peer, session);
-                Ok(FrameOutcome { event: Some(ev), reply: None })
+                Ok(FrameOutcome {
+                    event: Some(ev),
+                    reply: None,
+                })
             }
             None => {
                 if is_lower {
@@ -274,7 +313,9 @@ impl ControlChannel {
                 // already have a session from) is a harmless network-level duplicate: ignore it
                 // silently rather than erroring (log spam) or re-keying a session that's already
                 // correct.
-                if self.sessions.contains_key(&peer) && self.answered.get(&peer) == Some(&hello.public_key) {
+                if self.sessions.contains_key(&peer)
+                    && self.answered.get(&peer) == Some(&hello.public_key)
+                {
                     return Ok(FrameOutcome::default());
                 }
                 // Once a session is up, a new opening Hello is unexpected unless this connection
@@ -301,7 +342,10 @@ impl ControlChannel {
                 };
                 self.rt.write().insert(peer, session.realtime());
                 self.sessions.insert(peer, session);
-                Ok(FrameOutcome { event: Some(ev), reply: Some(reply) })
+                Ok(FrameOutcome {
+                    event: Some(ev),
+                    reply: Some(reply),
+                })
             }
         }
     }
@@ -321,7 +365,8 @@ impl ControlChannel {
     }
 
     pub fn on_disconnected(&mut self, peer: PeerId) -> Option<ControlEvent> {
-        self.drop_session(peer).then_some(ControlEvent::SessionDown(peer))
+        self.drop_session(peer)
+            .then_some(ControlEvent::SessionDown(peer))
     }
 
     /// Peers whose handshake has been outstanding for at least `timeout_ms` as of `now_ms`.
@@ -331,7 +376,8 @@ impl ControlChannel {
     /// with) is stamped lazily on its first poll here instead of being reported immediately.
     /// Also expires `fresh` flags set at least `timeout_ms` ago.
     pub fn stalled(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<PeerId> {
-        self.fresh.retain(|_, set| now_ms.saturating_sub(*set) < timeout_ms);
+        self.fresh
+            .retain(|_, set| now_ms.saturating_sub(*set) < timeout_ms);
         let mut out = Vec::new();
         for (&peer, started) in self.awaiting.iter_mut() {
             match *started {
@@ -362,14 +408,21 @@ mod tests {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ha = a.on_connected(PeerId(2), 0).expect("lower peer id opens");
-        let hb = b.on_connected(PeerId(1), 0).expect("higher peer id sends a hello request");
+        let hb = b
+            .on_connected(PeerId(1), 0)
+            .expect("higher peer id sends a hello request");
         assert_eq!(hb[0], FRAME_HELLO_REQUEST);
         let ob = b.on_frame(PeerId(1), &ha).unwrap();
         let reply = ob.reply.clone().expect("b answers the opening hello");
         let oa = a.on_frame(PeerId(2), &reply).unwrap();
-        assert!(oa.reply.is_none(), "a must not answer b's reply with another hello");
-        let (Some(ControlEvent::SessionUp { sas: s1, .. }), Some(ControlEvent::SessionUp { sas: s2, name, .. })) =
-            (ob.event, oa.event)
+        assert!(
+            oa.reply.is_none(),
+            "a must not answer b's reply with another hello"
+        );
+        let (
+            Some(ControlEvent::SessionUp { sas: s1, .. }),
+            Some(ControlEvent::SessionUp { sas: s2, name, .. }),
+        ) = (ob.event, oa.event)
         else {
             panic!()
         };
@@ -392,7 +445,10 @@ mod tests {
         let ha = a.on_connected(PeerId(2), 0).unwrap();
         let ob = b.on_frame(PeerId(1), &ha).unwrap();
         let reply = ob.reply.expect("b must answer with its hello");
-        assert!(matches!(a.on_frame(PeerId(2), &reply).unwrap().event, Some(ControlEvent::SessionUp { .. })));
+        assert!(matches!(
+            a.on_frame(PeerId(2), &reply).unwrap().event,
+            Some(ControlEvent::SessionUp { .. })
+        ));
         assert!(a.has_session(PeerId(2)) && b.has_session(PeerId(1)));
     }
     #[test]
@@ -407,9 +463,14 @@ mod tests {
         let ob = b.on_frame(PeerId(1), &ha).unwrap();
         let reply = ob.reply.clone().expect("b answers the opening hello");
         let oa = a.on_frame(PeerId(2), &reply).unwrap();
-        assert!(oa.reply.is_none(), "a's reply-to-a-reply must not generate another hello");
-        let (Some(ControlEvent::SessionUp { sas: s1, .. }), Some(ControlEvent::SessionUp { sas: s2, .. })) =
-            (ob.event, oa.event)
+        assert!(
+            oa.reply.is_none(),
+            "a's reply-to-a-reply must not generate another hello"
+        );
+        let (
+            Some(ControlEvent::SessionUp { sas: s1, .. }),
+            Some(ControlEvent::SessionUp { sas: s2, .. }),
+        ) = (ob.event, oa.event)
         else {
             panic!("expected exactly one SessionUp per side")
         };
@@ -468,7 +529,10 @@ mod tests {
         // The pending handshake must still be there: a subsequent, well-formed reply to the
         // *same* opening Hello completes normally.
         let good_reply = hs_b.hello_reply(&opening);
-        assert!(matches!(a.on_frame(PeerId(2), &good_reply).unwrap().event, Some(ControlEvent::SessionUp { .. })));
+        assert!(matches!(
+            a.on_frame(PeerId(2), &good_reply).unwrap().event,
+            Some(ControlEvent::SessionUp { .. })
+        ));
         assert!(a.has_session(PeerId(2)));
     }
     #[test]
@@ -490,10 +554,24 @@ mod tests {
             timestamp_ns: 0,
             frame_count: 480,
         };
-        let pkt = a.realtime_sessions().read().get(&PeerId(2)).unwrap().seal(&h, b"x");
-        let (hh, p) = b.realtime_sessions().read().get(&PeerId(1)).unwrap().open(&pkt).unwrap();
+        let pkt = a
+            .realtime_sessions()
+            .read()
+            .get(&PeerId(2))
+            .unwrap()
+            .seal(&h, b"x");
+        let (hh, p) = b
+            .realtime_sessions()
+            .read()
+            .get(&PeerId(1))
+            .unwrap()
+            .open(&pkt)
+            .unwrap();
         assert_eq!((hh.sender, p.as_slice()), (PeerId(1), &b"x"[..]));
-        assert!(matches!(b.on_disconnected(PeerId(1)), Some(ControlEvent::SessionDown(_))));
+        assert!(matches!(
+            b.on_disconnected(PeerId(1)),
+            Some(ControlEvent::SessionDown(_))
+        ));
         assert!(b.realtime_sessions().read().get(&PeerId(1)).is_none());
     }
 
@@ -508,7 +586,10 @@ mod tests {
         // handshake already pending, on_connected resends the *same* Hello instead of new keys
         // (F3), so this no longer diverges from h1.
         let h2 = a.on_connected(PeerId(2), 10).unwrap();
-        assert_eq!(h1, h2, "must resend the identical pending Hello, not generate new key material");
+        assert_eq!(
+            h1, h2,
+            "must resend the identical pending Hello, not generate new key material"
+        );
         let r1 = b.on_frame(PeerId(1), &h1).unwrap().reply.unwrap();
         // b already completed a session from h1; the byte-identical h2 is silently ignored, not
         // an UnexpectedHello (F4).
@@ -529,9 +610,17 @@ mod tests {
         // A late/duplicate Connected on b's side (self-healing regression: this used to
         // unconditionally drop the session in `on_connected`) must not disrupt it.
         let _hb = b.on_connected(PeerId(1), 10);
-        assert!(b.has_session(PeerId(1)), "a late Connected must not destroy a good session");
-        let f = a.seal(PeerId(2), &ControlMessage::Leave { room_id: RoomId(1) }).unwrap();
-        assert!(matches!(b.on_frame(PeerId(1), &f).unwrap().event, Some(ControlEvent::Message { .. })));
+        assert!(
+            b.has_session(PeerId(1)),
+            "a late Connected must not destroy a good session"
+        );
+        let f = a
+            .seal(PeerId(2), &ControlMessage::Leave { room_id: RoomId(1) })
+            .unwrap();
+        assert!(matches!(
+            b.on_frame(PeerId(1), &f).unwrap().event,
+            Some(ControlEvent::Message { .. })
+        ));
     }
     #[test]
     fn probe_d_restart_rejected_without_fresh_connected_but_recovers_with_one() {
@@ -548,14 +637,18 @@ mod tests {
         assert!(b.on_frame(PeerId(1), &h).is_err());
         assert!(b.has_session(PeerId(1)));
         // Once b's transport does tell it about the (re)connection, the restart is accepted.
-        assert!(b.on_connected(PeerId(1), 21).is_none(), "b already has a session: on_connected is a no-op");
+        assert!(
+            b.on_connected(PeerId(1), 21).is_none(),
+            "b already has a session: on_connected is a no-op"
+        );
         let ob = b.on_frame(PeerId(1), &h).unwrap();
         assert!(matches!(ob.event, Some(ControlEvent::SessionUp { .. })));
         a2.on_frame(PeerId(2), &ob.reply.unwrap()).unwrap();
         assert!(a2.has_session(PeerId(2)) && b.has_session(PeerId(1)));
     }
     #[test]
-    fn probe_e_injected_opening_hello_at_lower_side_is_rejected_and_real_handshake_still_completes() {
+    fn probe_e_injected_opening_hello_at_lower_side_is_rejected_and_real_handshake_still_completes()
+    {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ha = a.on_connected(PeerId(2), 0).unwrap();
@@ -567,7 +660,10 @@ mod tests {
         assert!(matches!(err, ControlError::UnexpectedHello));
         assert!(!a.has_session(PeerId(2)));
         let r = b.on_frame(PeerId(1), &ha).unwrap().reply.unwrap();
-        assert!(matches!(a.on_frame(PeerId(2), &r).unwrap().event, Some(ControlEvent::SessionUp { .. })));
+        assert!(matches!(
+            a.on_frame(PeerId(2), &r).unwrap().event,
+            Some(ControlEvent::SessionUp { .. })
+        ));
     }
 
     #[test]
@@ -579,7 +675,9 @@ mod tests {
         let req = vec![FRAME_HELLO_REQUEST];
         let out = a.on_frame(PeerId(2), &req).unwrap();
         assert!(out.event.is_none());
-        let hello = out.reply.expect("the lower id answers a cold HELLO_REQUEST with a Hello");
+        let hello = out
+            .reply
+            .expect("the lower id answers a cold HELLO_REQUEST with a Hello");
         let ob = b.on_frame(PeerId(1), &hello).unwrap();
         a.on_frame(PeerId(2), &ob.reply.unwrap()).unwrap();
         assert!(a.has_session(PeerId(2)) && b.has_session(PeerId(1)));
@@ -589,7 +687,11 @@ mod tests {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let ha = a.on_connected(PeerId(2), 0).unwrap();
         let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
-        assert_eq!(out.reply.unwrap(), ha, "must resend the identical pending Hello, not a new one");
+        assert_eq!(
+            out.reply.unwrap(),
+            ha,
+            "must resend the identical pending Hello, not a new one"
+        );
     }
     #[test]
     fn hello_request_on_verified_session_without_fresh_connected_is_ignored() {
@@ -604,7 +706,10 @@ mod tests {
         assert!(a.has_session(PeerId(2)));
         let sas_before = a.sas(PeerId(2));
         let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
-        assert!(out.event.is_none() && out.reply.is_none(), "ignored: no fresh Connected since the session came up");
+        assert!(
+            out.event.is_none() && out.reply.is_none(),
+            "ignored: no fresh Connected since the session came up"
+        );
         assert!(a.has_session(PeerId(2)));
         assert_eq!(a.sas(PeerId(2)), sas_before);
     }
@@ -654,32 +759,63 @@ mod tests {
         let ha = a.on_connected(PeerId(2), 0).unwrap();
         let reply = b.on_frame(PeerId(1), &ha).unwrap().reply.unwrap();
         a.on_frame(PeerId(2), &reply).unwrap();
-        assert_eq!(a.stalled(100_000, 1), Vec::new(), "a resolved handshake is not stalled");
+        assert_eq!(
+            a.stalled(100_000, 1),
+            Vec::new(),
+            "a resolved handshake is not stalled"
+        );
         let mut c = ControlChannel::new(PeerId(1), "A".into());
         c.on_connected(PeerId(3), 0);
         c.on_disconnected(PeerId(3));
-        assert_eq!(c.stalled(100_000, 1), Vec::new(), "a disconnected peer is not stalled");
+        assert_eq!(
+            c.stalled(100_000, 1),
+            Vec::new(),
+            "a disconnected peer is not stalled"
+        );
     }
     #[test]
     fn hello_request_cold_answer_is_lazily_watched_by_the_watchdog() {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
-        let _hello = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap().reply.unwrap();
+        let _hello = a
+            .on_frame(PeerId(2), &[FRAME_HELLO_REQUEST])
+            .unwrap()
+            .reply
+            .unwrap();
         // The first poll just stamps the start time (no `now_ms` was available when the
         // handshake was started by on_hello_request); it must not be reported as already
         // stalled from that same poll.
-        assert_eq!(a.stalled(1_000_000, 1), Vec::new(), "first poll only stamps the start time");
-        assert_eq!(a.stalled(1_000_001, 1), vec![PeerId(2)], "now past the stamped start time");
+        assert_eq!(
+            a.stalled(1_000_000, 1),
+            Vec::new(),
+            "first poll only stamps the start time"
+        );
+        assert_eq!(
+            a.stalled(1_000_001, 1),
+            vec![PeerId(2)],
+            "now past the stamped start time"
+        );
     }
     #[test]
     fn on_connected_with_pending_handshake_resends_same_hello_and_refreshes_awaiting() {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let h1 = a.on_connected(PeerId(2), 1_000).unwrap();
         let h2 = a.on_connected(PeerId(2), 2_000).unwrap();
-        assert_eq!(h1, h2, "must resend the identical pending Hello, not generate new key material");
+        assert_eq!(
+            h1, h2,
+            "must resend the identical pending Hello, not generate new key material"
+        );
         // The watchdog timer is refreshed to the second call's time (2_000), not stuck at the
         // first (1_000).
-        assert_eq!(a.stalled(2_999, 1_000), Vec::new(), "not yet 1s past the refreshed start time");
-        assert_eq!(a.stalled(3_000, 1_000), vec![PeerId(2)], "1s past the refreshed start time");
+        assert_eq!(
+            a.stalled(2_999, 1_000),
+            Vec::new(),
+            "not yet 1s past the refreshed start time"
+        );
+        assert_eq!(
+            a.stalled(3_000, 1_000),
+            vec![PeerId(2)],
+            "1s past the refreshed start time"
+        );
     }
 
     // -- Regressions ported from the reviewer's `review_probe2`/`review_probe3` scratch modules --
@@ -715,7 +851,10 @@ mod tests {
         assert!(a.fresh.contains_key(&PeerId(2)), "still within the window");
         assert_eq!(a.stalled(6_000, 5_000), Vec::new());
         let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
-        assert!(out.event.is_none() && out.reply.is_none(), "expired: the request is ignored");
+        assert!(
+            out.event.is_none() && out.reply.is_none(),
+            "expired: the request is ignored"
+        );
         assert_eq!(a.sas(PeerId(2)), sas);
         // Within the window a HELLO_REQUEST is still honoured.
         a.on_connected(PeerId(2), 10_000);
@@ -736,7 +875,10 @@ mod tests {
         assert_eq!(a.sas(PeerId(2)), sas);
         // Normal traffic keeps flowing afterward.
         let f = b.seal(PeerId(1), &msg()).unwrap();
-        assert!(matches!(a.on_frame(PeerId(2), &f).unwrap().event, Some(ControlEvent::Message { .. })));
+        assert!(matches!(
+            a.on_frame(PeerId(2), &f).unwrap().event,
+            Some(ControlEvent::Message { .. })
+        ));
         assert_eq!(a.stalled(10_000, 5_000), Vec::new());
         assert_eq!(b.stalled(10_000, 5_000), Vec::new());
     }
@@ -751,7 +893,10 @@ mod tests {
         // and no `fresh` Connected, so the request is ignored outright -- no hello is ever
         // produced for the attacker to attach a forged reply to.
         let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
-        assert!(out.reply.is_none(), "the request is ignored: no fresh opening hello to attack");
+        assert!(
+            out.reply.is_none(),
+            "the request is ignored: no fresh opening hello to attack"
+        );
         assert!(a.has_session(PeerId(2)));
         assert_eq!(a.sas(PeerId(2)), sas);
     }
@@ -783,12 +928,22 @@ mod tests {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let h1 = a.on_connected(PeerId(2), 0).unwrap();
         let h2 = a.on_connected(PeerId(2), 10).unwrap();
-        assert_eq!(h1, h2, "on_connected with a pending handshake must resend the same hello");
+        assert_eq!(
+            h1, h2,
+            "on_connected with a pending handshake must resend the same hello"
+        );
         let r1 = b.on_frame(PeerId(1), &h1).unwrap().reply.unwrap();
-        assert!(b.on_frame(PeerId(1), &h2).unwrap().event.is_none(), "identical duplicate is ignored");
+        assert!(
+            b.on_frame(PeerId(1), &h2).unwrap().event.is_none(),
+            "identical duplicate is ignored"
+        );
         a.on_frame(PeerId(2), &r1).unwrap();
         assert!(a.has_session(PeerId(2)) && b.has_session(PeerId(1)));
-        assert_eq!(a.stalled(5_010, 5_000), Vec::new(), "no stale watchdog entry lingers after SessionUp");
+        assert_eq!(
+            a.stalled(5_010, 5_000),
+            Vec::new(),
+            "no stale watchdog entry lingers after SessionUp"
+        );
     }
     #[test]
     fn p9_hello_request_before_own_connected_then_on_connected_is_idempotent() {
@@ -800,9 +955,15 @@ mod tests {
         // a's own Connected notification arrives afterward: must reuse the same pending
         // handshake started above rather than generating new keys (F3).
         let h2 = a.on_connected(PeerId(2), 0).unwrap();
-        assert_eq!(h1, h2, "must reuse the pending handshake started by the cold HELLO_REQUEST answer");
+        assert_eq!(
+            h1, h2,
+            "must reuse the pending handshake started by the cold HELLO_REQUEST answer"
+        );
         let r1 = b.on_frame(PeerId(1), &h1).unwrap().reply.unwrap();
-        assert!(b.on_frame(PeerId(1), &h2).unwrap().event.is_none(), "identical duplicate is ignored");
+        assert!(
+            b.on_frame(PeerId(1), &h2).unwrap().event.is_none(),
+            "identical duplicate is ignored"
+        );
         a.on_frame(PeerId(2), &r1).unwrap();
         assert!(a.has_session(PeerId(2)) && b.has_session(PeerId(1)));
     }

@@ -9,11 +9,22 @@ pub const HEADER_LEN: usize = 44;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum PacketKind { Mic = 1, Playback = 2, ClockPing = 3, ClockPong = 4 }
+pub enum PacketKind {
+    Mic = 1,
+    Playback = 2,
+    ClockPing = 3,
+    ClockPong = 4,
+}
 
 impl PacketKind {
     fn from_u8(v: u8) -> Option<Self> {
-        Some(match v { 1 => Self::Mic, 2 => Self::Playback, 3 => Self::ClockPing, 4 => Self::ClockPong, _ => return None })
+        Some(match v {
+            1 => Self::Mic,
+            2 => Self::Playback,
+            3 => Self::ClockPing,
+            4 => Self::ClockPong,
+            _ => return None,
+        })
     }
 }
 
@@ -33,15 +44,23 @@ pub struct RtHeader {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RtError {
-    #[error("packet too short")] TooShort,
-    #[error("bad magic")] BadMagic,
-    #[error("unsupported version")] BadVersion,
-    #[error("unknown kind")] BadKind,
-    #[error("payload length mismatch")] LengthMismatch,
+    #[error("packet too short")]
+    TooShort,
+    #[error("bad magic")]
+    BadMagic,
+    #[error("unsupported version")]
+    BadVersion,
+    #[error("unknown kind")]
+    BadKind,
+    #[error("payload length mismatch")]
+    LengthMismatch,
 }
 
 pub fn header_bytes(h: &RtHeader, payload_len: usize) -> [u8; HEADER_LEN] {
-    debug_assert!(payload_len <= u16::MAX as usize, "payload_len {payload_len} does not fit in the u16 header field");
+    debug_assert!(
+        payload_len <= u16::MAX as usize,
+        "payload_len {payload_len} does not fit in the u16 header field"
+    );
     let mut b = [0u8; HEADER_LEN];
     b[0..2].copy_from_slice(&RT_MAGIC.to_le_bytes());
     b[2] = RT_VERSION;
@@ -64,17 +83,31 @@ pub fn encode_packet(h: &RtHeader, payload: &[u8]) -> Vec<u8> {
     v
 }
 
-fn u16_at(b: &[u8], i: usize) -> u16 { u16::from_le_bytes([b[i], b[i + 1]]) }
-fn u32_at(b: &[u8], i: usize) -> u32 { u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) }
-fn u64_at(b: &[u8], i: usize) -> u64 { u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) }
+fn u16_at(b: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes([b[i], b[i + 1]])
+}
+fn u32_at(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
+}
+fn u64_at(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+}
 
 pub fn decode_packet(buf: &[u8]) -> Result<(RtHeader, &[u8]), RtError> {
-    if buf.len() < HEADER_LEN { return Err(RtError::TooShort); }
-    if u16_at(buf, 0) != RT_MAGIC { return Err(RtError::BadMagic); }
-    if buf[2] != RT_VERSION { return Err(RtError::BadVersion); }
+    if buf.len() < HEADER_LEN {
+        return Err(RtError::TooShort);
+    }
+    if u16_at(buf, 0) != RT_MAGIC {
+        return Err(RtError::BadMagic);
+    }
+    if buf[2] != RT_VERSION {
+        return Err(RtError::BadVersion);
+    }
     let kind = PacketKind::from_u8(buf[3]).ok_or(RtError::BadKind)?;
     let len = u16_at(buf, 42) as usize;
-    if buf.len() != HEADER_LEN + len { return Err(RtError::LengthMismatch); }
+    if buf.len() != HEADER_LEN + len {
+        return Err(RtError::LengthMismatch);
+    }
     let h = RtHeader {
         kind,
         epoch: Epoch(u32_at(buf, 4)),
@@ -90,17 +123,31 @@ pub fn decode_packet(buf: &[u8]) -> Result<(RtHeader, &[u8]), RtError> {
 
 /// Clock ping payload: t1. Pong payload: t1, t2, t3, ping_seq (all u64 LE; the times are host ns
 /// of their clocks, ping_seq is the sequence number of the ping being answered).
-pub fn encode_times(times: &[u64]) -> Vec<u8> { times.iter().flat_map(|t| t.to_le_bytes()).collect() }
+pub fn encode_times(times: &[u64]) -> Vec<u8> {
+    times.iter().flat_map(|t| t.to_le_bytes()).collect()
+}
 pub fn decode_times(p: &[u8]) -> Vec<u64> {
-    p.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect()
+    p.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn hdr() -> RtHeader {
-        RtHeader { kind: PacketKind::Mic, epoch: Epoch(42), stream: StreamId::MIC, sender: PeerId(0xabc),
-                   sequence: 7, sample_index: 3360, timestamp_ns: 123_456_789, frame_count: 480 }
+        RtHeader {
+            kind: PacketKind::Mic,
+            epoch: Epoch(42),
+            stream: StreamId::MIC,
+            sender: PeerId(0xabc),
+            sequence: 7,
+            sample_index: 3360,
+            timestamp_ns: 123_456_789,
+            frame_count: 480,
+        }
     }
     #[test]
     fn roundtrip() {

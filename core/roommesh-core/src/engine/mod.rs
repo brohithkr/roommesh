@@ -1,8 +1,8 @@
 //! Coordinator/speaker engine runtime, events and metrics.
-pub mod stream;
-pub mod uplink;
 pub mod coordinator;
-pub mod speaker;
+pub mod facade;
 pub mod metrics;
 pub mod runtime;
-pub mod facade;
+pub mod speaker;
+pub mod stream;
+pub mod uplink;

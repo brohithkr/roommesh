@@ -14,9 +14,13 @@ pub fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
 /// Value of `src` at fractional index `pos`; `None` without one sample of context each side.
 #[inline]
 pub fn sample_at(src: &VecDeque<f32>, pos: f64) -> Option<f32> {
-    if pos.is_nan() || pos < 1.0 { return None; }
+    if pos.is_nan() || pos < 1.0 {
+        return None;
+    }
     let i = pos.floor() as usize;
-    if i + 2 >= src.len() { return None; }
+    if i + 2 >= src.len() {
+        return None;
+    }
     let t = (pos - i as f64) as f32;
     Some(hermite(src[i - 1], src[i], src[i + 1], src[i + 2], t))
 }

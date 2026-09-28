@@ -131,19 +131,27 @@ fn cmd_speaker_loopback() {
         .unwrap();
     s.play().unwrap();
     reader.read(1 << 16); // position the cursor at the live edge
-    // Drain continuously rather than sleeping and bulk-draining at the end: the ring holds
-    // ~680ms, so a single sleep(2s) then one read() would fall behind by more than that and
-    // trip the reader's overrun recovery, discarding almost everything it was meant to measure.
+                          // Drain continuously rather than sleeping and bulk-draining at the end: the ring holds
+                          // ~680ms, so a single sleep(2s) then one read() would fall behind by more than that and
+                          // trip the reader's overrun recovery, discarding almost everything it was meant to measure.
     let mut energy = 0.0f64;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
         while let Some(chunk) = reader.read(1 << 16) {
-            energy += chunk.samples.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
+            energy += chunk
+                .samples
+                .iter()
+                .map(|v| (*v as f64) * (*v as f64))
+                .sum::<f64>();
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     while let Some(chunk) = reader.read(1 << 16) {
-        energy += chunk.samples.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
+        energy += chunk
+            .samples
+            .iter()
+            .map(|v| (*v as f64) * (*v as f64))
+            .sum::<f64>();
     }
     println!(
         "{} speaker-loopback energy={energy:.1}",

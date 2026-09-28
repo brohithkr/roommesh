@@ -49,7 +49,10 @@ impl WebRtcAec {
             }),
             ..Default::default()
         });
-        Ok(Self { ap, render: vec![0.0; 480] })
+        Ok(Self {
+            ap,
+            render: vec![0.0; 480],
+        })
     }
 }
 
@@ -74,7 +77,11 @@ impl EchoCanceller for WebRtcAec {
     fn stats(&self) -> AecStats {
         let s = self.ap.get_stats();
         let erle = s.echo_return_loss_enhancement.map(|v| v as f32);
-        AecStats { erle_db: erle, delay_ms: s.delay_ms, converged: erle.is_some_and(|e| e > 6.0) }
+        AecStats {
+            erle_db: erle,
+            delay_ms: s.delay_ms,
+            converged: erle.is_some_and(|e| e > 6.0),
+        }
     }
 }
 
@@ -110,7 +117,8 @@ mod tests {
         let total = 600; // 6 s
         let reference: Vec<f32> = (0..total * 480)
             .map(|i| {
-                let env = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * 3.0 * i as f32 / 48_000.0).sin();
+                let env =
+                    0.5 + 0.5 * (2.0 * std::f32::consts::PI * 3.0 * i as f32 / 48_000.0).sin();
                 0.3 * env * rng.uni()
             })
             .collect();
@@ -120,7 +128,11 @@ mod tests {
             let mut mic: Vec<f32> = (0..480)
                 .map(|k| {
                     let i = f * 480 + k;
-                    let echo = if i >= delay { 0.5 * reference[i - delay] } else { 0.0 };
+                    let echo = if i >= delay {
+                        0.5 * reference[i - delay]
+                    } else {
+                        0.0
+                    };
                     echo + 0.0005 * rng.uni()
                 })
                 .collect();

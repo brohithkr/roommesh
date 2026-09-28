@@ -16,7 +16,12 @@ pub struct Capabilities {
 }
 impl Capabilities {
     pub fn full() -> Self {
-        Self { can_coordinate: true, has_mic: true, has_speaker: true, driver_installed: true }
+        Self {
+            can_coordinate: true,
+            has_mic: true,
+            has_speaker: true,
+            driver_installed: true,
+        }
     }
 }
 
@@ -82,7 +87,11 @@ impl RoomManifest {
         }
     }
     pub fn enabled_mics(&self) -> Vec<PeerId> {
-        self.members.iter().filter(|m| m.mic_enabled && m.capabilities.has_mic).map(|m| m.id).collect()
+        self.members
+            .iter()
+            .filter(|m| m.mic_enabled && m.capabilities.has_mic)
+            .map(|m| m.id)
+            .collect()
     }
     pub fn member_ids(&self) -> Vec<PeerId> {
         self.members.iter().map(|m| m.id).collect()
@@ -107,7 +116,11 @@ pub enum Acceptance {
 
 /// Decides whether `incoming` (sent by authenticated `sender`) replaces `current`.
 /// Order: (epoch, revision). Same-epoch conflicting coordinators → lowest coordinator id wins.
-pub fn evaluate_manifest(current: Option<&RoomManifest>, incoming: &RoomManifest, sender: PeerId) -> Acceptance {
+pub fn evaluate_manifest(
+    current: Option<&RoomManifest>,
+    incoming: &RoomManifest,
+    sender: PeerId,
+) -> Acceptance {
     use Acceptance::*;
     use RejectReason::*;
     let Some(cur) = current else { return Accept };
@@ -118,13 +131,25 @@ pub fn evaluate_manifest(current: Option<&RoomManifest>, incoming: &RoomManifest
         return Reject(StaleEpoch);
     }
     if incoming.epoch > cur.epoch {
-        return if cur.is_member(sender) { Accept } else { Reject(NotMember) };
+        return if cur.is_member(sender) {
+            Accept
+        } else {
+            Reject(NotMember)
+        };
     }
     // same epoch
     if incoming.coordinator != cur.coordinator {
-        if !cur.is_member(sender) { return Reject(NotMember); }
-        if sender != incoming.coordinator { return Reject(NotCoordinator); }
-        return if incoming.coordinator < cur.coordinator { Accept } else { Reject(LostTieBreak) };
+        if !cur.is_member(sender) {
+            return Reject(NotMember);
+        }
+        if sender != incoming.coordinator {
+            return Reject(NotCoordinator);
+        }
+        return if incoming.coordinator < cur.coordinator {
+            Accept
+        } else {
+            Reject(LostTieBreak)
+        };
     }
     if sender != cur.coordinator {
         return Reject(NotCoordinator);
@@ -146,7 +171,12 @@ pub fn is_valid_coordinator_command(current: &RoomManifest, sender: PeerId, epoc
 mod tests {
     use super::*;
     fn member(id: u64) -> MemberInfo {
-        MemberInfo { id: PeerId(id), name: format!("Mac {id}"), mic_enabled: true, capabilities: Capabilities::full() }
+        MemberInfo {
+            id: PeerId(id),
+            name: format!("Mac {id}"),
+            mic_enabled: true,
+            capabilities: Capabilities::full(),
+        }
     }
     fn room() -> RoomManifest {
         RoomManifest::new(RoomId(7), "Conference Room".into(), member(1))
@@ -186,7 +216,10 @@ mod tests {
         let mut old = cur.clone();
         old.epoch = Epoch(41);
         old.coordinator = PeerId(1);
-        assert_eq!(evaluate_manifest(Some(&cur), &old, PeerId(1)), Acceptance::Reject(RejectReason::StaleEpoch));
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &old, PeerId(1)),
+            Acceptance::Reject(RejectReason::StaleEpoch)
+        );
     }
     #[test]
     fn higher_epoch_from_member_accepted() {
@@ -195,17 +228,32 @@ mod tests {
         let mut next = cur.clone();
         next.epoch = Epoch(2);
         next.coordinator = PeerId(4);
-        assert_eq!(evaluate_manifest(Some(&cur), &next, PeerId(4)), Acceptance::Accept);
-        assert_eq!(evaluate_manifest(Some(&cur), &next, PeerId(99)), Acceptance::Reject(RejectReason::NotMember));
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(4)),
+            Acceptance::Accept
+        );
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(99)),
+            Acceptance::Reject(RejectReason::NotMember)
+        );
     }
     #[test]
     fn same_epoch_revision_only_from_coordinator() {
         let cur = room();
         let mut next = cur.clone();
         next.revision = 1;
-        assert_eq!(evaluate_manifest(Some(&cur), &next, PeerId(1)), Acceptance::Accept);
-        assert_eq!(evaluate_manifest(Some(&cur), &next, PeerId(2)), Acceptance::Reject(RejectReason::NotCoordinator));
-        assert_eq!(evaluate_manifest(Some(&next), &cur, PeerId(1)), Acceptance::Reject(RejectReason::StaleRevision));
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(1)),
+            Acceptance::Accept
+        );
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(2)),
+            Acceptance::Reject(RejectReason::NotCoordinator)
+        );
+        assert_eq!(
+            evaluate_manifest(Some(&next), &cur, PeerId(1)),
+            Acceptance::Reject(RejectReason::StaleRevision)
+        );
     }
     #[test]
     fn same_epoch_conflict_lowest_coordinator_wins() {
@@ -218,8 +266,14 @@ mod tests {
         let mut b = base.clone();
         b.epoch = Epoch(5);
         b.coordinator = PeerId(2);
-        assert_eq!(evaluate_manifest(Some(&a), &b, PeerId(2)), Acceptance::Accept);
-        assert_eq!(evaluate_manifest(Some(&b), &a, PeerId(3)), Acceptance::Reject(RejectReason::LostTieBreak));
+        assert_eq!(
+            evaluate_manifest(Some(&a), &b, PeerId(2)),
+            Acceptance::Accept
+        );
+        assert_eq!(
+            evaluate_manifest(Some(&b), &a, PeerId(3)),
+            Acceptance::Reject(RejectReason::LostTieBreak)
+        );
     }
     #[test]
     fn same_epoch_conflict_from_non_member_rejected() {
@@ -234,7 +288,10 @@ mod tests {
         b.coordinator = PeerId(2);
         // PeerId(2) has the lower coordinator id (would normally win the tie-break), but the
         // manifest is claimed to come from PeerId(99), who isn't even a member of `a`.
-        assert_eq!(evaluate_manifest(Some(&a), &b, PeerId(99)), Acceptance::Reject(RejectReason::NotMember));
+        assert_eq!(
+            evaluate_manifest(Some(&a), &b, PeerId(99)),
+            Acceptance::Reject(RejectReason::NotMember)
+        );
     }
     #[test]
     fn same_epoch_conflict_not_vouched_by_named_coordinator_rejected() {
@@ -249,7 +306,10 @@ mod tests {
         b.coordinator = PeerId(2);
         // PeerId(3) is a member and would win nothing here; the manifest names PeerId(2) as
         // coordinator but is sent by PeerId(3), who isn't that coordinator.
-        assert_eq!(evaluate_manifest(Some(&a), &b, PeerId(3)), Acceptance::Reject(RejectReason::NotCoordinator));
+        assert_eq!(
+            evaluate_manifest(Some(&a), &b, PeerId(3)),
+            Acceptance::Reject(RejectReason::NotCoordinator)
+        );
     }
     #[test]
     fn coordinator_commands_validated_by_epoch() {

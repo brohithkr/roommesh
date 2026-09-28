@@ -34,30 +34,45 @@ pub struct Hello {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SecureError {
-    #[error("malformed frame")] Malformed,
-    #[error("decryption failed")] Crypto,
-    #[error("unsupported protocol version {0}")] Version(u16),
-    #[error("attempted to complete a handshake with ourselves")] SelfConnection,
-    #[error(transparent)] Rt(#[from] RtError),
+    #[error("malformed frame")]
+    Malformed,
+    #[error("decryption failed")]
+    Crypto,
+    #[error("unsupported protocol version {0}")]
+    Version(u16),
+    #[error("attempted to complete a handshake with ourselves")]
+    SelfConnection,
+    #[error(transparent)]
+    Rt(#[from] RtError),
 }
 
 pub fn decode_hello(frame: &[u8]) -> Result<Hello, SecureError> {
-    if frame.first() != Some(&FRAME_HELLO) { return Err(SecureError::Malformed); }
+    if frame.first() != Some(&FRAME_HELLO) {
+        return Err(SecureError::Malformed);
+    }
     let body = &frame[1..];
     // `protocol_version` is `Hello`'s first field, so peek it with a standalone decode before
     // attempting to decode the whole struct: a different protocol version may use a different
     // wire shape entirely (fields added/removed/reordered), which would otherwise surface as an
     // opaque "malformed frame" instead of the actionable version mismatch.
-    let (version, _) = postcard::take_from_bytes::<u16>(body).map_err(|_| SecureError::Malformed)?;
+    let (version, _) =
+        postcard::take_from_bytes::<u16>(body).map_err(|_| SecureError::Malformed)?;
     if version != crate::room::state::PROTOCOL_VERSION {
         return Err(SecureError::Version(version));
     }
     let (hello, rest) = postcard::take_from_bytes(body).map_err(|_| SecureError::Malformed)?;
-    if !rest.is_empty() { return Err(SecureError::Malformed); }
+    if !rest.is_empty() {
+        return Err(SecureError::Malformed);
+    }
     Ok(hello)
 }
 
-pub struct Handshake { local: PeerId, name: String, secret: StaticSecret, public: PublicKey }
+pub struct Handshake {
+    local: PeerId,
+    name: String,
+    secret: StaticSecret,
+    public: PublicKey,
+}
 
 impl Handshake {
     pub fn new(local: PeerId, name: String) -> Self {
@@ -65,18 +80,34 @@ impl Handshake {
         getrandom::fill(&mut seed).expect("rng");
         let secret = StaticSecret::from(seed);
         let public = PublicKey::from(&secret);
-        Self { local, name, secret, public }
+        Self {
+            local,
+            name,
+            secret,
+            public,
+        }
     }
-    pub fn public_key(&self) -> [u8; 32] { self.public.to_bytes() }
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public.to_bytes()
+    }
     /// Plaintext frame to send first on a fresh control connection (an "opening" Hello:
     /// `reply_to: None`).
-    pub fn hello(&self) -> Vec<u8> { self.build_hello(None) }
+    pub fn hello(&self) -> Vec<u8> {
+        self.build_hello(None)
+    }
     /// Plaintext reply to an opening Hello, naming the public key it answers. Never call this
     /// in response to a Hello that itself has `reply_to` set.
-    pub fn hello_reply(&self, opening: &Hello) -> Vec<u8> { self.build_hello(Some(opening.public_key)) }
+    pub fn hello_reply(&self, opening: &Hello) -> Vec<u8> {
+        self.build_hello(Some(opening.public_key))
+    }
     fn build_hello(&self, reply_to: Option<[u8; 32]>) -> Vec<u8> {
-        let h = Hello { protocol_version: crate::room::state::PROTOCOL_VERSION, peer_id: self.local,
-                        name: self.name.clone(), public_key: self.public.to_bytes(), reply_to };
+        let h = Hello {
+            protocol_version: crate::room::state::PROTOCOL_VERSION,
+            peer_id: self.local,
+            name: self.name.clone(),
+            public_key: self.public.to_bytes(),
+            reply_to,
+        };
         let mut v = vec![FRAME_HELLO];
         v.extend(postcard::to_allocvec(&h).expect("hello"));
         v
@@ -88,10 +119,15 @@ impl Handshake {
         if remote.peer_id == self.local {
             return Err(SecureError::SelfConnection);
         }
-        let shared = self.secret.diffie_hellman(&PublicKey::from(remote.public_key));
+        let shared = self
+            .secret
+            .diffie_hellman(&PublicKey::from(remote.public_key));
         let local_is_low = self.local < remote.peer_id;
-        let (lo_pub, hi_pub) = if local_is_low { (self.public.to_bytes(), remote.public_key) }
-                               else { (remote.public_key, self.public.to_bytes()) };
+        let (lo_pub, hi_pub) = if local_is_low {
+            (self.public.to_bytes(), remote.public_key)
+        } else {
+            (remote.public_key, self.public.to_bytes())
+        };
         let mut salt = Vec::with_capacity(64);
         salt.extend_from_slice(&lo_pub);
         salt.extend_from_slice(&hi_pub);
@@ -101,19 +137,29 @@ impl Handshake {
             hk.expand(label.as_bytes(), &mut k).expect("hkdf");
             ChaCha20Poly1305::new(Key::from_slice(&k))
         };
-        let (c_lo_hi, c_hi_lo) = (key("roommesh v1 ctrl lo->hi"), key("roommesh v1 ctrl hi->lo"));
+        let (c_lo_hi, c_hi_lo) = (
+            key("roommesh v1 ctrl lo->hi"),
+            key("roommesh v1 ctrl hi->lo"),
+        );
         let (r_lo_hi, r_hi_lo) = (key("roommesh v1 rt lo->hi"), key("roommesh v1 rt hi->lo"));
         let mut sas_bytes = [0u8; 4];
         hk.expand(b"roommesh v1 sas", &mut sas_bytes).expect("hkdf");
         let code = u32::from_le_bytes(sas_bytes) % 1_000_000;
-        let (ctrl_tx, ctrl_rx, rt_tx, rt_rx) = if local_is_low { (c_lo_hi, c_hi_lo, r_lo_hi, r_hi_lo) }
-                                               else { (c_hi_lo, c_lo_hi, r_hi_lo, r_lo_hi) };
+        let (ctrl_tx, ctrl_rx, rt_tx, rt_rx) = if local_is_low {
+            (c_lo_hi, c_hi_lo, r_lo_hi, r_hi_lo)
+        } else {
+            (c_hi_lo, c_lo_hi, r_hi_lo, r_lo_hi)
+        };
         Ok(Session {
             remote: remote.peer_id,
             remote_name: remote.name.clone(),
             sas: format!("{:03} {:03}", code / 1000, code % 1000),
-            ctrl_tx, ctrl_rx,
-            rt: Arc::new(RtCipher { tx: rt_tx, rx: rt_rx }),
+            ctrl_tx,
+            ctrl_rx,
+            rt: Arc::new(RtCipher {
+                tx: rt_tx,
+                rx: rt_rx,
+            }),
             tx_counter: 0,
             rx_counter: 0,
         })
@@ -121,13 +167,25 @@ impl Handshake {
 }
 
 /// Realtime keys for one peer. Shared (`Arc`) between the FFI receive path and the DSP thread.
-pub struct RtCipher { tx: ChaCha20Poly1305, rx: ChaCha20Poly1305 }
+pub struct RtCipher {
+    tx: ChaCha20Poly1305,
+    rx: ChaCha20Poly1305,
+}
 
 impl RtCipher {
     pub fn seal(&self, h: &RtHeader, plaintext: &[u8]) -> Vec<u8> {
         let ct_len = plaintext.len() + 16;
         let aad = header_bytes(h, ct_len);
-        let ct = self.tx.encrypt(&rt_nonce(h), Payload { msg: plaintext, aad: &aad }).expect("encrypt");
+        let ct = self
+            .tx
+            .encrypt(
+                &rt_nonce(h),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .expect("encrypt");
         let mut v = Vec::with_capacity(HEADER_LEN + ct.len());
         v.extend_from_slice(&aad);
         v.extend(ct);
@@ -135,7 +193,15 @@ impl RtCipher {
     }
     pub fn open(&self, packet: &[u8]) -> Result<(RtHeader, Vec<u8>), SecureError> {
         let (h, ct) = decode_packet(packet)?;
-        let pt = self.rx.decrypt(&rt_nonce(&h), Payload { msg: ct, aad: &packet[..HEADER_LEN] })
+        let pt = self
+            .rx
+            .decrypt(
+                &rt_nonce(&h),
+                Payload {
+                    msg: ct,
+                    aad: &packet[..HEADER_LEN],
+                },
+            )
             .map_err(|_| SecureError::Crypto)?;
         Ok((h, pt))
     }
@@ -169,13 +235,22 @@ fn rt_nonce(h: &RtHeader) -> Nonce {
 }
 
 impl Session {
-    pub fn remote_peer(&self) -> PeerId { self.remote }
-    pub fn remote_name(&self) -> &str { &self.remote_name }
+    pub fn remote_peer(&self) -> PeerId {
+        self.remote
+    }
+    pub fn remote_name(&self) -> &str {
+        &self.remote_name
+    }
     /// Short authentication string both users can compare, e.g. "482 913".
-    pub fn sas(&self) -> &str { &self.sas }
+    pub fn sas(&self) -> &str {
+        &self.sas
+    }
 
     pub fn seal_control(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        let ct = self.ctrl_tx.encrypt(&counter_nonce(self.tx_counter), plaintext).expect("encrypt");
+        let ct = self
+            .ctrl_tx
+            .encrypt(&counter_nonce(self.tx_counter), plaintext)
+            .expect("encrypt");
         self.tx_counter += 1;
         let mut v = Vec::with_capacity(1 + ct.len());
         v.push(FRAME_SEALED);
@@ -183,21 +258,32 @@ impl Session {
         v
     }
     pub fn open_control(&mut self, frame: &[u8]) -> Result<Vec<u8>, SecureError> {
-        if frame.first() != Some(&FRAME_SEALED) { return Err(SecureError::Malformed); }
-        let pt = self.ctrl_rx.decrypt(&counter_nonce(self.rx_counter), &frame[1..]).map_err(|_| SecureError::Crypto)?;
+        if frame.first() != Some(&FRAME_SEALED) {
+            return Err(SecureError::Malformed);
+        }
+        let pt = self
+            .ctrl_rx
+            .decrypt(&counter_nonce(self.rx_counter), &frame[1..])
+            .map_err(|_| SecureError::Crypto)?;
         self.rx_counter += 1;
         Ok(pt)
     }
-    pub fn realtime(&self) -> Arc<RtCipher> { self.rt.clone() }
-    pub fn seal_realtime(&self, h: &RtHeader, plaintext: &[u8]) -> Vec<u8> { self.rt.seal(h, plaintext) }
-    pub fn open_realtime(&self, packet: &[u8]) -> Result<(RtHeader, Vec<u8>), SecureError> { self.rt.open(packet) }
+    pub fn realtime(&self) -> Arc<RtCipher> {
+        self.rt.clone()
+    }
+    pub fn seal_realtime(&self, h: &RtHeader, plaintext: &[u8]) -> Vec<u8> {
+        self.rt.seal(h, plaintext)
+    }
+    pub fn open_realtime(&self, packet: &[u8]) -> Result<(RtHeader, Vec<u8>), SecureError> {
+        self.rt.open(packet)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::realtime::*;
     use crate::ids::*;
+    use crate::network::realtime::*;
 
     fn pair() -> (Session, Session) {
         let a = Handshake::new(PeerId(1), "A".into());
@@ -238,8 +324,16 @@ mod tests {
     #[test]
     fn realtime_seal_open_any_order() {
         let (a, b) = pair();
-        let h = |seq| RtHeader { kind: PacketKind::Mic, epoch: Epoch(1), stream: StreamId::MIC, sender: PeerId(1),
-                                 sequence: seq, sample_index: 0, timestamp_ns: 0, frame_count: 480 };
+        let h = |seq| RtHeader {
+            kind: PacketKind::Mic,
+            epoch: Epoch(1),
+            stream: StreamId::MIC,
+            sender: PeerId(1),
+            sequence: seq,
+            sample_index: 0,
+            timestamp_ns: 0,
+            frame_count: 480,
+        };
         let p1 = a.seal_realtime(&h(1), b"one");
         let p2 = a.seal_realtime(&h(2), b"two");
         let (h2, pl2) = b.open_realtime(&p2).unwrap();
@@ -253,8 +347,16 @@ mod tests {
     #[test]
     fn realtime_payload_tamper_detected() {
         let (a, b) = pair();
-        let h = RtHeader { kind: PacketKind::Mic, epoch: Epoch(1), stream: StreamId::MIC, sender: PeerId(1),
-                           sequence: 1, sample_index: 0, timestamp_ns: 0, frame_count: 480 };
+        let h = RtHeader {
+            kind: PacketKind::Mic,
+            epoch: Epoch(1),
+            stream: StreamId::MIC,
+            sender: PeerId(1),
+            sequence: 1,
+            sample_index: 0,
+            timestamp_ns: 0,
+            frame_count: 480,
+        };
         let p = a.seal_realtime(&h, b"hello world, this is voice data");
         let mut bad = p.clone();
         let last = bad.len() - 1; // last byte of the ciphertext/tag, not the header
@@ -264,8 +366,16 @@ mod tests {
     #[test]
     fn epoch_changes_nonce_so_ciphertext_differs_for_same_plaintext() {
         let (a, b) = pair();
-        let h = |epoch| RtHeader { kind: PacketKind::Mic, epoch: Epoch(epoch), stream: StreamId::MIC, sender: PeerId(1),
-                                   sequence: 5, sample_index: 0, timestamp_ns: 0, frame_count: 480 };
+        let h = |epoch| RtHeader {
+            kind: PacketKind::Mic,
+            epoch: Epoch(epoch),
+            stream: StreamId::MIC,
+            sender: PeerId(1),
+            sequence: 5,
+            sample_index: 0,
+            timestamp_ns: 0,
+            frame_count: 480,
+        };
         let p1 = a.seal_realtime(&h(1), b"same plaintext!!");
         let p2 = a.seal_realtime(&h(2), b"same plaintext!!");
         // Compare only the ciphertext body (excluding the header/AAD and the 16-byte tag): with
