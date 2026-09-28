@@ -2,9 +2,16 @@
 use crate::audio::device_clock::DeviceClock;
 use crate::time::now_ns;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use std::time::Duration;
 
 pub const BLOCK_FRAMES: usize = 512;
+/// Prefix of the messages reported by [`DeviceHost::take_errors`] for the capture stream.
+pub const CAPTURE_STREAM_ERROR: &str = "capture stream error";
+/// Prefix of the messages reported by [`DeviceHost::take_errors`] for the playback stream.
+pub const PLAYBACK_STREAM_ERROR: &str = "playback stream error";
+/// Upper bound for a synchronous device open (`DeviceHost::start_*`).
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
 pub struct CaptureBlock {
@@ -131,7 +138,10 @@ pub fn list_devices() -> Vec<DeviceInfo> {
     v
 }
 
-fn build_capture(sel: &DeviceSelector) -> Result<(cpal::Stream, CaptureHandle), DeviceError> {
+fn build_capture(
+    sel: &DeviceSelector,
+    errors: Sender<String>,
+) -> Result<(cpal::Stream, CaptureHandle), DeviceError> {
     let host = cpal::default_host();
     let device = pick(
         host.input_devices().map_err(be)?,
@@ -151,6 +161,12 @@ fn build_capture(sel: &DeviceSelector) -> Result<(cpal::Stream, CaptureHandle), 
                 let ts = info.timestamp();
                 // cpal 0.18: `StreamInstant::duration_since` takes the earlier instant by value and
                 // returns `Duration` directly (saturating to zero), not `Option<Duration>`.
+                // cpal derives `callback` from the IO proc's mHostTime (≈ when the first frame of
+                // this buffer was captured) and sets `capture = callback - (buffer + device
+                // latency)`, i.e. one buffer more than the true capture delay. We only use the
+                // difference and anchor it at `now_ns()` read here, which is ≈ one buffer after
+                // mHostTime, so the extra buffer cancels and `capture_ns` ≈ mHostTime − latency,
+                // in our host-ns domain.
                 let lag = ts.callback.duration_since(ts.capture).as_nanos() as u64;
                 let mut capture_ns = now_ns().saturating_sub(lag);
                 let frames = data.len() / channels;
@@ -174,7 +190,10 @@ fn build_capture(sel: &DeviceSelector) -> Result<(cpal::Stream, CaptureHandle), 
                     done += n;
                 }
             },
-            |e| log::error!("capture stream error: {e}"),
+            move |e| {
+                log::error!("{CAPTURE_STREAM_ERROR}: {e}");
+                let _ = errors.try_send(format!("{CAPTURE_STREAM_ERROR}: {e}"));
+            },
             None,
         )
         .map_err(be)?;
@@ -189,7 +208,10 @@ fn build_capture(sel: &DeviceSelector) -> Result<(cpal::Stream, CaptureHandle), 
     ))
 }
 
-fn build_playback(sel: &DeviceSelector) -> Result<(cpal::Stream, PlaybackHandle), DeviceError> {
+fn build_playback(
+    sel: &DeviceSelector,
+    errors: Sender<String>,
+) -> Result<(cpal::Stream, PlaybackHandle), DeviceError> {
     let host = cpal::default_host();
     let device = pick(
         host.output_devices().map_err(be)?,
@@ -208,25 +230,35 @@ fn build_playback(sel: &DeviceSelector) -> Result<(cpal::Stream, PlaybackHandle)
             config,
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 let ts = info.timestamp();
+                // `playback = callback + (buffer + device latency)` with `callback` from the IO
+                // proc's mHostTime; the render callback runs ≈ one buffer before mHostTime, so
+                // anchoring the difference at `now_ns()` cancels cpal's extra buffer and
+                // `play_ns` ≈ when the first frame of this callback reaches the speaker.
                 let lead = ts.playback.duration_since(ts.callback).as_nanos() as u64;
                 let _ = rep_prod.push(PlaybackReport {
                     output_frames: out_frames,
                     popped_frames: popped,
                     play_ns: now_ns() + lead,
                 });
-                for frame in data.chunks_mut(channels) {
-                    let v = match cons.pop() {
-                        Ok(v) => {
-                            popped += 1;
-                            v
-                        }
-                        Err(_) => 0.0,
-                    };
-                    frame.fill(v);
-                    out_frames += 1;
+                let frames = data.len() / channels.max(1);
+                let n = frames.min(cons.slots());
+                let mut i = 0;
+                if let Ok(chunk) = cons.read_chunk(n) {
+                    let (a, b) = chunk.as_slices();
+                    for v in a.iter().chain(b.iter()) {
+                        data[i * channels..(i + 1) * channels].fill(*v);
+                        i += 1;
+                    }
+                    chunk.commit_all();
                 }
+                popped += i as u64;
+                data[i * channels..].fill(0.0);
+                out_frames += frames as u64;
             },
-            |e| log::error!("playback stream error: {e}"),
+            move |e| {
+                log::error!("{PLAYBACK_STREAM_ERROR}: {e}");
+                let _ = errors.try_send(format!("{PLAYBACK_STREAM_ERROR}: {e}"));
+            },
             None,
         )
         .map_err(be)?;
@@ -278,21 +310,23 @@ enum Cmd {
     StopPlayback,
 }
 
-/// Owns cpal streams on a dedicated thread.
+/// Owns cpal streams on a dedicated thread. Opens can be requested asynchronously
+/// ([`request_capture`](Self::request_capture)) so an audio thread never waits on cpal.
 pub struct DeviceHost {
     tx: Sender<Cmd>,
+    errors: Receiver<String>,
 }
 
 // `cap`/`play` are read only via their Drop impl (stopping the previous stream before replacing
 // or clearing it), which the unused-assignment lint can't see.
 #[allow(unused_assignments)]
-fn device_thread_loop(rx: crossbeam_channel::Receiver<Cmd>) {
+fn device_thread_loop(rx: Receiver<Cmd>, errors: Sender<String>) {
     let (mut cap, mut play): (Option<cpal::Stream>, Option<cpal::Stream>) = (None, None);
     for cmd in rx {
         match cmd {
             Cmd::StartCapture(sel, reply) => {
                 cap = None;
-                let _ = reply.send(build_capture(&sel).map(|(s, h)| {
+                let _ = reply.send(build_capture(&sel, errors.clone()).map(|(s, h)| {
                     cap = Some(s);
                     h
                 }));
@@ -300,7 +334,7 @@ fn device_thread_loop(rx: crossbeam_channel::Receiver<Cmd>) {
             Cmd::StopCapture => cap = None,
             Cmd::StartPlayback(sel, reply) => {
                 play = None;
-                let _ = reply.send(build_playback(&sel).map(|(s, h)| {
+                let _ = reply.send(build_playback(&sel, errors.clone()).map(|(s, h)| {
                     play = Some(s);
                     h
                 }));
@@ -310,30 +344,68 @@ fn device_thread_loop(rx: crossbeam_channel::Receiver<Cmd>) {
     }
 }
 
+fn recv_open<T>(rx: Receiver<Result<T, DeviceError>>) -> Result<T, DeviceError> {
+    match rx.recv_timeout(OPEN_TIMEOUT) {
+        Ok(r) => r,
+        Err(e) => Err(be(e)),
+    }
+}
+
 impl DeviceHost {
     pub fn spawn() -> Self {
         let (tx, rx) = unbounded::<Cmd>();
+        let (etx, erx) = bounded::<String>(64);
         std::thread::Builder::new()
             .name("roommesh-devices".into())
-            .spawn(move || device_thread_loop(rx))
+            .spawn(move || device_thread_loop(rx, etx))
             .expect("spawn device thread");
-        Self { tx }
+        Self { tx, errors: erx }
     }
-    pub fn start_capture(&self, sel: DeviceSelector) -> Result<CaptureHandle, DeviceError> {
+    /// Starts opening the capture device; the result arrives on the returned channel. A later
+    /// `stop_capture` (or another request) supersedes it.
+    pub fn request_capture(
+        &self,
+        sel: DeviceSelector,
+    ) -> Receiver<Result<CaptureHandle, DeviceError>> {
         let (tx, rx) = bounded(1);
-        self.tx.send(Cmd::StartCapture(sel, tx)).map_err(be)?;
-        rx.recv().map_err(be)?
+        if let Err(e) = self.tx.send(Cmd::StartCapture(sel, tx)) {
+            if let Cmd::StartCapture(_, reply) = e.into_inner() {
+                let _ = reply.send(Err(DeviceError::Backend("device thread stopped".into())));
+            }
+        }
+        rx
+    }
+    /// Blocking open (at most 3 s).
+    pub fn start_capture(&self, sel: DeviceSelector) -> Result<CaptureHandle, DeviceError> {
+        recv_open(self.request_capture(sel))
     }
     pub fn stop_capture(&self) {
         let _ = self.tx.send(Cmd::StopCapture);
     }
-    pub fn start_playback(&self, sel: DeviceSelector) -> Result<PlaybackHandle, DeviceError> {
+    /// Asynchronous counterpart of [`start_playback`](Self::start_playback).
+    pub fn request_playback(
+        &self,
+        sel: DeviceSelector,
+    ) -> Receiver<Result<PlaybackHandle, DeviceError>> {
         let (tx, rx) = bounded(1);
-        self.tx.send(Cmd::StartPlayback(sel, tx)).map_err(be)?;
-        rx.recv().map_err(be)?
+        if let Err(e) = self.tx.send(Cmd::StartPlayback(sel, tx)) {
+            if let Cmd::StartPlayback(_, reply) = e.into_inner() {
+                let _ = reply.send(Err(DeviceError::Backend("device thread stopped".into())));
+            }
+        }
+        rx
+    }
+    /// Blocking open (at most 3 s).
+    pub fn start_playback(&self, sel: DeviceSelector) -> Result<PlaybackHandle, DeviceError> {
+        recv_open(self.request_playback(sel))
     }
     pub fn stop_playback(&self) {
         let _ = self.tx.send(Cmd::StopPlayback);
+    }
+    /// Stream errors reported by cpal since the last call, prefixed with
+    /// [`CAPTURE_STREAM_ERROR`] or [`PLAYBACK_STREAM_ERROR`].
+    pub fn take_errors(&self) -> Vec<String> {
+        self.errors.try_iter().collect()
     }
 }
 
