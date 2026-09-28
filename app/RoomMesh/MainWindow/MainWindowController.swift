@@ -5,6 +5,7 @@ import SwiftUI
 final class MainWindowController: NSObject, NSWindowDelegate {
     static let shared = MainWindowController()
     private var window: NSWindow?
+    var isVisible: Bool { window?.isVisible ?? false }
 
     func show() {
         if window == nil {

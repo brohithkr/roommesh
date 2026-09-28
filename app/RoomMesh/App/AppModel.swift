@@ -60,6 +60,10 @@ final class AppModel {
 
     @ObservationIgnored var presentWindow: () -> Void = { MainWindowController.shared.show() }
     @ObservationIgnored var notifyInvite: (String, String) -> Void = { Notifications.shared.inviteReceived(roomName: $0, from: $1) }
+    /// Removes the delivered invite notification once the invite is answered.
+    @ObservationIgnored var inviteAnswered: () -> Void = { Notifications.shared.inviteAnswered() }
+    /// True when the invite sheet will be on screen anyway (app active, main window up): no banner then.
+    @ObservationIgnored var inviteUIVisible: () -> Bool = { NSApp.isActive && MainWindowController.shared.isVisible }
     /// Blocking privileged driver work, run off the main thread. Returns false if the user cancelled.
     @ObservationIgnored var driverWork: @Sendable (DriverOperation) throws -> Bool = { try DriverInstaller.perform($0) }
     /// Asks before restarting coreaudiod while in a room (it interrupts the room's audio).
@@ -176,6 +180,8 @@ final class AppModel {
 
     /// Called by the sheet content when it appears, so a later nil write can be matched to it.
     func sheetDidPresent(_ sheet: ActiveSheet) { presentedSheetID = sheet.id }
+    /// Called from the sheet content's onDisappear; a late call for an older sheet is ignored.
+    func sheetDidDisappear(_ sheet: ActiveSheet) { if presentedSheetID == sheet.id { presentedSheetID = nil } }
 
     /// Closes exactly `sheet` (closing an invite declines it); other pending sheets are untouched.
     func dismiss(_ sheet: ActiveSheet) {
@@ -202,6 +208,7 @@ final class AppModel {
     func respondToInvite(accept: Bool) {
         guard let inv = incomingInvite else { return }
         incomingInvite = nil
+        inviteAnswered()
         run { try $0.respondToInvite(roomId: inv.id, accept: accept) }
     }
     func leaveRoom() { run { try $0.leaveRoom() } }
@@ -299,8 +306,11 @@ final class AppModel {
         case .nearbyChanged(let peers): nearby = peers
         case .roomChanged(let state): room = state
         case .inviteReceived(let roomId, let roomName, let fromPeer, let fromName, let sas):
+            // Only one invite is shown at a time: a newer one for another room declines the old one,
+            // so its sender isn't left waiting. (Its notification is replaced by the new one's.)
+            if let old = incomingInvite, old.id != roomId { run { try $0.respondToInvite(roomId: old.id, accept: false) } }
             incomingInvite = PendingInvite(id: roomId, roomName: roomName, fromPeer: fromPeer, fromName: fromName, sas: sas)
-            notifyInvite(roomName, fromName)
+            if !inviteUIVisible() { notifyInvite(roomName, fromName) }
             presentWindow()
         case .inviteDeclined(let peerId): lastError = "\(name(of: peerId) ?? "The other Mac") declined the invitation."
         case .coordinatorLost(let c): coordinatorLostCandidates = c; presentWindow()

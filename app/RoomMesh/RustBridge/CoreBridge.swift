@@ -15,9 +15,9 @@ final class CoreSink: TransportSink, @unchecked Sendable {
 /// Core → UI events, delivered on Rust threads. Hops to the main queue, which is FIFO,
 /// so events are applied in the order the core emitted them (separate `Task`s are not).
 final class EventRelay: FfiEventListener, @unchecked Sendable {
-    private let deliver: @MainActor (FfiEvent) -> Void
+    private let deliver: @MainActor @Sendable (FfiEvent) -> Void
     /// Test seam: deliver to an arbitrary main-actor sink.
-    init(_ deliver: @escaping @MainActor (FfiEvent) -> Void) { self.deliver = deliver }
+    init(_ deliver: @escaping @MainActor @Sendable (FfiEvent) -> Void) { self.deliver = deliver }
     convenience init(model: AppModel) { self.init { [weak model] in model?.apply($0) } }
     func onEvent(event: FfiEvent) {
         DispatchQueue.main.async { [deliver] in

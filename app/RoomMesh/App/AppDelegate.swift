@@ -8,9 +8,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !Self.isHostingUnitTests else { return }
         MainActor.assumeIsolated {
             let model = AppModel.shared
+            // Handlers first: a launch from a notification action is delivered as soon as the delegate is set.
+            Notifications.shared.onInviteAction = { accept in
+                DispatchQueue.main.async { MainActor.assumeIsolated { AppModel.shared.respondToInvite(accept: accept) } }
+            }
+            Notifications.shared.onOpen = {
+                DispatchQueue.main.async { MainActor.assumeIsolated { MainWindowController.shared.show() } }
+            }
             Notifications.shared.setUp()
-            Notifications.shared.onInviteAction = { accept in Task { @MainActor in AppModel.shared.respondToInvite(accept: accept) } }
-            Notifications.shared.onOpen = { Task { @MainActor in MainWindowController.shared.show() } }
             model.bootstrap(driverInstalled: VirtualDeviceStatus.installed)
             model.refreshStatus()
             if Permissions.microphone == .undetermined { Task { _ = await Permissions.requestMicrophone() } }

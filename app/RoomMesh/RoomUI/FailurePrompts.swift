@@ -36,6 +36,7 @@ struct FailurePromptView: View {
         .padding(20)
         .frame(width: 340)
         .onAppear { choice = candidates.first ?? "" }
+        .onChange(of: candidates) { _, now in if !now.contains(choice) { choice = now.first ?? "" } }
     }
     private func dismissPrompt() {
         if kind == .coordinator { model.coordinatorLostCandidates = nil } else { model.speakerLostCandidates = nil }

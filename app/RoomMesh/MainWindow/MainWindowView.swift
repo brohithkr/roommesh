@@ -23,6 +23,7 @@ struct MainWindowView: View {
                 }
             }
             .onAppear { model.sheetDidPresent(sheet) }
+            .onDisappear { model.sheetDidDisappear(sheet) }
         }
     }
 }

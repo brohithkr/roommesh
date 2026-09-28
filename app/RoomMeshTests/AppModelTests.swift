@@ -18,6 +18,8 @@ final class AppModelTests: XCTestCase {
         model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
         model.presentWindow = {}
         model.notifyInvite = { _, _ in }
+        model.inviteAnswered = {}
+        model.inviteUIVisible = { false }
         model.driverWork = { _ in XCTFail("driver work must be stubbed per test"); return false }
         model.confirmAudioRestart = { XCTFail("unexpected confirmation"); return false }
         model.attach(core: core)
@@ -282,5 +284,44 @@ final class AppModelTests: XCTestCase {
         model.uninstallDriver()
         waitForDriverOperation()
         XCTAssertEqual(model.lastError, "rm: denied")
+    }
+    // MARK: invite lifecycle
+    func testReplacedInviteDeclinesTheOldOne() {
+        model.apply(.inviteReceived(roomId: "00000000000000f1", roomName: "A", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        model.apply(.inviteReceived(roomId: "00000000000000f2", roomName: "B", fromPeer: "000000000000000c", fromName: "Kim", sas: "2"))
+        XCTAssertEqual(core.calls, ["respond:00000000000000f1:false"])
+        guard case .incomingInvite(let inv) = model.activeSheet else { return XCTFail("new invite shown") }
+        XCTAssertEqual(inv.id, "00000000000000f2")
+    }
+    func testResentInviteForSameRoomIsNotDeclined() {
+        model.apply(.inviteReceived(roomId: "00000000000000f1", roomName: "A", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        model.apply(.inviteReceived(roomId: "00000000000000f1", roomName: "A", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        XCTAssertTrue(core.calls.isEmpty)
+    }
+    func testInviteBannerOnlyWhenTheSheetIsNotOnScreen() {
+        var banners = 0
+        model.notifyInvite = { _, _ in banners += 1 }
+        model.inviteUIVisible = { true }
+        model.apply(.inviteReceived(roomId: "00000000000000f1", roomName: "A", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        XCTAssertEqual(banners, 0, "app active with the window up: the sheet is enough")
+        model.inviteUIVisible = { false }
+        model.apply(.inviteReceived(roomId: "00000000000000f1", roomName: "A", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        XCTAssertEqual(banners, 1)
+    }
+    func testAnsweringAnInviteRemovesItsNotification() {
+        var removed = 0
+        model.inviteAnswered = { removed += 1 }
+        model.apply(.inviteReceived(roomId: "00000000000000f1", roomName: "A", fromPeer: "000000000000000b", fromName: "Amaan", sas: "1"))
+        model.respondToInvite(accept: true)
+        XCTAssertEqual(removed, 1)
+    }
+    func testSheetDisappearClearsOnlyItsOwnPresentation() {
+        model.apply(.coordinatorLost(candidates: []))
+        let prompt = model.activeSheet!
+        model.sheetDidPresent(prompt)
+        model.sheetDidDisappear(.invite) // some other sheet's late onDisappear
+        XCTAssertEqual(model.presentedSheetID, prompt.id)
+        model.sheetDidDisappear(prompt)
+        XCTAssertNil(model.presentedSheetID)
     }
 }
