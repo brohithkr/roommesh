@@ -5,3 +5,4 @@ pub mod coordinator;
 pub mod speaker;
 pub mod metrics;
 pub mod runtime;
+pub mod facade;
