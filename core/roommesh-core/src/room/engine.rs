@@ -8,6 +8,11 @@
 //! single coordinator instead of splitting the room — but C's mic can't reach the coordinator
 //! (and C sees it as offline) until the link heals. Control requests from C are relayed through
 //! a member that can see the coordinator.
+//!
+//! Automatic election also needs a quorum: a peer only elects while it sees at least half the
+//! room alive, so a peer that was offline or asleep doesn't come back as a phantom coordinator.
+//! Trade-off: when a room splits into a minority and a majority, the minority waits for a
+//! manual pick.
 use crate::ids::{PeerId, RoomId};
 use crate::room::election::{elect_coordinator, speaker_candidates};
 use crate::room::events::*;
@@ -822,20 +827,29 @@ impl RoomEngine {
                 let Some(m) = self.manifest.clone() else {
                     return;
                 };
-                // Direct from the joiner, or relayed by a member (e.g. the joiner was invited
-                // by a peer that has since stopped being the coordinator).
-                if m.room_id != room_id || (member.id != from && !m.is_member(from)) {
+                // Direct from the joiner, or relayed by a member for a joiner that isn't one yet
+                // (e.g. it was invited by a peer that has since stopped being the coordinator).
+                let relayed = member.id != from;
+                if m.room_id != room_id
+                    || (relayed && (!m.is_member(from) || m.is_member(member.id)))
+                {
                     return;
                 }
                 if m.coordinator == local {
                     let mut next = m;
+                    let mut member = member;
+                    // A member re-joining keeps the room's mic setting for it.
+                    if let Some(existing) = next.member(member.id) {
+                        member.mic_enabled = existing.mic_enabled;
+                    }
                     next.upsert_member(member);
                     next.revision += 1;
                     self.publish(now, next);
                 } else if m.coordinator != from {
-                    self.send_to_coordinator(
-                        now,
-                        &m,
+                    // One relay hop at most: the originator may pick a relayer, but a relayer
+                    // sends straight to the coordinator (queued if there's no session).
+                    self.send(
+                        m.coordinator,
                         ControlMessage::JoinRequest { room_id, member },
                     );
                 }
@@ -858,13 +872,15 @@ impl RoomEngine {
                         self.apply_change(now, change);
                     }
                 } else if cur.coordinator != from {
-                    // Relay unchanged (keeping the requester's epoch) — never back to its sender.
+                    // Relay unchanged (keeping the requester's epoch), never back to its sender,
+                    // and straight to the coordinator: one relay hop at most, so stale
+                    // `sees_coordinator` reports can't bounce it between members.
                     let msg = ControlMessage::Request {
                         room_id,
                         epoch,
                         change,
                     };
-                    self.send_to_coordinator(now, &cur, msg);
+                    self.send(cur.coordinator, msg);
                 }
             }
             ControlMessage::Leave { room_id } => {
@@ -1071,8 +1087,17 @@ impl RoomEngine {
         if self.coordinator_lost(now, &m) {
             let since = *self.coordinator_lost_since.get_or_insert(now);
             let waited = now.saturating_sub(since);
+            // Only elect while we see at least half the room: a peer that was offline/asleep (and
+            // so sees nobody) must not come back as a phantom coordinator or take over the room
+            // with a stale manifest. Manual SetCoordinator stays ungated.
+            let alive_n = m
+                .members
+                .iter()
+                .filter(|x| self.is_alive(now, x.id))
+                .count();
+            let quorum = alive_n * 2 >= m.members.len();
             if self.cfg.auto_elect {
-                if waited >= grace {
+                if waited >= grace && quorum {
                     let first = elect_coordinator(&m, |p| self.is_alive(now, p));
                     let winner = if waited >= 3 * grace && first != Some(local) {
                         elect_coordinator(&m, |p| self.is_alive(now, p) && Some(p) != first)
@@ -1949,5 +1974,121 @@ mod tests {
             .filter(|o| matches!(o, Output::Connect(p) if *p == PeerId(3)))
             .count();
         assert_eq!(connects, 1);
+    }
+
+    #[test]
+    fn relayed_request_takes_at_most_one_extra_hop() {
+        let mut n = room(&[1, 2, 3]);
+        n.kill(1); // sessions to 1 drop; 2 and 3 still report sees_coordinator=true for ~4 s
+        let now = n.now;
+        n.engines
+            .get_mut(&PeerId(2))
+            .unwrap()
+            .command(now, Command::SetSpeaker(Some(PeerId(3))))
+            .unwrap();
+        let mut hops = 0;
+        for _ in 0..50 {
+            let mut work = vec![];
+            for (id, e) in n.engines.iter_mut() {
+                let outs = e.take_outputs();
+                if !n.down.contains(id) {
+                    work.extend(outs.into_iter().map(|o| (*id, o)));
+                }
+            }
+            for (from, o) in work {
+                if let Output::Send { to, msg } = o {
+                    if matches!(msg, ControlMessage::Request { .. }) {
+                        hops += 1;
+                    }
+                    if n.can_talk(from, to) && n.links.contains(&k(from, to)) {
+                        n.engines.get_mut(&to).unwrap().on_message(now, from, msg);
+                    }
+                }
+            }
+        }
+        assert!(hops <= 2, "request bounced {hops} times");
+    }
+
+    #[test]
+    fn waking_peer_does_not_take_over_the_room() {
+        let mut n = room(&[1, 2, 3]);
+        n.kill(3); // asleep: no ticks
+        n.advance(20_000);
+        n.cmd(1, Command::SetSpeaker(Some(PeerId(2))));
+        n.down.remove(&PeerId(3));
+        n.partition(&[3], &[1, 2]); // wakes; sessions take a few seconds to come back
+        n.advance(3_000);
+        n.cut.clear();
+        n.advance(5_000);
+        let m = n.converged(&[1, 2, 3]);
+        assert_eq!((m.coordinator, m.epoch), (PeerId(1), Epoch(1)));
+        assert_eq!(m.speaker, Some(PeerId(2)), "changes made meanwhile survive");
+    }
+
+    #[test]
+    fn isolated_peer_does_not_self_elect_and_leaves_after_removal() {
+        let mut n = room(&[1, 2, 3]);
+        n.partition(&[3], &[1, 2]);
+        n.advance(8_000);
+        assert!(!n.engines[&PeerId(3)].roles().is_coordinator);
+        n.cmd(1, Command::RemoveMember(PeerId(3)));
+        n.cut.clear();
+        n.advance(10_000);
+        assert!(n.manifest(3).is_none());
+        assert_eq!(
+            n.converged(&[1, 2]).member_ids(),
+            vec![PeerId(1), PeerId(2)]
+        );
+    }
+
+    #[test]
+    fn relayed_join_request_cannot_overwrite_a_member() {
+        let mut n = room(&[1, 2, 3]);
+        let cur = n.converged(&[1, 2, 3]);
+        let now = n.now;
+        let mut forged = cur.member(PeerId(3)).unwrap().clone();
+        forged.name = "Forged".into();
+        let e1 = n.engines.get_mut(&PeerId(1)).unwrap();
+        e1.on_message(
+            now,
+            PeerId(2),
+            ControlMessage::JoinRequest {
+                room_id: cur.room_id,
+                member: forged,
+            },
+        );
+        assert_eq!(e1.manifest(), Some(&cur));
+    }
+
+    #[test]
+    fn member_rejoin_keeps_room_mic_setting() {
+        let mut n = room(&[1, 2]);
+        n.cmd(
+            1,
+            Command::SetMicEnabled {
+                peer: PeerId(2),
+                enabled: false,
+            },
+        );
+        let cur = n.converged(&[1, 2]);
+        let now = n.now;
+        let mut me = cur.member(PeerId(2)).unwrap().clone();
+        me.mic_enabled = true;
+        let e1 = n.engines.get_mut(&PeerId(1)).unwrap();
+        e1.on_message(
+            now,
+            PeerId(2),
+            ControlMessage::JoinRequest {
+                room_id: cur.room_id,
+                member: me,
+            },
+        );
+        assert!(
+            !e1.manifest()
+                .unwrap()
+                .member(PeerId(2))
+                .unwrap()
+                .mic_enabled
+        );
     }
 }
