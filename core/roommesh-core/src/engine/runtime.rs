@@ -372,6 +372,16 @@ fn next_seq(counter: &mut u32) -> u32 {
     s
 }
 
+/// No coordinator pipeline: drop mic metrics. Off the coordinator role, reports are stale too
+/// (they are only ever sent to the coordinator), so only names are kept.
+fn clear_mic_metrics(book: &mut MetricsBook, roles: &LocalRoles) {
+    if roles.is_coordinator {
+        book.clear_all_mic();
+    } else {
+        book.reset_to_names();
+    }
+}
+
 fn emit(events: &Sender<RuntimeEvent>, msg: String) {
     log::warn!("{msg}");
     let _ = events.try_send(RuntimeEvent::Error(msg));
@@ -807,7 +817,7 @@ impl Dsp {
     /// Coordinator teardown: the mic writer's drop silences RoomMesh Microphone at once.
     fn drop_coord(&mut self) {
         if self.coord.take().is_some() {
-            self.shared.metrics.lock().clear_all_mic();
+            clear_mic_metrics(&mut self.shared.metrics.lock(), &self.roles);
             self.mic_metric_peers.clear();
         }
         if std::mem::take(&mut self.last_aec) {
@@ -1291,7 +1301,7 @@ impl Dsp {
                 let _ = self.events.try_send(RuntimeEvent::AecStatus(conv));
             }
         } else if let Some(mut book) = self.shared.metrics.try_lock() {
-            book.clear_all_mic();
+            clear_mic_metrics(&mut book, &self.roles);
             self.mic_metric_peers.clear();
         }
         if !self.roles.is_coordinator {

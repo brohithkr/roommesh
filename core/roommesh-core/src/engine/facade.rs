@@ -20,7 +20,7 @@
 //! `[t1, t2, t3, ping_sequence]`, and the pinging DSP accepts a pong only for a ping it still
 //! has outstanding with the same t1 (once). Pings themselves pass a per-sender replay window
 //! (scoped to the session key and epoch) before they are answered.
-use crate::engine::metrics::PeerMetrics;
+use crate::engine::metrics::{merge_local_report, PeerMetrics};
 use crate::engine::runtime::{
     AudioBackend, AudioRuntime, AudioSettings, RuntimeEvent, RuntimeMsg, RuntimeSender,
     RuntimeShared,
@@ -356,26 +356,7 @@ impl Core {
     /// Per-peer metrics. On the coordinator these come from its pipelines and the members'
     /// `PeerReport`s; elsewhere the entry for the coordinator is filled from our own link to it.
     pub fn metrics(&self) -> Vec<PeerMetrics> {
-        let mut v = self.runtime_shared.metrics.lock().snapshot();
-        let roles = self.roles();
-        let report = self.runtime_shared.local_report.lock().clone();
-        if let (Some(r), Some(c), false) = (report, roles.coordinator, roles.is_coordinator) {
-            let m = match v.iter().position(|m| m.peer == c) {
-                Some(i) => &mut v[i],
-                None => {
-                    v.push(PeerMetrics {
-                        peer: c,
-                        ..Default::default()
-                    });
-                    v.last_mut().expect("just pushed")
-                }
-            };
-            m.rtt_ms = Some(r.rtt_ms);
-            m.clock_offset_ms = Some(r.clock_offset_ms);
-            m.drift_ppm = Some(r.drift_ppm);
-            m.transport = r.transport;
-        }
-        v
+        merged_metrics(&self.runtime_shared, &self.roles())
     }
     pub fn virtual_device_ok(&self) -> bool {
         self.runtime_shared
@@ -434,6 +415,15 @@ struct ControlLoop {
 
 fn now_ms() -> u64 {
     now_ns() / 1_000_000
+}
+
+/// The metrics book merged with our own link report (see [`merge_local_report`]): the single
+/// source for both `Core::metrics()` and connection-quality events.
+fn merged_metrics(shared: &RuntimeShared, roles: &LocalRoles) -> Vec<PeerMetrics> {
+    let mut v = shared.metrics.lock().snapshot();
+    let report = shared.local_report.lock().clone();
+    merge_local_report(&mut v, roles, report.as_ref());
+    v
 }
 
 impl ControlLoop {
@@ -524,8 +514,14 @@ impl ControlLoop {
                             msg: ControlMessage::PeerReport(r),
                             from,
                         }) => {
-                            // Only the peer itself may report on its own link.
-                            if r.peer == from {
+                            // Only the peer itself may report on its own link, only to the
+                            // coordinator, and only while it is a member of our room.
+                            let accept =
+                                r.peer == from
+                                    && self.cache.roles.lock().as_ref().is_some_and(|l| {
+                                        l.is_coordinator && l.members.contains(&from)
+                                    });
+                            if accept {
                                 self.runtime_shared.metrics.lock().apply_report(&r);
                             }
                         }
@@ -579,7 +575,13 @@ impl ControlLoop {
 
     /// Emits `ConnectionQualityChanged` for every peer whose classification changed.
     fn quality(&mut self) {
-        let metrics = self.runtime_shared.metrics.lock().snapshot();
+        let roles = self
+            .cache
+            .roles
+            .lock()
+            .clone()
+            .unwrap_or_else(LocalRoles::none);
+        let metrics = merged_metrics(&self.runtime_shared, &roles);
         self.last_quality
             .retain(|p, _| metrics.iter().any(|m| m.peer == *p));
         for m in metrics.into_iter().filter(|m| m.peer != self.local) {
@@ -616,8 +618,13 @@ impl ControlLoop {
                         RoomEvent::RoomChanged(s) => {
                             if let Some(s) = s {
                                 let mut book = self.runtime_shared.metrics.lock();
-                                for m in s.members.iter().filter(|m| !m.is_local) {
-                                    book.set_name(m.id, m.name.clone());
+                                for m in &s.members {
+                                    if m.is_local {
+                                        // Listed only while its own mic is analysed.
+                                        book.note_name(m.id, m.name.clone());
+                                    } else {
+                                        book.set_name(m.id, m.name.clone());
+                                    }
                                 }
                             }
                             *self.cache.snapshot.lock() = s.clone();
@@ -636,7 +643,8 @@ impl ControlLoop {
                                 book.clear_mic(*p);
                             }
                         } else {
-                            book.clear_all_mic(); // mic metrics exist only on the coordinator
+                            // Reports and mic metrics exist only on the coordinator.
+                            book.reset_to_names();
                         }
                     }
                     self.cache
@@ -907,6 +915,45 @@ mod tests {
         assert!(w.accept(&c1, Epoch(2), 12), "new epoch resets");
         assert!(w.accept(&c2, Epoch(2), 0), "new key resets");
         assert!(!w.accept(&c2, Epoch(2), 0));
+    }
+
+    #[test]
+    fn peer_reports_apply_only_on_the_coordinator_from_members() {
+        use crate::room::protocol::PeerReport;
+        let net = LoopbackNetwork::new();
+        let a = node(&net, 1, Box::new(NullAudio));
+        let mut raw = raw_peer(&net, 2, &a, 1);
+        let send_report = |raw: &mut RawPeer| {
+            let r = PeerReport {
+                peer: PeerId(2),
+                rtt_ms: 9.0,
+                jitter_ms: 1.0,
+                loss_pct: 0.0,
+                clock_offset_ms: 0.0,
+                drift_ppm: 0.0,
+                transport: "lo".into(),
+            };
+            let f = raw
+                .control
+                .seal(PeerId(1), &ControlMessage::PeerReport(r))
+                .expect("session");
+            raw.transport.send_control(PeerId(1), f);
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let has_report = || {
+            a.core
+                .metrics()
+                .iter()
+                .any(|m| m.peer == PeerId(2) && m.rtt_ms.is_some())
+        };
+        send_report(&mut raw);
+        assert!(!has_report(), "not in a room: report must be ignored");
+        a.core
+            .command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        wait("A coordinates", 3, || a.core.roles().is_coordinator);
+        send_report(&mut raw);
+        assert!(!has_report(), "reports from non-members must be ignored");
     }
 
     #[test]

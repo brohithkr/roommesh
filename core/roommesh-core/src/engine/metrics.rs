@@ -2,7 +2,7 @@
 use crate::audio::jitter_buffer::JitterStats;
 use crate::engine::coordinator::MicStatus;
 use crate::ids::PeerId;
-use crate::room::events::ConnectionQuality;
+use crate::room::events::{ConnectionQuality, LocalRoles};
 use crate::room::protocol::PeerReport;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,6 +71,42 @@ pub fn stream_jitter_ms(s: &JitterStats) -> f32 {
     (s.jitter_ns / 1e6) as f32
 }
 
+/// Completes a book snapshot with this peer's own link report. Off the coordinator the book
+/// knows nothing about the coordinator (reports and mic streams are coordinator-only), so its
+/// entry is filled from our own measurements: RTT, clock offset/drift and transport always, and
+/// jitter/loss when we are the room speaker (the report's jitter/loss then describe the far-end
+/// stream we receive; otherwise they are placeholders). Quality is re-classified afterwards.
+/// Used for both `Core::metrics()` and the connection-quality events, so they always agree.
+pub fn merge_local_report(
+    v: &mut Vec<PeerMetrics>,
+    roles: &LocalRoles,
+    report: Option<&PeerReport>,
+) {
+    if let (Some(r), Some(c), false) = (report, roles.coordinator, roles.is_coordinator) {
+        let m = match v.iter().position(|m| m.peer == c) {
+            Some(i) => &mut v[i],
+            None => {
+                v.push(PeerMetrics {
+                    peer: c,
+                    ..Default::default()
+                });
+                v.last_mut().expect("just pushed")
+            }
+        };
+        m.rtt_ms = Some(r.rtt_ms);
+        m.clock_offset_ms = Some(r.clock_offset_ms);
+        m.drift_ppm = Some(r.drift_ppm);
+        m.transport = r.transport.clone();
+        if roles.is_speaker {
+            m.jitter_ms = Some(r.jitter_ms);
+            m.loss_pct = Some(r.loss_pct);
+        }
+    }
+    for m in v.iter_mut() {
+        m.quality = classify(m.loss_pct, m.jitter_ms, m.rtt_ms);
+    }
+}
+
 #[derive(Default)]
 pub struct MetricsBook {
     peers: BTreeMap<PeerId, PeerMetrics>,
@@ -79,22 +115,51 @@ pub struct MetricsBook {
     stream_fed: BTreeSet<PeerId>,
     /// Last reported (jitter_ms, loss_pct) per peer, restored when stream info is cleared.
     reported: BTreeMap<PeerId, (f32, f32)>,
+    /// Display names, applied to entries whenever they are (re)created.
+    names: BTreeMap<PeerId, String>,
 }
 
 impl MetricsBook {
     fn entry(&mut self, p: PeerId) -> &mut PeerMetrics {
+        let name = &self.names;
         self.peers.entry(p).or_insert_with(|| PeerMetrics {
             peer: p,
+            name: name.get(&p).cloned().unwrap_or_default(),
             ..Default::default()
         })
     }
+    /// Names `p` and makes sure it is listed (a member with no metrics yet).
     pub fn set_name(&mut self, p: PeerId, name: String) {
+        self.note_name(p, name.clone());
         self.entry(p).name = name;
+    }
+    /// Names `p` without listing it: the name is applied if and when `p` gets metrics (the
+    /// local peer, which only has an entry while it coordinates and its own mic is analysed).
+    pub fn note_name(&mut self, p: PeerId, name: String) {
+        if let Some(e) = self.peers.get_mut(&p) {
+            e.name = name.clone();
+        }
+        self.names.insert(p, name);
     }
     pub fn retain(&mut self, members: &[PeerId]) {
         self.peers.retain(|p, _| members.contains(p));
         self.stream_fed.retain(|p| members.contains(p));
         self.reported.retain(|p, _| members.contains(p));
+        self.names.retain(|p, _| members.contains(p));
+    }
+    /// Drops every measurement, keeping only the peers and their names. For a peer that is not
+    /// the coordinator: reports and mic streams are coordinator-only, so anything left over from
+    /// an earlier coordinator stint is stale.
+    pub fn reset_to_names(&mut self) {
+        for (p, e) in self.peers.iter_mut() {
+            *e = PeerMetrics {
+                peer: *p,
+                name: std::mem::take(&mut e.name),
+                ..Default::default()
+            };
+        }
+        self.stream_fed.clear();
+        self.reported.clear();
     }
     pub fn apply_report(&mut self, r: &PeerReport) {
         self.reported.insert(r.peer, (r.jitter_ms, r.loss_pct));
@@ -338,5 +403,105 @@ mod tests {
         assert_eq!(p.jitter_ms, Some(2.0));
         assert_eq!(p.quality, ConnectionQuality::Excellent);
         assert!(p.is_active && p.aec_converged);
+    }
+    #[test]
+    fn reset_to_names_forgets_reports_and_streams() {
+        let mut b = MetricsBook::default();
+        b.set_name(PeerId(2), "Amaan".into());
+        b.apply_report(&report(7.0, 0.1));
+        b.apply_mic(
+            PeerId(2),
+            0.8,
+            0.9,
+            Some(4.0),
+            Some(1.5),
+            None,
+            None,
+            true,
+            true,
+        );
+        b.reset_to_names();
+        let p = b.snapshot().remove(0);
+        assert_eq!(
+            p,
+            PeerMetrics {
+                peer: PeerId(2),
+                name: "Amaan".into(),
+                ..Default::default()
+            }
+        );
+        // No stale report comes back when mic info is cleared later.
+        b.apply_mic(
+            PeerId(2),
+            0.8,
+            0.9,
+            Some(4.0),
+            Some(1.5),
+            None,
+            None,
+            true,
+            true,
+        );
+        b.clear_mic(PeerId(2));
+        let p = b.snapshot().remove(0);
+        assert_eq!((p.jitter_ms, p.loss_pct, p.rtt_ms), (None, None, None));
+    }
+    #[test]
+    fn noted_names_apply_when_an_entry_appears() {
+        let mut b = MetricsBook::default();
+        b.note_name(PeerId(1), "Me".into());
+        assert!(
+            b.snapshot().is_empty(),
+            "noting a name does not list the peer"
+        );
+        b.apply_mic(PeerId(1), 0.5, 0.5, None, None, None, None, false, true);
+        assert_eq!(b.snapshot()[0].name, "Me");
+        b.note_name(PeerId(1), "Renamed".into());
+        assert_eq!(b.snapshot()[0].name, "Renamed");
+    }
+    fn member_roles(coordinator: u64, is_speaker: bool) -> LocalRoles {
+        LocalRoles {
+            coordinator: Some(PeerId(coordinator)),
+            is_coordinator: false,
+            is_speaker,
+            ..LocalRoles::none()
+        }
+    }
+    #[test]
+    fn local_report_fills_the_coordinator_entry_and_reclassifies() {
+        let r = PeerReport {
+            peer: PeerId(2),
+            rtt_ms: 5.0,
+            jitter_ms: 40.0,
+            loss_pct: 12.0,
+            clock_offset_ms: 1.0,
+            drift_ppm: 2.0,
+            transport: "awdl0".into(),
+        };
+        // Not the speaker: jitter/loss are placeholders and stay out.
+        let mut v = vec![PeerMetrics {
+            peer: PeerId(1),
+            name: "Coord".into(),
+            ..Default::default()
+        }];
+        merge_local_report(&mut v, &member_roles(1, false), Some(&r));
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].rtt_ms, v[0].jitter_ms), (Some(5.0), None));
+        assert_eq!(v[0].transport, "awdl0");
+        assert_eq!(v[0].quality, ConnectionQuality::Excellent);
+        // Speaker: the far-end stream's jitter/loss count, and quality follows.
+        let mut v = Vec::new();
+        merge_local_report(&mut v, &member_roles(1, true), Some(&r));
+        assert_eq!(v[0].peer, PeerId(1));
+        assert_eq!((v[0].jitter_ms, v[0].loss_pct), (Some(40.0), Some(12.0)));
+        assert_eq!(v[0].quality, ConnectionQuality::Degraded);
+        // The coordinator itself merges nothing.
+        let mut v = Vec::new();
+        let coord = LocalRoles {
+            is_coordinator: true,
+            ..member_roles(1, true)
+        };
+        merge_local_report(&mut v, &coord, Some(&r));
+        assert!(v.is_empty());
     }
 }
