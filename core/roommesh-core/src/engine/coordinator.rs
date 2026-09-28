@@ -11,10 +11,14 @@ use crate::dsp::arbitration::{Arbiter, ArbitrationConfig, MicObservation, Select
 use crate::dsp::level::{measure, EnvelopeTracker};
 use crate::dsp::scoring::{MicFeatures, MicScorer};
 use crate::dsp::vad::Vad;
-use crate::engine::stream::StreamReceiver;
+use crate::engine::stream::{StreamReceiver, CODEC_DELAY_NS};
 use crate::ids::{Epoch, PeerId, StreamId};
 use crate::network::realtime::{PacketKind, RtHeader};
 use std::collections::BTreeMap;
+
+/// Interpolation context past the end of a read window (the timeline's cubic reader needs two
+/// samples beyond the last output sample), rounded up.
+const PUMP_MARGIN_NS: u64 = 100_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoordinatorConfig {
@@ -80,6 +84,8 @@ struct MicChannel {
     env: EnvelopeTracker,
     /// Last analysed level, held in `env` during dropouts so envelope histories stay aligned.
     last_level_db: f32,
+    /// Samples of the last produced frame this mic could not supply (0 = fully covered).
+    last_missing: usize,
     status: MicStatus,
 }
 
@@ -155,6 +161,7 @@ impl CoordinatorPipeline {
                 scorer: MicScorer::new(),
                 env: EnvelopeTracker::new(50),
                 last_level_db: -90.0,
+                last_missing: FRAME_SAMPLES,
                 status: MicStatus {
                     peer: p,
                     score: 0.0,
@@ -252,7 +259,15 @@ impl CoordinatorPipeline {
             let mut mic = vec![0.0f32; FRAME_SAMPLES];
             let st = match (ch.rx.as_mut(), ch.local.as_mut()) {
                 (Some(rx), _) => {
-                    rx.pump(t_mic + FRAME_NS, now_ns, Some);
+                    // The receiver shifts decoded audio back by the codec delay, so the packet
+                    // stamped `ts` ends at `ts + FRAME_NS - CODEC_DELAY_NS`: to cover the read
+                    // window up to `t_mic + FRAME_NS` (plus interpolation context) at any phase,
+                    // decode every packet stamped up to that far past it.
+                    rx.pump(
+                        t_mic + FRAME_NS + CODEC_DELAY_NS + PUMP_MARGIN_NS,
+                        now_ns,
+                        Some,
+                    );
                     ch.status.jitter = Some(rx.stats());
                     ch.status.buffer_ms = rx
                         .timeline
@@ -263,6 +278,7 @@ impl CoordinatorPipeline {
                 (None, Some(tl)) => tl.read(t_mic, NS_PER_SAMPLE, &mut mic),
                 _ => continue,
             };
+            ch.last_missing = st.missing;
             let present = st.missing < FRAME_SAMPLES / 2;
             let clip = measure(&mic).clip_ratio;
             // The AEC always runs so its render/capture streams stay in step.
@@ -498,6 +514,44 @@ mod tests {
             t += FRAME_NS;
         }
         assert!(energy > 0.01, "mixed output energy {energy}");
+    }
+    /// A remote stream whose packet grid is offset from the output grid by any phase must fully
+    /// cover every output frame: the receive timeline is shifted back by the codec delay, so the
+    /// pump deadline has to reach that far past the read window.
+    #[test]
+    fn remote_mic_fully_covers_output_at_every_phase() {
+        // 0..=10 ms in 1 ms steps, plus the edge where a packet's shifted audio ends exactly at
+        // the read window's end.
+        let phases_us = (0..=10u64)
+            .map(|m| m * 1_000)
+            .chain([6_450, 6_500, 6_520, 6_550]);
+        for phase_us in phases_us {
+            let mut pipe =
+                CoordinatorPipeline::new(PeerId(1), Epoch(1), CoordinatorConfig::default())
+                    .unwrap();
+            pipe.set_enabled_mics(&[PeerId(2)]);
+            let mut up = MicUplink::new(PeerId(2), 64_000).unwrap();
+            let phase = phase_us * 1_000;
+            for k in 0..150u64 {
+                let t = T0 + k * FRAME_NS;
+                let cap = t + phase;
+                let f = AudioFrame {
+                    sample_index: k * 480,
+                    timestamp_ns: cap,
+                    samples: (0..480u64).map(|i| talker(k * 480 + i)).collect(),
+                };
+                let (h, p) = up.packetize(&f, Epoch(1), cap).unwrap();
+                pipe.push_remote_mic(h, p, cap + 3_000_000);
+                pipe.produce(t, t);
+                if k > 20 {
+                    let missing = pipe.mics[&PeerId(2)].last_missing;
+                    assert_eq!(
+                        missing, 0,
+                        "phase {phase_us} us, frame {k}: {missing} missing"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn rejects_wrong_epoch_and_disabled_mics() {
