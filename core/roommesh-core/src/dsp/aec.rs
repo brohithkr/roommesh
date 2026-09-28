@@ -11,8 +11,11 @@ pub struct AecStats {
 }
 
 pub trait EchoCanceller: Send {
-    /// `reference`: 10 ms of far-end audio played at the time `mic` was captured. `mic` is
-    /// replaced by the echo-cancelled signal.
+    /// `reference`: >= 480 samples (10 ms at 48 kHz) of far-end audio that was played no later
+    /// than `mic`'s capture time -- AEC3 models only a causal delay (reference leads or
+    /// coincides with the echo it's meant to cancel), never a reference that lags behind it.
+    /// `mic` is expected to be exactly 480 samples and is replaced by the echo-cancelled signal
+    /// in place.
     fn process(&mut self, reference: &[f32], mic: &mut [f32]);
     fn stats(&self) -> AecStats;
 }
@@ -52,6 +55,14 @@ impl WebRtcAec {
 
 impl EchoCanceller for WebRtcAec {
     fn process(&mut self, reference: &[f32], mic: &mut [f32]) {
+        if reference.len() < 480 || mic.len() != 480 {
+            log::warn!(
+                "aec: expected a 480-sample reference (got {}) and exactly 480 mic samples (got {}); skipping frame",
+                reference.len(),
+                mic.len()
+            );
+            return;
+        }
         self.render.copy_from_slice(&reference[..480]);
         if let Err(e) = self.ap.process_render_frame([&mut self.render[..]]) {
             log::warn!("aec render: {e:?}");
@@ -123,5 +134,19 @@ mod tests {
         let erle = 10.0 * (e_in / e_out.max(1e-12)).log10();
         assert!(erle > 10.0, "echo reduction only {erle} dB");
         assert!(aec.stats().delay_ms.is_some() || aec.stats().erle_db.is_some());
+    }
+
+    #[test]
+    fn short_frames_are_ignored_without_panicking() {
+        let mut aec = WebRtcAec::new(false).unwrap();
+        let mut short_mic = vec![0.1f32; 10];
+        aec.process(&[0.2; 10], &mut short_mic);
+        assert_eq!(short_mic, vec![0.1f32; 10]); // untouched: the frame was skipped
+        let mut mic480 = vec![0.1f32; 480];
+        aec.process(&[0.2; 10], &mut mic480); // reference too short, mic correctly sized
+        assert_eq!(mic480, vec![0.1f32; 480]);
+        let mut mic_wrong_len = vec![0.1f32; 500];
+        aec.process(&[0.2; 480], &mut mic_wrong_len); // reference fine, mic wrong length
+        assert_eq!(mic_wrong_len, vec![0.1f32; 500]);
     }
 }

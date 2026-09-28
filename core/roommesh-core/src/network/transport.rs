@@ -38,4 +38,8 @@ pub enum TransportEvent {
     Realtime(Vec<u8>),
 }
 
+/// Should be an unbounded sender (or otherwise never block on a full/rendezvous channel):
+/// implementations such as `LoopbackNetwork` may hold an internal lock shared by every peer
+/// while resolving which sinks to notify, so a sink whose `send` blocks (or is slow) can stall
+/// unrelated peers even when events are queued for sending only after the lock is released.
 pub type TransportSink = crossbeam_channel::Sender<TransportEvent>;

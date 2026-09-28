@@ -21,6 +21,11 @@ pub struct Hello {
     pub peer_id: PeerId,
     pub name: String,
     pub public_key: [u8; 32],
+    /// Set only when this Hello answers an opening Hello: the public key being answered. A
+    /// Hello with `reply_to` set must never itself be answered with another Hello -- that
+    /// invariant is what keeps the handshake to a single request/response round instead of an
+    /// unbounded ping-pong when both peers race to connect or a duplicate Hello arrives.
+    pub reply_to: Option<[u8; 32]>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -49,10 +54,16 @@ impl Handshake {
         let public = PublicKey::from(&secret);
         Self { local, name, secret, public }
     }
-    /// Plaintext frame to send first on a fresh control connection.
-    pub fn hello(&self) -> Vec<u8> {
+    pub fn public_key(&self) -> [u8; 32] { self.public.to_bytes() }
+    /// Plaintext frame to send first on a fresh control connection (an "opening" Hello:
+    /// `reply_to: None`).
+    pub fn hello(&self) -> Vec<u8> { self.build_hello(None) }
+    /// Plaintext reply to an opening Hello, naming the public key it answers. Never call this
+    /// in response to a Hello that itself has `reply_to` set.
+    pub fn hello_reply(&self, opening: &Hello) -> Vec<u8> { self.build_hello(Some(opening.public_key)) }
+    fn build_hello(&self, reply_to: Option<[u8; 32]>) -> Vec<u8> {
         let h = Hello { protocol_version: crate::room::state::PROTOCOL_VERSION, peer_id: self.local,
-                        name: self.name.clone(), public_key: self.public.to_bytes() };
+                        name: self.name.clone(), public_key: self.public.to_bytes(), reply_to };
         let mut v = vec![FRAME_HELLO];
         v.extend(postcard::to_allocvec(&h).expect("hello"));
         v

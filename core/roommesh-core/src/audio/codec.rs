@@ -43,7 +43,12 @@ impl VoiceDecoder {
         Ok(self.dec.decode_float(packet, out, false)?)
     }
     /// Conceal one lost frame: FEC from the following packet when available, otherwise PLC.
+    /// Always decodes exactly one `FRAME_SAMPLES`-sample frame, even into a larger buffer.
     pub fn conceal(&mut self, next_packet: Option<&[u8]>, out: &mut [f32]) -> Result<usize, CodecError> {
+        if out.len() < FRAME_SAMPLES {
+            return Err(CodecError::FrameSize(out.len()));
+        }
+        let out = &mut out[..FRAME_SAMPLES];
         match next_packet {
             Some(p) => Ok(self.dec.decode_float(p, out, true)?),
             None => Ok(self.dec.decode_float(&[], out, false)?),
@@ -85,5 +90,21 @@ mod tests {
         assert_eq!(dec.conceal(None, &mut out).unwrap(), FRAME_SAMPLES);
         assert_eq!(dec.conceal(Some(&pkt), &mut out).unwrap(), FRAME_SAMPLES);
         assert!(enc.encode(&[0.0; 100]).is_err());
+    }
+    #[test]
+    fn conceal_writes_one_frame_into_a_larger_buffer() {
+        let mut enc = VoiceEncoder::new(32_000).unwrap();
+        let mut dec = VoiceDecoder::new().unwrap();
+        let mut out = vec![0.0f32; FRAME_SAMPLES];
+        let pkt = enc.encode(&vec![0.1; FRAME_SAMPLES]).unwrap();
+        dec.decode(&pkt, &mut out).unwrap();
+        let mut big = vec![0.0f32; 5760];
+        assert_eq!(dec.conceal(None, &mut big).unwrap(), FRAME_SAMPLES);
+    }
+    #[test]
+    fn conceal_rejects_undersized_buffer() {
+        let mut dec = VoiceDecoder::new().unwrap();
+        let mut small = vec![0.0f32; 10];
+        assert!(matches!(dec.conceal(None, &mut small), Err(CodecError::FrameSize(10))));
     }
 }

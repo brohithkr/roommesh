@@ -40,19 +40,31 @@ impl LoopbackNetwork {
         Arc::new(LoopbackTransport { net: self.clone(), me })
     }
 
-    fn emit(inner: &Inner, to: PeerId, ev: TransportEvent) {
-        if let Some(n) = inner.nodes.get(&to) {
-            let _ = n.sink.send(ev);
+    /// Looks up a node's sink (a cheap clone of the channel sender) without sending anything.
+    /// Callers collect the (sink, event) pairs they need to emit while holding `inner`'s lock,
+    /// then send them only after the lock is released -- see the module-level note on why we
+    /// never call `TransportSink::send` while holding the lock.
+    fn sink(inner: &Inner, to: PeerId) -> Option<TransportSink> {
+        inner.nodes.get(&to).map(|n| n.sink.clone())
+    }
+    fn flush(sends: Vec<(TransportSink, TransportEvent)>) {
+        for (s, ev) in sends {
+            let _ = s.send(ev);
         }
     }
 
     pub fn partition(&self, a: PeerId, b: PeerId) {
-        let mut g = self.inner.lock();
-        g.blocked.insert(key(a, b));
-        if g.links.remove(&key(a, b)) {
-            Self::emit(&g, a, TransportEvent::Disconnected(b));
-            Self::emit(&g, b, TransportEvent::Disconnected(a));
-        }
+        let sends = {
+            let mut g = self.inner.lock();
+            g.blocked.insert(key(a, b));
+            let mut sends = Vec::new();
+            if g.links.remove(&key(a, b)) {
+                if let Some(s) = Self::sink(&g, a) { sends.push((s, TransportEvent::Disconnected(b))); }
+                if let Some(s) = Self::sink(&g, b) { sends.push((s, TransportEvent::Disconnected(a))); }
+            }
+            sends
+        };
+        Self::flush(sends);
     }
     pub fn heal(&self, a: PeerId, b: PeerId) {
         self.inner.lock().blocked.remove(&key(a, b));
@@ -60,19 +72,26 @@ impl LoopbackNetwork {
 
     /// Simulates a crash: drops all links of `peer` and removes it.
     pub fn remove(&self, peer: PeerId) {
-        let mut g = self.inner.lock();
-        let others: Vec<PeerId> = g
-            .links
-            .iter()
-            .filter(|(x, y)| *x == peer || *y == peer)
-            .map(|(x, y)| if *x == peer { *y } else { *x })
-            .collect();
-        for o in others {
-            g.links.remove(&key(peer, o));
-            Self::emit(&g, o, TransportEvent::Disconnected(peer));
-            Self::emit(&g, o, TransportEvent::Lost(peer));
-        }
-        g.nodes.remove(&peer);
+        let sends = {
+            let mut g = self.inner.lock();
+            let others: Vec<PeerId> = g
+                .links
+                .iter()
+                .filter(|(x, y)| *x == peer || *y == peer)
+                .map(|(x, y)| if *x == peer { *y } else { *x })
+                .collect();
+            let mut sends = Vec::new();
+            for o in others {
+                g.links.remove(&key(peer, o));
+                if let Some(s) = Self::sink(&g, o) {
+                    sends.push((s.clone(), TransportEvent::Disconnected(peer)));
+                    sends.push((s, TransportEvent::Lost(peer)));
+                }
+            }
+            g.nodes.remove(&peer);
+            sends
+        };
+        Self::flush(sends);
     }
 }
 
@@ -83,21 +102,30 @@ pub struct LoopbackTransport {
 
 impl PeerTransport for LoopbackTransport {
     fn start(&self, advert: LocalAdvertisement) {
-        let mut g = self.net.inner.lock();
-        if let Some(n) = g.nodes.get_mut(&self.me) {
-            n.name = advert.name.clone();
-            n.advertised = true;
-        }
-        let others: Vec<(PeerId, String)> = g
-            .nodes
-            .iter()
-            .filter(|(id, n)| **id != self.me && n.advertised)
-            .map(|(id, n)| (*id, n.name.clone()))
-            .collect();
-        for (id, name) in others {
-            LoopbackNetwork::emit(&g, self.me, TransportEvent::Discovered { peer: id, name });
-            LoopbackNetwork::emit(&g, id, TransportEvent::Discovered { peer: self.me, name: advert.name.clone() });
-        }
+        let sends = {
+            let mut g = self.net.inner.lock();
+            if let Some(n) = g.nodes.get_mut(&self.me) {
+                n.name = advert.name.clone();
+                n.advertised = true;
+            }
+            let others: Vec<(PeerId, String)> = g
+                .nodes
+                .iter()
+                .filter(|(id, n)| **id != self.me && n.advertised)
+                .map(|(id, n)| (*id, n.name.clone()))
+                .collect();
+            let mut sends = Vec::new();
+            for (id, name) in others {
+                if let Some(s) = LoopbackNetwork::sink(&g, self.me) {
+                    sends.push((s, TransportEvent::Discovered { peer: id, name }));
+                }
+                if let Some(s) = LoopbackNetwork::sink(&g, id) {
+                    sends.push((s, TransportEvent::Discovered { peer: self.me, name: advert.name.clone() }));
+                }
+            }
+            sends
+        };
+        LoopbackNetwork::flush(sends);
     }
     fn stop(&self) {
         let mut g = self.net.inner.lock();
@@ -106,32 +134,56 @@ impl PeerTransport for LoopbackTransport {
         }
     }
     fn connect(&self, peer: PeerId) {
-        let mut g = self.net.inner.lock();
-        let k = key(self.me, peer);
-        if g.blocked.contains(&k) || g.links.contains(&k) || !g.nodes.contains_key(&peer) {
-            return;
-        }
-        g.links.insert(k);
-        LoopbackNetwork::emit(&g, self.me, TransportEvent::Connected(peer));
-        LoopbackNetwork::emit(&g, peer, TransportEvent::Connected(self.me));
+        let sends = {
+            let mut g = self.net.inner.lock();
+            let k = key(self.me, peer);
+            if g.blocked.contains(&k) || g.links.contains(&k) || !g.nodes.contains_key(&peer) {
+                return;
+            }
+            g.links.insert(k);
+            let mut sends = Vec::new();
+            if let Some(s) = LoopbackNetwork::sink(&g, self.me) { sends.push((s, TransportEvent::Connected(peer))); }
+            if let Some(s) = LoopbackNetwork::sink(&g, peer) { sends.push((s, TransportEvent::Connected(self.me))); }
+            sends
+        };
+        LoopbackNetwork::flush(sends);
     }
     fn disconnect(&self, peer: PeerId) {
-        let mut g = self.net.inner.lock();
-        if g.links.remove(&key(self.me, peer)) {
-            LoopbackNetwork::emit(&g, self.me, TransportEvent::Disconnected(peer));
-            LoopbackNetwork::emit(&g, peer, TransportEvent::Disconnected(self.me));
-        }
+        let sends = {
+            let mut g = self.net.inner.lock();
+            let mut sends = Vec::new();
+            if g.links.remove(&key(self.me, peer)) {
+                if let Some(s) = LoopbackNetwork::sink(&g, self.me) { sends.push((s, TransportEvent::Disconnected(peer))); }
+                if let Some(s) = LoopbackNetwork::sink(&g, peer) { sends.push((s, TransportEvent::Disconnected(self.me))); }
+            }
+            sends
+        };
+        LoopbackNetwork::flush(sends);
     }
     fn send_control(&self, peer: PeerId, frame: Vec<u8>) {
-        let g = self.net.inner.lock();
-        if g.links.contains(&key(self.me, peer)) {
-            LoopbackNetwork::emit(&g, peer, TransportEvent::Control { peer: self.me, frame });
+        let send = {
+            let g = self.net.inner.lock();
+            g.links.contains(&key(self.me, peer)).then(|| LoopbackNetwork::sink(&g, peer)).flatten()
+        };
+        if let Some(s) = send {
+            let _ = s.send(TransportEvent::Control { peer: self.me, frame });
         }
     }
     fn send_realtime(&self, peer: PeerId, packet: Vec<u8>) {
-        let g = self.net.inner.lock();
-        if !g.blocked.contains(&key(self.me, peer)) {
-            LoopbackNetwork::emit(&g, peer, TransportEvent::Realtime(packet));
+        // Requires the peer node to still exist (in addition to the partition check): a link is
+        // not required since realtime packets may legitimately arrive before `connect` completes
+        // on a lossy/unreliable transport, but a node that was removed (`LoopbackNetwork::remove`,
+        // simulating a crash) can never receive anything again.
+        let send = {
+            let g = self.net.inner.lock();
+            if g.blocked.contains(&key(self.me, peer)) || !g.nodes.contains_key(&peer) {
+                None
+            } else {
+                LoopbackNetwork::sink(&g, peer)
+            }
+        };
+        if let Some(s) = send {
+            let _ = s.send(TransportEvent::Realtime(packet));
         }
     }
     fn description(&self) -> String {
