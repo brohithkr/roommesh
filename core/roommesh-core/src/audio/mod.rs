@@ -9,3 +9,4 @@ pub mod codec;
 pub mod shared_layout;
 #[cfg(unix)]
 pub mod virtual_device;
+pub mod device_io;
