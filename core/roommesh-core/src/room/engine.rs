@@ -255,6 +255,12 @@ impl RoomEngine {
             }
         }
     }
+    /// A peer that thinks we're in `room_id` (we're not, and aren't joining it) is told we left.
+    fn reply_not_in_room(&mut self, from: PeerId, room_id: RoomId) {
+        if self.joining.map(|(r, _)| r) != Some(room_id) {
+            self.send(from, ControlMessage::Leave { room_id });
+        }
+    }
 
     // ---------- transport inputs ----------
     pub fn on_discovered(&mut self, peer: PeerId, name: String) {
@@ -631,7 +637,9 @@ impl RoomEngine {
                 let Some(m) = self.manifest.clone() else {
                     return;
                 };
-                if m.room_id != room_id || member.id != from {
+                // Direct from the joiner, or relayed by a member (e.g. the joiner was invited
+                // by a peer that has since stopped being the coordinator).
+                if m.room_id != room_id || (member.id != from && !m.is_member(from)) {
                     return;
                 }
                 if m.coordinator == local {
@@ -639,7 +647,7 @@ impl RoomEngine {
                     next.upsert_member(member);
                     next.revision += 1;
                     self.publish(now, next);
-                } else {
+                } else if m.coordinator != from {
                     self.send(
                         m.coordinator,
                         ControlMessage::JoinRequest { room_id, member },
@@ -648,7 +656,9 @@ impl RoomEngine {
             }
             ControlMessage::Manifest(m) => self.receive_manifest(now, from, m),
             ControlMessage::Request {
-                room_id, change, ..
+                room_id,
+                epoch,
+                change,
             } => {
                 let Some(cur) = self.manifest.clone() else {
                     return;
@@ -657,16 +667,18 @@ impl RoomEngine {
                     return;
                 }
                 if cur.coordinator == local {
-                    self.apply_change(now, change);
-                } else {
-                    self.send(
-                        cur.coordinator,
-                        ControlMessage::Request {
-                            room_id,
-                            epoch: cur.epoch,
-                            change,
-                        },
-                    );
+                    // A request made under an older coordinator term is stale.
+                    if epoch >= cur.epoch {
+                        self.apply_change(now, change);
+                    }
+                } else if cur.coordinator != from {
+                    // Relay unchanged (keeping the requester's epoch) — never back to its sender.
+                    let msg = ControlMessage::Request {
+                        room_id,
+                        epoch,
+                        change,
+                    };
+                    self.send(cur.coordinator, msg);
                 }
             }
             ControlMessage::Leave { room_id } => {
@@ -690,18 +702,19 @@ impl RoomEngine {
                 revision,
                 manifest,
             } => {
-                let Some(cur) = self.manifest.clone() else {
-                    return;
+                let Some(cur) = self.manifest.clone().filter(|m| m.room_id == room_id) else {
+                    return self.reply_not_in_room(from, room_id);
                 };
-                if cur.room_id != room_id {
+                if !cur.is_member(from) {
+                    // e.g. a removed peer that missed its removal: show it the manifest.
+                    if cur.coordinator == local {
+                        self.send(from, ControlMessage::Manifest(cur));
+                    }
                     return;
                 }
                 if let Some(m) = manifest {
                     self.receive_manifest(now, from, m);
-                } else if cur.coordinator == local
-                    && cur.is_member(from)
-                    && (epoch, revision) < cur.version()
-                {
+                } else if cur.coordinator == local && (epoch, revision) < cur.version() {
                     self.send(from, ControlMessage::Manifest(cur));
                 }
             }
@@ -728,22 +741,46 @@ impl RoomEngine {
     }
 
     fn receive_manifest(&mut self, now: u64, from: PeerId, m: RoomManifest) {
+        let local = self.local();
         if let Some((rid, _)) = self.joining {
-            if m.room_id == rid && m.is_member(self.local()) && from == m.coordinator {
+            if m.room_id == rid && m.is_member(local) && from == m.coordinator {
                 self.install(now, m);
                 return;
             }
         }
-        let Some(cur) = self.manifest.clone() else {
-            return;
+        let Some(cur) = self.manifest.clone().filter(|c| c.room_id == m.room_id) else {
+            return self.reply_not_in_room(from, m.room_id);
         };
         match evaluate_manifest(Some(&cur), &m, from) {
-            Acceptance::Accept => self.install(now, m),
+            Acceptance::Accept => {
+                // A proposal naming us, relayed by someone else (manual pick, leave hand-off,
+                // election by a peer): republish it as its coordinator so racing proposals for
+                // the same epoch converge on our version.
+                let relayed = m.coordinator == local && from != local;
+                self.install(now, m);
+                if relayed {
+                    if let Some(mut adopted) = self.manifest.clone() {
+                        adopted.revision += 1;
+                        self.publish(now, adopted);
+                    }
+                }
+            }
+            Acceptance::Reject(_) if !cur.is_member(from) => {}
+            Acceptance::Reject(_)
+                if m.epoch == cur.epoch
+                    && m.coordinator == local
+                    && m.coordinator < cur.coordinator
+                    && m.is_member(local) =>
+            {
+                // A same-epoch proposal naming us beats the one we hold; as the coordinator it
+                // names, we vouch for it.
+                let mut adopted = m;
+                adopted.revision += 1;
+                self.publish(now, adopted);
+            }
             Acceptance::Reject(_) => {
-                if cur.coordinator == self.local()
-                    && cur.room_id == m.room_id
-                    && cur.is_member(from)
-                {
+                // Bring the sender up to date: we're its coordinator, or it's behind by an epoch.
+                if cur.coordinator == local || m.epoch < cur.epoch {
                     self.send(from, ControlMessage::Manifest(cur));
                 }
             }
@@ -1256,5 +1293,193 @@ mod tests {
         n.cut.clear();
         n.advance(3_000);
         assert_eq!(n.converged(&[1, 2, 3, 4]).coordinator, PeerId(3));
+    }
+
+    // ---------- review regressions ----------
+    fn coordinators(n: &Net, ids: &[u64]) -> Vec<u64> {
+        ids.iter()
+            .copied()
+            .filter(|&i| n.engines[&PeerId(i)].roles().is_coordinator)
+            .collect()
+    }
+
+    #[test]
+    fn join_request_to_former_coordinator_is_relayed() {
+        let mut n = Net::new(&[1, 2, 3, 4]);
+        n.cmd(1, Command::CreateRoom { name: "R".into() });
+        for id in [2, 3] {
+            n.cmd(1, Command::Invite(PeerId(id)));
+            let room_id = n.invite_for(id);
+            n.cmd(
+                id,
+                Command::RespondToInvite {
+                    room_id,
+                    accept: true,
+                },
+            );
+        }
+        n.advance(300);
+        n.cmd(1, Command::Invite(PeerId(4)));
+        let room_id = n.invite_for(4);
+        n.cmd(1, Command::SetCoordinator(PeerId(2)));
+        n.cmd(
+            4,
+            Command::RespondToInvite {
+                room_id,
+                accept: true,
+            },
+        );
+        n.advance(11_000);
+        assert!(!n.has_event(4, |e| matches!(e, RoomEvent::Error { .. })));
+        let m = n.converged(&[1, 2, 3, 4]);
+        assert_eq!(m.coordinator, PeerId(2));
+        assert!(m.is_member(PeerId(4)));
+    }
+
+    #[test]
+    fn concurrent_manual_coordinator_picks_converge() {
+        let mut n = room(&[1, 2, 3, 4, 5]);
+        for e in n.engines.values_mut() {
+            e.set_auto_elect(false);
+        }
+        n.kill(1);
+        n.advance(7_000);
+        let now = n.now;
+        n.engines
+            .get_mut(&PeerId(2))
+            .unwrap()
+            .command(now, Command::SetCoordinator(PeerId(5)))
+            .unwrap();
+        n.engines
+            .get_mut(&PeerId(3))
+            .unwrap()
+            .command(now, Command::SetCoordinator(PeerId(4)))
+            .unwrap();
+        n.pump();
+        n.advance(5_000);
+        let m = n.converged(&[2, 3, 4, 5]);
+        assert_eq!(m.coordinator, PeerId(4));
+        assert_eq!(coordinators(&n, &[2, 3, 4, 5]), vec![4]);
+    }
+
+    #[test]
+    fn relayed_proposals_with_different_fallback_settings_converge() {
+        let mut n = room(&[1, 2, 3, 4]);
+        for e in n.engines.values_mut() {
+            e.set_auto_elect(false);
+        }
+        n.engines
+            .get_mut(&PeerId(2))
+            .unwrap()
+            .set_fallback_speaker(true);
+        n.kill(1);
+        n.advance(7_000);
+        let now = n.now;
+        for id in [2, 3] {
+            n.engines
+                .get_mut(&PeerId(id))
+                .unwrap()
+                .command(now, Command::SetCoordinator(PeerId(4)))
+                .unwrap();
+        }
+        n.pump();
+        n.advance(5_000);
+        let m = n.converged(&[2, 3, 4]);
+        assert_eq!(m.coordinator, PeerId(4));
+    }
+
+    #[test]
+    fn leave_hand_off_is_republished_by_successor() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(1, Command::Leave);
+        let m = n.converged(&[2, 3]);
+        assert_eq!(m.coordinator, PeerId(2));
+        assert!(m.revision >= 1, "successor vouches for the hand-off");
+    }
+
+    #[test]
+    fn removed_member_that_missed_its_removal_leaves() {
+        let mut n = room(&[1, 2, 3]);
+        n.cut.insert(k(PeerId(1), PeerId(3))); // 1<->3 messages lost, session stays up
+        n.cmd(1, Command::RemoveMember(PeerId(3)));
+        n.advance(200);
+        n.cut.clear();
+        n.advance(10_000);
+        assert!(n.manifest(3).is_none());
+        assert!(n.has_event(3, |e| matches!(e, RoomEvent::LeftRoom)));
+        assert!(!n.engines[&PeerId(3)].roles().is_coordinator);
+        assert_eq!(
+            n.converged(&[1, 2]).member_ids(),
+            vec![PeerId(1), PeerId(2)]
+        );
+    }
+
+    #[test]
+    fn lost_leave_is_repaired_by_the_coordinator() {
+        let mut n = room(&[1, 2, 3]);
+        n.cut.insert(k(PeerId(1), PeerId(2)));
+        n.cmd(2, Command::Leave);
+        n.advance(200);
+        n.cut.clear();
+        n.advance(10_000);
+        assert!(n.manifest(2).is_none());
+        let m = n.converged(&[1, 3]);
+        assert_eq!(m.member_ids(), vec![PeerId(1), PeerId(3)]);
+    }
+
+    #[test]
+    fn peer_outside_the_room_answers_heartbeats_with_leave() {
+        let n = room(&[1, 2]);
+        let m = n.converged(&[1, 2]);
+        let now = n.now;
+        let mut stranger = Net::new(&[7]).engines.remove(&PeerId(7)).unwrap();
+        stranger.on_session_up(now, PeerId(1), "Mac 1".into(), "123 456".into());
+        stranger.take_outputs();
+        stranger.on_message(
+            now,
+            PeerId(1),
+            ControlMessage::Heartbeat {
+                room_id: m.room_id,
+                epoch: m.epoch,
+                revision: m.revision,
+                manifest: Some(m.clone()),
+            },
+        );
+        assert_eq!(
+            stranger.take_outputs(),
+            vec![Output::Send {
+                to: PeerId(1),
+                msg: ControlMessage::Leave { room_id: m.room_id }
+            }]
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_request_from_older_epoch() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(1, Command::SetCoordinator(PeerId(2)));
+        let cur = n.converged(&[1, 2, 3]);
+        let now = n.now;
+        let e2 = n.engines.get_mut(&PeerId(2)).unwrap();
+        e2.on_message(
+            now,
+            PeerId(3),
+            ControlMessage::Request {
+                room_id: cur.room_id,
+                epoch: Epoch(1),
+                change: ChangeRequest::SetSpeaker(Some(PeerId(3))),
+            },
+        );
+        assert_eq!(e2.manifest(), Some(&cur));
+        e2.on_message(
+            now,
+            PeerId(3),
+            ControlMessage::Request {
+                room_id: cur.room_id,
+                epoch: cur.epoch,
+                change: ChangeRequest::SetSpeaker(Some(PeerId(3))),
+            },
+        );
+        assert_eq!(e2.manifest().unwrap().speaker, Some(PeerId(3)));
     }
 }
