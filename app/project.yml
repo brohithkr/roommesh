@@ -1,0 +1,62 @@
+name: RoomMesh
+options:
+  bundleIdPrefix: io.github.brohithkr
+  deploymentTarget:
+    macOS: "14.2"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: targeted
+    MACOSX_DEPLOYMENT_TARGET: "14.2"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+targets:
+  RoomMesh:
+    type: application
+    platform: macOS
+    sources:
+      - path: RoomMesh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.brohithkr.RoomMesh
+        PRODUCT_NAME: RoomMesh
+        INFOPLIST_FILE: RoomMesh/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: RoomMesh/Resources/RoomMesh.entitlements
+        OTHER_LDFLAGS: ["-lc++"]
+    dependencies:
+      - framework: Frameworks/RoomMeshCore.xcframework
+        embed: false
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AudioUnit.framework
+      - sdk: CoreFoundation.framework
+      - sdk: ServiceManagement.framework
+      - sdk: UserNotifications.framework
+    postBuildScripts:
+      - name: Embed RoomMesh driver
+        basedOnDependencyAnalysis: false
+        script: |
+          SRC="$SRCROOT/../driver/build/RoomMesh.driver"
+          DST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/RoomMesh.driver"
+          if [ -d "$SRC" ]; then rm -rf "$DST"; ditto "$SRC" "$DST"; else echo "warning: RoomMesh.driver not built (run scripts/build-driver.sh)"; fi
+  RoomMeshTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [RoomMeshTests]
+    dependencies:
+      - target: RoomMesh
+    settings:
+      base:
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/RoomMesh.app/Contents/MacOS/RoomMesh"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  RoomMesh:
+    build:
+      targets:
+        RoomMesh: all
+        RoomMeshTests: [test]
+    test:
+      targets: [RoomMeshTests]
