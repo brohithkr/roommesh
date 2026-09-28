@@ -25,6 +25,27 @@ private final class ControlLink: @unchecked Sendable {
     }
 }
 
+/// Restart delay for a failed listener/browser: 1.5 s doubling up to 30 s; reset once it is `.ready`.
+struct RecoveryBackoff {
+    static let base: TimeInterval = 1.5
+    static let cap: TimeInterval = 30
+    private var failures = 0
+    mutating func nextDelay() -> TimeInterval {
+        let delay = min(Self.base * pow(2, Double(failures)), Self.cap)
+        failures = min(failures + 1, 16)
+        return delay
+    }
+    mutating func reset() { failures = 0 }
+}
+
+/// Reports local-network denial only on the transition from not-denied to denied.
+struct DeniedLatch {
+    private(set) var denied = false
+    /// True when this call is the transition into denied.
+    mutating func markDenied() -> Bool { defer { denied = true }; return !denied }
+    mutating func markAllowed() { denied = false }
+}
+
 /// `FfiTransport` over Network.framework with Apple peer-to-peer (AWDL) enabled.
 /// Control: Bonjour `_roomaudio._tcp`, length-prefixed frames. Realtime: `_roomaudio._udp` datagrams.
 /// All mutable state is confined to `queue`; `description()` is lock-protected because Rust calls it from its own threads.
@@ -39,8 +60,8 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     static let preambleTimeout: TimeInterval = 5
     /// An outbound dial that has not reached `.ready` by then is abandoned (the core re-requests).
     static let dialTimeout: TimeInterval = 8
-    /// Delay before recreating a failed listener or browser.
-    static let restartBackoff: TimeInterval = 1.5
+    /// After a browser restart, peers it no longer sees this long after starting are reported lost.
+    static let browserSettle: TimeInterval = 3
     /// Inbound realtime connections with no datagram for this long are cancelled.
     static let realtimeIdleTimeout: UInt64 = 30 * NSEC_PER_SEC
     static let realtimeSweepInterval: TimeInterval = 5
@@ -51,7 +72,13 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     var onLocalNetworkAllowed: (@Sendable () -> Void)?
 
     private let queue = DispatchQueue(label: "io.github.brohithkr.RoomMesh.transport", qos: .userInteractive)
+    private enum Recoverable { case control, realtime, browser }
     private var running = false
+    private var backoff: [Recoverable: RecoveryBackoff] = [:]
+    private var deniedLatch = DeniedLatch()
+    /// Peers currently reported to the sink as discovered.
+    private var reportedPeers: Set<String> = []
+    private var reconcileAfterRestart = false
     private var localId = ""
     private var txt = NWTXTRecord()
     private var controlListener: NWListener?
@@ -109,11 +136,23 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
 
     static func admitsInbound(pendingCount: Int) -> Bool { pendingCount < maxPending }
 
+    /// Peers previously reported present that a restarted browser no longer sees.
+    static func vanishedPeers(previous: Set<String>, current: Set<String>) -> Set<String> {
+        previous.subtracting(current)
+    }
+
+    /// The peer id advertised by a browse result, or nil for ourselves and non-peer services.
+    static func peerName(_ endpoint: NWEndpoint, localId: String) -> String? {
+        guard case let .service(name, _, _, _) = endpoint, name != localId, name.count == 16 else { return nil }
+        return name
+    }
+
     // MARK: FfiTransport
     func start(peerId: String, name: String, protocolVersion: UInt16) {
         queue.async { [self] in
             running = true
             localId = peerId
+            deniedLatch = DeniedLatch()
             txt = NWTXTRecord(["n": name, "v": String(protocolVersion)])
             startListeners()
             startBrowser()
@@ -132,6 +171,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
             udp.values.forEach { $0.cancel() }
             inboundUDP.values.forEach { $0.cancel() }
             links = [:]; pending = [:]; udp = [:]; inboundUDP = [:]; inboundLastRx = [:]
+            backoff = [:]; reportedPeers = []; reconcileAfterRestart = false
         }
     }
 
@@ -150,6 +190,10 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
     func disconnect(peerId: String) {
         queue.async { [self] in
             links[peerId]?.conn.cancel()
+            for (key, link) in pending where link.outbound && link.peerId == peerId {
+                pending[key] = nil
+                link.conn.cancel()
+            }
             evictRealtime(peerId)
         }
     }
@@ -199,6 +243,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
             l.stateUpdateHandler = { [weak self, weak l] s in
                 guard let self, let l else { return }
                 switch s {
+                case .ready: self.backoff[.control] = nil
                 case .waiting(let e): self.checkDenied(e)
                 case .failed(let e):
                     self.checkDenied(e)
@@ -206,7 +251,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
                     l.cancel()
                     guard self.controlListener === l else { return }
                     self.controlListener = nil
-                    self.restartLater { $0.controlListener == nil ? $0.startControlListener() : () }
+                    self.restartLater(.control) { $0.controlListener == nil ? $0.startControlListener() : () }
                 default: break
                 }
             }
@@ -214,7 +259,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
             controlListener = l
         } catch {
             NSLog("RoomMesh: control listener failed: \(error)")
-            restartLater { $0.controlListener == nil ? $0.startControlListener() : () }
+            restartLater(.control) { $0.controlListener == nil ? $0.startControlListener() : () }
         }
     }
 
@@ -228,6 +273,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
             l.stateUpdateHandler = { [weak self, weak l] s in
                 guard let self, let l else { return }
                 switch s {
+                case .ready: self.backoff[.realtime] = nil
                 case .waiting(let e): self.checkDenied(e)
                 case .failed(let e):
                     self.checkDenied(e)
@@ -235,7 +281,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
                     l.cancel()
                     guard self.realtimeListener === l else { return }
                     self.realtimeListener = nil
-                    self.restartLater { $0.realtimeListener == nil ? $0.startRealtimeListener() : () }
+                    self.restartLater(.realtime) { $0.realtimeListener == nil ? $0.startRealtimeListener() : () }
                 default: break
                 }
             }
@@ -243,7 +289,7 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
             realtimeListener = l
         } catch {
             NSLog("RoomMesh: realtime listener failed: \(error)")
-            restartLater { $0.realtimeListener == nil ? $0.startRealtimeListener() : () }
+            restartLater(.realtime) { $0.realtimeListener == nil ? $0.startRealtimeListener() : () }
         }
     }
 
@@ -255,7 +301,10 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
         b.stateUpdateHandler = { [weak self, weak b] s in
             guard let self, let b else { return }
             switch s {
-            case .ready: self.onLocalNetworkAllowed?()
+            case .ready:
+                self.backoff[.browser] = nil
+                self.deniedLatch.markAllowed()
+                self.onLocalNetworkAllowed?()
             case .waiting(let e): self.checkDenied(e)
             case .failed(let e):
                 self.checkDenied(e)
@@ -263,17 +312,27 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
                 b.cancel()
                 guard self.browser === b else { return }
                 self.browser = nil
-                self.restartLater { $0.browser == nil ? $0.startBrowser() : () }
+                self.reconcileAfterRestart = true
+                self.restartLater(.browser) { $0.browser == nil ? $0.startBrowser() : () }
             default: break
             }
         }
         b.start(queue: queue)
         browser = b
+        if reconcileAfterRestart {
+            queue.asyncAfter(deadline: .now() + Self.browserSettle) { [weak self, weak b] in
+                guard let self, let b, self.browser === b, self.reconcileAfterRestart else { return }
+                self.reconcileAfterRestart = false
+                let current = Set(b.browseResults.compactMap { Self.peerName($0.endpoint, localId: self.localId) })
+                for id in Self.vanishedPeers(previous: self.reportedPeers, current: current) { self.reportLost(id) }
+            }
+        }
     }
 
-    /// Runs `body` after the restart backoff unless the transport has been stopped meanwhile.
-    private func restartLater(_ body: @escaping (AppleP2PTransport) -> Void) {
-        queue.asyncAfter(deadline: .now() + Self.restartBackoff) { [weak self] in
+    /// Runs `body` after `which`'s next backoff delay unless the transport has been stopped meanwhile.
+    private func restartLater(_ which: Recoverable, _ body: @escaping (AppleP2PTransport) -> Void) {
+        let delay = backoff[which, default: RecoveryBackoff()].nextDelay()
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.running else { return }
             body(self)
         }
@@ -291,18 +350,25 @@ final class AppleP2PTransport: FfiTransport, @unchecked Sendable {
         }
     }
     private func report(_ r: NWBrowser.Result, present: Bool) {
-        guard case let .service(name, _, _, _) = r.endpoint, name != localId, name.count == 16 else { return }
+        guard let name = Self.peerName(r.endpoint, localId: localId) else { return }
         if present {
             var display = name
             if case let .bonjour(txt) = r.metadata, let n = txt["n"] { display = n }
+            reportedPeers.insert(name)
             sink?.peerDiscovered(name, name: display)
         } else {
-            evictRealtime(name) // a restarted peer gets a fresh realtime connection
-            sink?.peerLost(name)
+            reportLost(name)
         }
     }
+    private func reportLost(_ name: String) {
+        reportedPeers.remove(name)
+        evictRealtime(name) // a restarted peer gets a fresh realtime connection
+        sink?.peerLost(name)
+    }
+    /// Fires `onLocalNetworkDenied` only when entering the denied state, not on every retry.
     private func checkDenied(_ e: NWError) {
-        if case let .dns(code) = e, code == -65570 { onLocalNetworkDenied?() } // kDNSServiceErr_PolicyDenied
+        // kDNSServiceErr_PolicyDenied
+        if case let .dns(code) = e, code == -65570, deniedLatch.markDenied() { onLocalNetworkDenied?() }
     }
 
     // MARK: control links

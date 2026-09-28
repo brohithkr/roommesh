@@ -56,4 +56,37 @@ final class TransportLogicTests: XCTestCase {
         XCTAssertFalse(AppleP2PTransport.admitsInbound(pendingCount: 32))
         XCTAssertFalse(AppleP2PTransport.admitsInbound(pendingCount: 100))
     }
+
+    func testRecoveryBackoffDoublesToCapAndResets() {
+        var b = RecoveryBackoff()
+        XCTAssertEqual((0..<8).map { _ in b.nextDelay() }, [1.5, 3, 6, 12, 24, 30, 30, 30])
+        b.reset()
+        XCTAssertEqual(b.nextDelay(), 1.5)
+        var many = RecoveryBackoff()
+        for _ in 0..<10_000 { _ = many.nextDelay() }
+        XCTAssertEqual(many.nextDelay(), 30, "no overflow after many failures")
+    }
+
+    func testDeniedLatchFiresOnlyOnTransition() {
+        var latch = DeniedLatch()
+        XCTAssertTrue(latch.markDenied(), "first denial reports")
+        XCTAssertFalse(latch.markDenied(), "repeated denial while retrying is silent")
+        XCTAssertFalse(latch.markDenied())
+        latch.markAllowed()
+        XCTAssertTrue(latch.markDenied(), "denied again after being allowed reports again")
+    }
+
+    func testVanishedPeers() {
+        XCTAssertEqual(AppleP2PTransport.vanishedPeers(previous: ["a", "b", "c"], current: ["b", "d"]), ["a", "c"])
+        XCTAssertEqual(AppleP2PTransport.vanishedPeers(previous: [], current: ["b"]), [])
+        XCTAssertEqual(AppleP2PTransport.vanishedPeers(previous: ["a"], current: []), ["a"])
+    }
+
+    func testPeerNameFiltersEndpoints() {
+        let svc = { (name: String) in NWEndpoint.service(name: name, type: AppleP2PTransport.controlType, domain: "local.", interface: nil) }
+        XCTAssertEqual(AppleP2PTransport.peerName(svc(high), localId: low), high)
+        XCTAssertNil(AppleP2PTransport.peerName(svc(low), localId: low), "self")
+        XCTAssertNil(AppleP2PTransport.peerName(svc("short"), localId: low), "not a peer id")
+        XCTAssertNil(AppleP2PTransport.peerName(.hostPort(host: "127.0.0.1", port: 1), localId: low))
+    }
 }
