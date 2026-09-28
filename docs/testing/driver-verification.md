@@ -1,7 +1,7 @@
-# RoomMesh HAL driver verification (Task 34)
+# RoomMesh HAL driver verification
 
-Verification performed against the driver already installed on this Mac (`sudo scripts/install-driver.sh`
-was run by the user beforehand — Step 1 of Task 34 is out of scope here). All commands were run from
+Verification performed against the driver already installed on this Mac (installed beforehand with
+`sudo scripts/install-driver.sh`; installing is not part of this record). All commands were run from
 `core/` with:
 
 ```sh
@@ -46,8 +46,9 @@ mic io active=0 speaker io active=0
 driver alive: true
 ```
 
-**PASS** — magic matches `0x524D5348` ('RMSH'), version/rate/ring size all validate inside
-`SharedRegion::open` (which itself asserts these before returning), and `driver alive: true` (driver
+**PASS** — magic matches `0x524D5348` ('RMSH'). `SharedRegion::open` checks the magic, version, sample
+rate and ring size and returns `Err(Incompatible)` on any mismatch, so a successful open means they all
+match. `driver alive: true` (driver
 heartbeat well under the 2s liveness threshold). `app heartbeat age` is large here because no app was
 writing at the moment of this particular invocation — mic io/speaker io both show `0` clients since no
 loopback was mid-flight.
@@ -85,8 +86,8 @@ devtool's `SpeakerReader` reads it back out of shared memory. A PASS here confir
 contract, the driver's output IO handler, and device format negotiation (stereo → mono downmix) all
 work correctly end-to-end on this Mac.
 
-**Bug found and fixed while diagnosing an initial FAIL here:** the task-31.md reference implementation
-for `speaker-loopback` calls `reader.read(1)` once, sleeps for the whole 2-second test, then drains
+**Bug found and fixed while diagnosing an initial FAIL here:** the plan's original reference
+implementation of `speaker-loopback` calls `reader.read(1)` once, sleeps for the whole 2-second test, then drains
 with a single `read(1 << 16)` loop. The speaker ring holds only ~680 ms of audio (`RING_FRAMES` =
 32768 @ 48 kHz). Sleeping past that window before the first real read causes
 `SpeakerReader::read`'s overrun-recovery logic (`w - *cur > RING_FRAMES - 4_800`) to snap the cursor
@@ -96,7 +97,7 @@ and shared memory were working correctly. Fixed in `core/roommesh-devtool/src/ma
 ring continuously (every 20 ms) for the duration of the test instead of sleeping and bulk-draining
 once. This is a devtool bug, not a driver bug — no driver code was touched.
 
-### mic-loopback: FAIL (energy=0.0) — environment limitation, not a driver defect
+### mic-loopback: FAIL (energy=0.0) outside Terminal.app — TCC, not a driver defect
 
 ```sh
 $ cargo run -p roommesh-devtool -- mic-loopback
@@ -120,22 +121,20 @@ FAIL mic-loopback energy=0.0
    which is not physically possible for a live analog microphone in any environment (self-noise alone
    guarantees nonzero samples).
 
-This shows the zero-energy result is **not specific to the RoomMesh driver or the devtool** — no audio
-input at all is reaching cpal capture streams in this execution context (this agent's shell, several
-process hops removed from an interactive Terminal.app window). This is consistent with a macOS TCC
-microphone-permission gate: input HAL clients that lack (or whose responsible process lacks) granted
-microphone consent are typically fed silence rather than an explicit error, for both physical and
-virtual capture devices alike. The task brief's note that "Terminal already has microphone permission
-(a cpal capture test passed earlier)" evidently does not carry over to this non-interactive process
-tree.
+This shows the zero-energy result is **not specific to the RoomMesh driver or the devtool**: no audio
+input at all reaches cpal capture streams in this execution context (a non-Terminal process tree, several
+process hops removed from an interactive Terminal.app window). This is the macOS TCC
+microphone-permission gate: input HAL clients whose responsible process lacks microphone consent are
+fed silence rather than an explicit error, for physical and virtual capture devices alike. Microphone
+permission granted to Terminal.app does not carry over to other host apps' process trees.
 
-**Everything the devtool and shared-memory contract can verify without live microphone capture has
-been verified and passes** (shm-status, shm-selftest, the write side of mic-loopback, and the full
-round trip on the speaker side). The remaining gap is specifically: a human running
-`cargo run -p roommesh-devtool -- mic-loopback` from an interactive Terminal.app window with granted
-microphone permission should re-run it to get a real PASS/FAIL signal on the input path; that
-verification could not be completed from this environment. No driver or app code changes are indicated
-by this finding — it is an environment/TCC characteristic of the current process, not a bug.
+The same check run from Terminal.app with microphone permission PASSes (see the 2026-09-29 results
+below), which confirms the input path. No driver or app code changes are indicated by the FAIL outside
+Terminal.app.
+
+`roommesh-devtool mic-loopback` now reports this case explicitly: when input callbacks arrive but every
+sample is exactly 0, it prints the callback and sample counts plus a hint to run it from Terminal.app
+with microphone permission, instead of a bare `FAIL energy=0.0`.
 
 ## Summary
 
@@ -146,4 +145,23 @@ by this finding — it is an environment/TCC characteristic of the current proce
 | `shm-selftest` | PASS |
 | `devices` (RoomMesh excluded from physical list) | PASS |
 | `speaker-loopback` (after devtool fix) | PASS — energy=3023.9 |
-| `mic-loopback` | FAIL — energy=0.0, but isolated to a TCC microphone-permission gap in this process tree, not the driver (see investigation above); the write side and shared-memory mechanics are independently verified correct |
+| `mic-loopback` from Terminal.app (microphone permission granted) | PASS — energy=4496.1 |
+| `mic-loopback` from Simux or a VS Code-hosted shell | FAIL — energy=0.0: TCC (the host app has no microphone permission, so CoreAudio delivers silence), not a driver defect |
+
+## Results 2026-09-29 (driver built from commit 1ce9a33)
+
+The driver built from commit `1ce9a33` (speaker-ring seqlock) was installed with
+`sudo scripts/install-driver.sh`. `roommesh-devtool` was built from the branch head.
+
+| Check | Where it ran | Result |
+|---|---|---|
+| `shm-status` | any shell | driver alive: true |
+| `speaker-loopback` | any shell | PASS — energy=3023.9 |
+| `mic-loopback` | Terminal.app, microphone permission granted | **PASS — energy=4496.1** |
+| `mic-loopback` | Simux | FAIL — energy=0.0 (TCC) |
+| `mic-loopback` | Claude Code shell hosted in VS Code | FAIL — energy=0.0 (TCC) |
+
+During the VS Code-hosted FAIL, `shm-status` showed `mic io active=1` and an app heartbeat of 8 ms, so
+the loopback was writing the mic ring and CoreAudio had the RoomMesh Microphone IO running. Neither
+Simux nor VS Code has microphone permission, so TCC made CoreAudio deliver silence to the capture
+stream. The Terminal.app PASS on the same driver confirms that the mic path works end to end.
