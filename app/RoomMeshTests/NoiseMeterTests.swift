@@ -107,6 +107,64 @@ final class NoiseMeterTests: XCTestCase {
         XCTAssertEqual(core.calls.last, "meter:false")
     }
 
+    // MARK: baseline slider
+
+    func testSliderPushesTheBaselineOnlyAfterAPauseOrWhenTheDragEnds() {
+        let clock = ManualScheduler()
+        var commits: [Double] = []
+        let slider = BaselineSliderModel(delay: 0.3, schedule: clock.schedule)
+        slider.commit = { commits.append($0) }
+        slider.drag(to: -60.2)
+        XCTAssertEqual(slider.displayed(committed: -58), -60, "the label follows at once, in whole dB")
+        clock.advance(0.2)
+        slider.drag(to: -55)
+        clock.advance(0.2)
+        slider.drag(to: -50.4)
+        XCTAssertEqual(commits, [], "still moving")
+        XCTAssertEqual(slider.displayed(committed: -58), -50)
+        clock.advance(0.29)
+        XCTAssertEqual(commits, [])
+        clock.advance(0.02)
+        XCTAssertEqual(commits, [-50], "300 ms without a change")
+        XCTAssertNil(slider.draft)
+        XCTAssertEqual(slider.displayed(committed: -50), -50)
+        // The drag ending pushes at once, and only once.
+        slider.drag(to: -45)
+        slider.endDrag()
+        XCTAssertEqual(commits, [-50, -45])
+        clock.advance(1)
+        slider.endDrag()
+        XCTAssertEqual(commits, [-50, -45])
+        // Moving within the same whole dB is no change.
+        slider.drag(to: -45.2, committed: -45)
+        clock.advance(1)
+        XCTAssertEqual(commits, [-50, -45])
+        // A pending value can be dropped (Automatic chosen, or a measurement set the baseline).
+        slider.drag(to: -40)
+        slider.cancel()
+        clock.advance(1)
+        XCTAssertEqual(commits, [-50, -45])
+        XCTAssertNil(slider.draft)
+    }
+
+    func testOneDragSendsOneSettingsUpdate() {
+        let core = FakeCore()
+        let model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
+        model.attach(core: core)
+        model.settings.noiseBaselineDb = -60
+        core.calls = []
+        let clock = ManualScheduler()
+        let slider = BaselineSliderModel(delay: 0.3, schedule: clock.schedule)
+        slider.commit = { model.settings.noiseBaselineDb = $0 }
+        for (i, v) in stride(from: -60.0, through: -40.0, by: 0.5).enumerated() {
+            slider.drag(to: v, committed: model.settings.noiseBaselineDb)
+            clock.advance(i.isMultiple(of: 2) ? 0.05 : 0.1)
+        }
+        slider.endDrag()
+        XCTAssertEqual(core.calls.filter { $0 == "settings" }.count, 1)
+        XCTAssertEqual(core.lastSettings?.noiseBaselineDb, -40)
+    }
+
     // MARK: presentation
 
     func testAccessibilityValue() {
@@ -133,5 +191,28 @@ final class NoiseMeterTests: XCTestCase {
         XCTAssertEqual(NoiseMeterBar.fraction(-120), 0)
         XCTAssertEqual(NoiseMeterBar.fraction(0), 1)
         XCTAssertEqual(NoiseMeterBar.fraction(.nan), 0)
+    }
+}
+
+/// A test clock for `Debouncer`: scheduled work runs when `advance` passes its due time.
+@MainActor
+final class ManualScheduler {
+    private(set) var now: TimeInterval = 0
+    private var tasks: [(id: Int, at: TimeInterval, run: @MainActor () -> Void)] = []
+    private var nextId = 0
+
+    func schedule(_ delay: TimeInterval, _ run: @escaping @MainActor () -> Void) -> () -> Void {
+        let id = nextId
+        nextId += 1
+        tasks.append((id, now + delay, run))
+        return { [weak self] in self?.tasks.removeAll { $0.id == id } }
+    }
+
+    func advance(_ dt: TimeInterval) {
+        now += dt
+        while let i = tasks.indices.filter({ tasks[$0].at <= now + 1e-9 }).min(by: { tasks[$0].at < tasks[$1].at }) {
+            let t = tasks.remove(at: i)
+            t.run()
+        }
     }
 }

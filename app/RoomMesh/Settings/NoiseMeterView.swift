@@ -19,6 +19,90 @@ enum NoiseMeasurement {
     }
 }
 
+/// Runs the last value sent after `delay` without another one (or at once on `flush`).
+@MainActor
+final class Debouncer<Value> {
+    /// Runs `work` after the delay; returns a cancel function.
+    typealias Schedule = @MainActor (_ delay: TimeInterval, _ work: @escaping @MainActor () -> Void) -> () -> Void
+
+    static func mainQueue(_ delay: TimeInterval, _ work: @escaping @MainActor () -> Void) -> () -> Void {
+        let item = DispatchWorkItem { MainActor.assumeIsolated { work() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+        return { item.cancel() }
+    }
+
+    let delay: TimeInterval
+    private let schedule: Schedule
+    private let commit: @MainActor (Value) -> Void
+    private var pending: Value?
+    private var cancelTimer: (() -> Void)?
+
+    init(delay: TimeInterval, schedule: @escaping Schedule = mainQueue, commit: @escaping @MainActor (Value) -> Void) {
+        self.delay = delay
+        self.schedule = schedule
+        self.commit = commit
+    }
+
+    func send(_ value: Value) {
+        pending = value
+        cancelTimer?()
+        cancelTimer = schedule(delay) { [weak self] in self?.flush() }
+    }
+
+    /// Commits the pending value now, if there is one.
+    func flush() {
+        cancelTimer?()
+        cancelTimer = nil
+        guard let v = pending else { return }
+        pending = nil
+        commit(v)
+    }
+
+    func cancel() {
+        cancelTimer?()
+        cancelTimer = nil
+        pending = nil
+    }
+}
+
+/// The custom-baseline slider: the label follows the drag at once, but the value is pushed to
+/// the settings (and so to the core and, as an UpdateMember, to the whole room) only after
+/// `delay` without a change or when the drag ends, so one drag makes one manifest revision.
+@MainActor @Observable
+final class BaselineSliderModel {
+    /// The dragged value not pushed yet.
+    private(set) var draft: Double?
+    @ObservationIgnored var commit: (Double) -> Void = { _ in }
+    @ObservationIgnored private var debouncer: Debouncer<Double>!
+
+    init(delay: TimeInterval = 0.3, schedule: @escaping Debouncer<Double>.Schedule = Debouncer<Double>.mainQueue) {
+        debouncer = Debouncer(delay: delay, schedule: schedule) { [weak self] v in
+            guard let self else { return }
+            self.draft = nil
+            self.commit(v)
+        }
+    }
+
+    /// What the label shows: the drag in progress, else the setting.
+    func displayed(committed: Double?) -> Double? { draft ?? committed }
+
+    /// The slider moved to `value` (rounded to whole dB); `committed` is the current setting.
+    func drag(to value: Double, committed: Double? = nil) {
+        let v = value.rounded()
+        guard v != (draft ?? committed) else { return }
+        draft = v
+        debouncer.send(v)
+    }
+
+    func endDrag() { debouncer.flush() }
+
+    /// Drops a pending value (the setting was changed some other way).
+    func cancel() {
+        debouncer.cancel()
+        draft = nil
+    }
+}
+
 /// Polls the core's live mic meter at 20 Hz while the Settings view is visible, and runs a
 /// "Measure room noise" pass over those readings.
 @MainActor @Observable
@@ -192,6 +276,7 @@ struct NoiseMeterBar: View {
 struct NoiseBaselineSection: View {
     @Environment(AppModel.self) private var model
     @State private var meter = NoiseMeterModel()
+    @State private var slider = BaselineSliderModel()
     @State private var measureMessage: String?
 
     var body: some View {
@@ -209,12 +294,13 @@ struct NoiseBaselineSection: View {
                 Text("Custom baseline").tag(true)
             }
             .pickerStyle(.segmented)
-            if let baseline = settings.noiseBaselineDb {
+            if let baseline = slider.displayed(committed: settings.noiseBaselineDb) {
                 LabeledContent {
                     HStack {
                         // 1 dB steps via the binding (`step:` would draw 60 tick marks).
-                        Slider(value: sliderBinding, in: NoiseMeasurement.range)
-                            .accessibilityValue(NoiseMeterBar.dbText(Float(baseline)))
+                        Slider(value: sliderBinding, in: NoiseMeasurement.range,
+                               onEditingChanged: { editing in if !editing { slider.endDrag() } })
+                        .accessibilityValue(NoiseMeterBar.dbText(Float(baseline)))
                         Text(NoiseMeterBar.dbText(Float(baseline)))
                             .monospacedDigit()
                             .frame(minWidth: 52, alignment: .trailing)
@@ -228,6 +314,7 @@ struct NoiseBaselineSection: View {
             HStack {
                 Button("Measure room noise") {
                     measureMessage = nil
+                    slider.endDrag()
                     meter.startMeasuring()
                 }
                 .disabled(meter.countdown != nil)
@@ -249,15 +336,20 @@ struct NoiseBaselineSection: View {
             meter.onMeasured = { [weak model] result in
                 guard let model else { return }
                 if let result {
+                    slider.cancel()
                     model.settings.noiseBaselineDb = result
                     measureMessage = "Baseline set to \(NoiseMeterBar.dbText(Float(result)))"
                 } else {
                     measureMessage = "No microphone readings — check the microphone and try again"
                 }
             }
+            slider.commit = { [weak model] v in model?.settings.noiseBaselineDb = v }
             meter.start(model: model)
         }
-        .onDisappear { meter.stop() }
+        .onDisappear {
+            slider.endDrag()
+            meter.stop()
+        }
     }
 
     /// Automatic ↔ Custom; switching to Custom starts from the current automatic floor.
@@ -266,6 +358,7 @@ struct NoiseBaselineSection: View {
             get: { model.settings.noiseBaselineDb != nil },
             set: { custom in
                 guard custom != (model.settings.noiseBaselineDb != nil) else { return }
+                slider.cancel()
                 if custom {
                     let start = meter.reading.map { Double($0.autoFloorDb).rounded() } ?? -60
                     model.settings.noiseBaselineDb = min(max(start, NoiseMeasurement.range.lowerBound), NoiseMeasurement.range.upperBound)
@@ -277,10 +370,7 @@ struct NoiseBaselineSection: View {
 
     private var sliderBinding: Binding<Double> {
         Binding(
-            get: { model.settings.noiseBaselineDb ?? -60 },
-            set: { v in
-                let v = v.rounded()
-                if v != model.settings.noiseBaselineDb { model.settings.noiseBaselineDb = v }
-            })
+            get: { slider.displayed(committed: model.settings.noiseBaselineDb) ?? -60 },
+            set: { slider.drag(to: $0, committed: model.settings.noiseBaselineDb) })
     }
 }
