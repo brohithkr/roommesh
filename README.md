@@ -99,6 +99,12 @@ The coordinator picks the active mic with a voice-activity detector that runs on
 after echo cancellation and noise suppression. It tracks each mic's noise floor automatically,
 and a frame only counts as speech when it is well above that floor.
 
+**No mic is active until someone speaks.** In a silent room (a new room, or after the active mic
+drops out) there is no active mic: RoomMesh Microphone carries silence and the app shows the
+active mic as "—". The first mic that hears speech becomes active. After that, the last talker's
+mic stays selected through silence until another mic clearly takes over. (Before, a silent room
+picked the best-scoring mic, which in practice was the one with the least background noise.)
+
 **Settings → Audio → Background noise** shows what the room hears from this Mac's mic. While
 the tab is visible the app runs the mic through the same processing (and opens the mic even when
 you aren't in a room). The meter spans −90…−20 dB:
@@ -110,15 +116,27 @@ you aren't in a room). The meter spans −90…−20 dB:
 
 The baseline is either **Automatic** (the detector's own floor, shown underneath) or a **Custom
 baseline** (−90…−30 dB). With a custom baseline the floor is the higher of the two, so anything
-at or below it never selects this Mac's mic, which helps against a noisy fan or chatter from the
-next room. **Measure room noise** listens for 5 s while the room is quiet and sets the baseline to
-the 95th percentile of the level plus 3 dB.
+at or below it never selects a mic, which helps against a noisy fan or chatter from the next
+room. **Measure room noise** listens to this Mac's mic for 5 s while the room is quiet and sets
+the baseline to the 95th percentile of the level plus 3 dB.
 
-Each Mac sets its own baseline because mic gains differ. The value travels to the coordinator in
-the room manifest (`MemberInfo.noise_baseline_db`), and only that Mac can change it. The default
-is Automatic. It lives in `DEFAULT_NOISE_BASELINE_DB` (`core/roommesh-core/src/dsp/vad.rs`) and
-`SettingsStore.defaultNoiseBaselineDb` (`app/RoomMesh/App/SettingsStore.swift`); change both
-together. To measure a room through the same chain from the command line, run
+**The baseline belongs to the room, not to a Mac.** One baseline applies to every mic in the
+room, so no Mac becomes the default active mic just because it has a lower baseline or a
+quieter mic.
+
+- **In a room**, the section reads "Background noise — *room name*". The picker, the slider and
+  **Measure room noise** change the room's baseline for every Mac in it. Any member can change
+  it. The value lives in the room manifest (`RoomManifest.noise_baseline_db`), set through the
+  coordinator with `ChangeRequest::SetNoiseBaseline`, and it survives a coordinator handover.
+  A change from another Mac shows up in the section, but it doesn't move the slider while you
+  are dragging it. The meter uses the room's baseline.
+- **Outside a room**, the section edits this Mac's own default. A room you create starts with it,
+  and the meter uses it.
+
+The default is Automatic. It lives in `DEFAULT_NOISE_BASELINE_DB`
+(`core/roommesh-core/src/dsp/vad.rs`) and `SettingsStore.defaultNoiseBaselineDb`
+(`app/RoomMesh/App/SettingsStore.swift`); change both together. The room baseline changed
+the control protocol (version 5), so builds from before it can't connect to newer ones. To measure a room through the same chain from the command line, run
 `cargo run -p roommesh-devtool -- noise-probe` from `core/` (in Terminal.app, with microphone
 permission).
 
