@@ -210,6 +210,7 @@ Installer volume. It removes the app, the driver and the installer receipts, the
    sudo rm -rf /Applications/RoomMesh.app
    sudo pkgutil --forget io.github.brohithkr.RoomMesh.app.pkg
    sudo pkgutil --forget io.github.brohithkr.RoomMesh.driver.pkg
+   sudo pkgutil --forget io.github.brohithkr.RoomMesh.pkg   # receipt from pre-wizard builds, if present
    ```
 
 4. Optionally, remove its settings: `defaults delete io.github.brohithkr.RoomMesh`. A second-instance

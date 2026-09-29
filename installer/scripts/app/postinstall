@@ -1,0 +1,8 @@
+#!/bin/sh
+# Open RoomMesh for the user logged in at the console (the installer runs this as root).
+U=$(/usr/bin/stat -f %Su /dev/console)
+if [ -n "$U" ] && [ "$U" != root ] && [ "$U" != loginwindow ]; then
+  /bin/launchctl asuser "$(/usr/bin/id -u "$U")" /usr/bin/sudo -u "$U" \
+    /usr/bin/open -a /Applications/RoomMesh.app || true
+fi
+exit 0
