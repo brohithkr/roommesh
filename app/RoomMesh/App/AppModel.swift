@@ -218,6 +218,9 @@ final class AppModel {
     func setUseMyMic(_ on: Bool) { setMicEnabled(localPeerId, on) }
     func toggleMute() { isMuted.toggle(); core?.setLocalMute(muted: isMuted) }
     func metrics() -> [FfiPeerMetrics] { core?.getPeerMetrics() ?? [] }
+    /// The live mic meter behind Settings › Audio (see `NoiseMeterModel`).
+    func setMicMeterEnabled(_ enabled: Bool) { core?.setMicMeterEnabled(enabled: enabled) }
+    func micMeter() -> FfiMicMeter? { core?.getMicMeter() }
     /// Polled every 2 s and after driver changes; assigns only on change so views don't re-render needlessly.
     func refreshStatus() {
         let available = core?.virtualDeviceAvailable() ?? false

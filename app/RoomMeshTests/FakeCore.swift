@@ -28,7 +28,11 @@ final class FakeCore: RoomMeshCoreProtocol, @unchecked Sendable {
     func isLocalMuted() -> Bool { false }
     func startAudioEngine() {}
     func stopAudioEngine() {}
-    func updateSettings(settings: FfiSettings) { calls.append("settings") }
+    var lastSettings: FfiSettings?
+    func updateSettings(settings: FfiSettings) { calls.append("settings"); lastSettings = settings }
+    var meter: FfiMicMeter?
+    func setMicMeterEnabled(enabled: Bool) { calls.append("meter:\(enabled)") }
+    func getMicMeter() -> FfiMicMeter? { meter }
     func setLocalInfo(name: String, driverInstalled: Bool) {}
     func getRoomState() -> FfiRoomState? { room }
     func getNearbyPeers() -> [FfiNearbyPeer] { [] }

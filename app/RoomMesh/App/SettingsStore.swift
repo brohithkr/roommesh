@@ -24,6 +24,22 @@ final class SettingsStore {
     var autoElectCoordinator: Bool { didSet { d.set(autoElectCoordinator, forKey: "autoElect"); onChange?() } }
     var fallbackSpeakerToCoordinator: Bool { didSet { d.set(fallbackSpeakerToCoordinator, forKey: "fallbackSpeaker"); onChange?() } }
     var showWindowAtLaunch: Bool { didSet { d.set(showWindowAtLaunch, forKey: "showWindow") } }
+    /// This Mac's mic noise baseline in dBFS (after processing); `nil` = Automatic. Anything at or
+    /// below it never counts as speech on the coordinator.
+    var noiseBaselineDb: Double? {
+        didSet {
+            // "Custom" is stored explicitly, so a user who chose Automatic keeps it even if the
+            // default changes.
+            d.set(noiseBaselineDb != nil, forKey: "noiseBaselineCustom")
+            if let noiseBaselineDb { d.set(noiseBaselineDb, forKey: "noiseBaseline") }
+            onChange?()
+        }
+    }
+
+    /// The noise baseline until the user picks one (`nil` = Automatic). The core has its own
+    /// default (`DEFAULT_NOISE_BASELINE_DB` in core/roommesh-core/src/dsp/vad.rs); keep them the
+    /// same. Real-room measurements will tune this later.
+    static let defaultNoiseBaselineDb: Double? = nil
 
     init(defaults: UserDefaults) {
         d = defaults
@@ -39,13 +55,19 @@ final class SettingsStore {
         autoElectCoordinator = d.bool(forKey: "autoElect")
         fallbackSpeakerToCoordinator = d.bool(forKey: "fallbackSpeaker")
         showWindowAtLaunch = d.bool(forKey: "showWindow")
+        if d.object(forKey: "noiseBaselineCustom") == nil {
+            noiseBaselineDb = Self.defaultNoiseBaselineDb
+        } else {
+            noiseBaselineDb = d.bool(forKey: "noiseBaselineCustom") ? d.double(forKey: "noiseBaseline") : nil
+        }
     }
 
     var ffi: FfiSettings {
         FfiSettings(inputDevice: inputDevice, outputDevice: outputDevice, allowSimultaneousTalkers: allowSimultaneousTalkers,
                     echoCancellation: echoCancellation, noiseSuppression: noiseSuppression, micLatencyMs: micLatencyMs,
                     playoutDelayMs: playoutDelayMs, autoElectCoordinator: autoElectCoordinator,
-                    fallbackSpeakerToCoordinator: fallbackSpeakerToCoordinator)
+                    fallbackSpeakerToCoordinator: fallbackSpeakerToCoordinator,
+                    noiseBaselineDb: noiseBaselineDb.map { Float($0) })
     }
 
     /// Peer ids are 16 lowercase hex characters (what `generatePeerId()` produces and the core accepts).

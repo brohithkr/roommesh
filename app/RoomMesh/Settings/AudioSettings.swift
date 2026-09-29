@@ -16,6 +16,7 @@ struct AudioSettingsView: View {
                     ForEach(DeviceRow.rows(devices.filter(\.isOutput))) { Text($0.name).tag(Optional($0.name)) }
                 }
             }
+            NoiseBaselineSection()
             Section("Processing") {
                 Toggle("Echo cancellation", isOn: $settings.echoCancellation)
                 Toggle("Noise suppression", isOn: $settings.noiseSuppression)
