@@ -249,6 +249,84 @@ freshly installed app from asking to reinstall its driver. The script then runs
 `codesign --verify --strict --deep` on the app and the driver. It also runs `spctl -a -t install`
 on a signed pkg, which fails until the pkg is notarized.
 
+## Releases
+
+Releases are built and published by the manually triggered GitHub Actions workflow
+[`.github/workflows/release.yml`](.github/workflows/release.yml), on a `macos-15` runner with the
+latest Xcode 16.x:
+
+```sh
+gh workflow run release.yml -f version=1.1.0
+gh workflow run release.yml -f version=1.2.0 -f prerelease=true -f universal=true \
+  -f notes='Adds the room-wide noise baseline.'
+gh run watch    # follow the run
+```
+
+You can also start it from the repository's **Actions → Release → Run workflow** page. Pick the
+branch to release from there, or pass `--ref <branch>` to `gh workflow run`. The inputs are:
+
+| Input | Default | Meaning |
+|---|---|---|
+| `version` | (required) | `X.Y.Z`. The release is tagged `v<version>`. The run fails straight away if that tag already exists |
+| `prerelease` | `false` | Marks the release as a pre-release. `releases/latest`, and so the app's update checker, ignores pre-releases |
+| `universal` | `false` | Builds for arm64 and x86_64 (`UNIVERSAL=1`). Much slower, since WebRTC is compiled twice |
+| `notes` | empty | Markdown shown above the changelog that GitHub generates from the merged PRs and commits |
+
+The workflow runs these steps:
+
+1. It sets the version with `scripts/set-version.sh <version> <run number>`. The build number
+   (`CFBundleVersion`) is the workflow's run number, so it always increases. You can run the script
+   yourself too: `scripts/set-version.sh 1.1.0 [build]` validates `X.Y.Z` and updates
+   `app/RoomMesh/Resources/Info.plist`, and the driver takes its version from there.
+2. It runs `make test` (cargo test and clippy, the driver's ctest, the app's unit tests). If
+   any test fails, nothing is published.
+3. It runs `make package`, and writes `SHA256SUMS.txt` for the dmg and the pkg.
+4. It creates the GitHub release `v<version>`, titled **RoomMesh `<version>`**, on the commit it
+   built. The build is also kept as a workflow artifact.
+
+Every release has exactly these assets. The app's update checker reads
+`https://api.github.com/repos/brohithkr/roommesh/releases/latest`, downloads
+`RoomMesh-<version>.pkg` and verifies it against `SHA256SUMS.txt`, so don't rename them:
+
+- `RoomMesh-<version>.dmg`: the disk image with **Install RoomMesh.pkg** and **Uninstall RoomMesh.command**
+- `RoomMesh-<version>.pkg`: the installer on its own
+- `SHA256SUMS.txt`: `shasum -a 256` output for both. Check a download with `shasum -a 256 -c SHA256SUMS.txt`
+
+`.github/workflows/ci.yml` runs `make test-core` and the driver's ctest on every pull request
+and on every push to `main`. It doesn't build the app.
+
+### Signing and notarization in CI
+
+Signing is optional. Without any of the secrets below, the workflow builds the same unsigned
+release as a local `make package`, and the release notes tell users how to open it anyway:
+right-click → **Open**, or allow it in **System Settings → Privacy & Security**. To sign and
+notarize, add these repository secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret | Value |
+|---|---|
+| `MACOS_CERT_P12_BASE64` | `base64 -i certs.p12` of a `.p12` that holds the **Developer ID Application** identity and, ideally, the **Developer ID Installer** identity. Export both from Keychain Access, with their private keys, into one file |
+| `MACOS_CERT_PASSWORD` | the `.p12`'s password |
+| `MACOS_INSTALLER_CERT_P12_BASE64`, `MACOS_INSTALLER_CERT_PASSWORD` | optional: the Installer identity as a separate `.p12` (its password defaults to `MACOS_CERT_PASSWORD`) |
+| `DEVELOPER_ID_APP` | the identity's full name, e.g. `Developer ID Application: Jane Doe (TEAMID1234)` |
+| `DEVELOPER_ID_INSTALLER` | e.g. `Developer ID Installer: Jane Doe (TEAMID1234)` |
+| `NOTARY_APPLE_ID` | the Apple ID used for notarization |
+| `NOTARY_TEAM_ID` | the 10-character team ID |
+| `NOTARY_PASSWORD` | an [app-specific password](https://support.apple.com/102654) for that Apple ID |
+
+`scripts/ci-signing.sh` imports the certificates into a temporary keychain, which is deleted at the
+end of the run. It checks that the named identities are valid, then creates the notarytool keychain
+profile `roommesh-notary` and verifies the credentials before the build starts. `make package` then
+signs and notarizes as described in [Signing](#signing), with `DEVELOPER_ID_APP`,
+`DEVELOPER_ID_INSTALLER` and `NOTARY_PROFILE` set. The secrets work in layers:
+
+- **Certificate and `DEVELOPER_ID_APP` only:** the app, the driver and the dmg are signed.
+- **Plus `DEVELOPER_ID_INSTALLER`:** the pkg is signed too.
+- **Plus all three `NOTARY_*` secrets:** the pkg and the dmg are also notarized and stapled.
+  Notarization needs both identities.
+
+A partial layer fails the run instead of quietly publishing a weaker build. Examples are only some
+of the `NOTARY_*` secrets, or a `DEVELOPER_ID_*` without the certificate.
+
 ## Uninstall
 
 If you installed from the dmg, double-click **Uninstall RoomMesh.command** on the RoomMesh
