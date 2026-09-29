@@ -268,7 +268,7 @@ branch to release from there, or pass `--ref <branch>` to `gh workflow run`. The
 | Input | Default | Meaning |
 |---|---|---|
 | `version` | (required) | `X.Y.Z`. The release is tagged `v<version>`. The run fails straight away if that tag already exists |
-| `prerelease` | `false` | Marks the release as a pre-release. `releases/latest`, and so the app's update checker, ignores pre-releases |
+| `prerelease` | `false` | Marks the release as a pre-release. `releases/latest` skips pre-releases, so the app's update checker offers them only when **Include pre-releases** is on |
 | `universal` | `false` | Builds for arm64 and x86_64 (`UNIVERSAL=1`). Much slower, since WebRTC is compiled twice |
 | `notes` | empty | Markdown shown above the changelog that GitHub generates from the merged PRs and commits |
 

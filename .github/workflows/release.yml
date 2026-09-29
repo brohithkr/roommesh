@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       prerelease:
-        description: "Mark as a pre-release (releases/latest, and so the update checker, skips it)"
+        description: "Mark as a pre-release (the update checker offers it only with Include pre-releases on)"
         required: false
         type: boolean
         default: false
