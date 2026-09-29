@@ -1,0 +1,4 @@
+#!/bin/sh
+# Restart coreaudiod so it loads the new driver; launchd restarts it (audio pauses ~1 s).
+/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || /usr/bin/killall -9 coreaudiod || true
+exit 0

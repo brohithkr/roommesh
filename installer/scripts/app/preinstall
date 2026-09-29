@@ -1,0 +1,4 @@
+#!/bin/sh
+# Quit a running RoomMesh so its bundle can be replaced.
+/usr/bin/pkill -x RoomMesh || true
+exit 0

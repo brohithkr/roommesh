@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RoomMesh installer distribution. scripts/package.sh substitutes the @...@ placeholders and builds it
+  with productbuild. Wizard: Introduction (welcome) → Read Me → License → Destination Select →
+  Installation Type (the two choices below) → Installation → Summary (conclusion).
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>RoomMesh</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <readme file="readme.html" mime-type="text/html"/>
+    <license file="license.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <options customize="allow" require-scripts="false" rootVolumeOnly="true" hostArchitectures="@HOST_ARCHITECTURES@"/>
+    <domains enable_localSystem="true"/>
+
+    <!-- Minimum macOS (<os-version min="@MIN_OS@"/>), checked by script so it can say why. -->
+    <installation-check script="roommeshInstallationCheck()"/>
+    <script><![CDATA[
+function roommeshInstallationCheck() {
+    if (system.compareVersions(system.version.ProductVersion, '@MIN_OS@') < 0) {
+        my.result.type = 'Fatal';
+        my.result.title = 'RoomMesh requires macOS @MIN_OS@ or later';
+        my.result.message = 'This Mac is running macOS ' + system.version.ProductVersion +
+            '. Update macOS in System Settings > General > Software Update, then open this installer again.';
+        return false;
+    }
+    return true;
+}
+    ]]></script>
+
+    <choices-outline>
+        <line choice="app"/>
+        <line choice="driver"/>
+    </choices-outline>
+    <choice id="app" title="RoomMesh App"
+            description="The RoomMesh menu-bar app, installed in the Applications folder. Always installed."
+            enabled="false" selected="true">
+        <pkg-ref id="io.github.brohithkr.RoomMesh.app.pkg"/>
+    </choice>
+    <choice id="driver" title="RoomMesh Audio Driver"
+            description="Adds the RoomMesh Microphone and RoomMesh Speaker devices used by Meet, Zoom and Teams. Required for this Mac to act as the room coordinator. Installing restarts macOS audio for about a second."
+            start_selected="true">
+        <pkg-ref id="io.github.brohithkr.RoomMesh.driver.pkg"/>
+    </choice>
+
+    <pkg-ref id="io.github.brohithkr.RoomMesh.app.pkg" version="@VERSION@" onConclusion="none">@APP_PKG@</pkg-ref>
+    <pkg-ref id="io.github.brohithkr.RoomMesh.driver.pkg" version="@VERSION@" onConclusion="none">@DRIVER_PKG@</pkg-ref>
+</installer-gui-script>
