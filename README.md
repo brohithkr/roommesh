@@ -82,6 +82,35 @@ The app gates what each device actually carries based on the Mac's current role 
 / room speaker / neither) — role changes never require touching the meeting app's device
 settings again.
 
+## Background noise and the noise baseline
+
+The coordinator picks the active mic with a voice-activity detector that runs once per mic,
+after echo cancellation and noise suppression. It tracks each mic's noise floor automatically,
+and a frame only counts as speech when it is well above that floor.
+
+**Settings → Audio → Background noise** shows what the room hears from this Mac's mic. While
+the tab is visible the app runs the mic through the same processing (and opens the mic even when
+you aren't in a room). The meter spans −90…−20 dB:
+
+- the bar is the processed level, and the thin tick is its recent peak;
+- the vertical marker is the effective baseline;
+- above the marker the bar is blue while it counts as speech, and orange when it is heard but
+  isn't speech; below the marker it is grey (background, ignored).
+
+The baseline is either **Automatic** (the detector's own floor, shown underneath) or a **Custom
+baseline** (−90…−30 dB). With a custom baseline the floor is the higher of the two, so anything
+at or below it never selects this Mac's mic, which helps against a noisy fan or chatter from the
+next room. **Measure room noise** listens for 5 s while the room is quiet and sets the baseline to
+the 95th percentile of the level plus 3 dB.
+
+Each Mac sets its own baseline because mic gains differ. The value travels to the coordinator in
+the room manifest (`MemberInfo.noise_baseline_db`), and only that Mac can change it. The default
+is Automatic. It lives in `DEFAULT_NOISE_BASELINE_DB` (`core/roommesh-core/src/dsp/vad.rs`) and
+`SettingsStore.defaultNoiseBaselineDb` (`app/RoomMesh/App/SettingsStore.swift`); change both
+together. To measure a room through the same chain from the command line, run
+`cargo run -p roommesh-devtool -- noise-probe` from `core/` (in Terminal.app, with microphone
+permission).
+
 ## Verifying the audio path (roommesh-devtool)
 
 Run these from `core/`:
