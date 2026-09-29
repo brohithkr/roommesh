@@ -218,6 +218,21 @@ final class AppModel {
     func setUseMyMic(_ on: Bool) { setMicEnabled(localPeerId, on) }
     func toggleMute() { isMuted.toggle(); core?.setLocalMute(muted: isMuted) }
     func metrics() -> [FfiPeerMetrics] { core?.getPeerMetrics() ?? [] }
+    /// The noise baseline Settings › Audio edits (`nil` = Automatic): the room's while in a room
+    /// (it applies to every Mac in it), else this Mac's default for rooms it creates.
+    var noiseBaselineDb: Double? {
+        guard let room else { return settings.noiseBaselineDb }
+        return room.noiseBaselineDb.map(Double.init)
+    }
+    /// Sets the baseline `noiseBaselineDb` reads: the room's (through the coordinator; the new
+    /// value comes back in the room state) or this Mac's default.
+    func setNoiseBaseline(_ db: Double?) {
+        if inRoom {
+            run { try $0.setRoomNoiseBaseline(baselineDb: db.map(Float.init)) }
+        } else {
+            settings.noiseBaselineDb = db
+        }
+    }
     /// The live mic meter behind Settings › Audio (see `NoiseMeterModel`).
     func setMicMeterEnabled(_ enabled: Bool) { core?.setMicMeterEnabled(enabled: enabled) }
     func micMeter() -> FfiMicMeter? { core?.getMicMeter() }

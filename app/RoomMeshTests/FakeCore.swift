@@ -24,6 +24,7 @@ final class FakeCore: RoomMeshCoreProtocol, @unchecked Sendable {
     func setPeerMicrophoneEnabled(peerId: String, enabled: Bool) throws { try record("mic:\(peerId):\(enabled)") }
     func removeMember(peerId: String) throws { try record("remove:\(peerId)") }
     func renameRoom(name: String) throws { try record("rename:\(name)") }
+    func setRoomNoiseBaseline(baselineDb: Float?) throws { try record("roomBaseline:\(baselineDb.map { "\($0)" } ?? "nil")") }
     func setLocalMute(muted: Bool) { calls.append("mute:\(muted)") }
     func isLocalMuted() -> Bool { false }
     func startAudioEngine() {}
@@ -47,9 +48,9 @@ func member(_ id: String, _ name: String, local: Bool = false, coord: Bool = fal
     FfiMember(id: id, name: name, isLocal: local, online: online, micEnabled: true, isCoordinator: coord, isSpeaker: speaker, isActiveMic: active,
               driverInstalled: driver)
 }
-func sampleRoom() -> FfiRoomState {
+func sampleRoom(noiseBaselineDb: Float? = nil) -> FfiRoomState {
     FfiRoomState(roomId: "00000000000000ff", name: "Conference Room", epoch: 1, coordinator: "000000000000000a",
-                 speaker: "000000000000000c", activePrimary: "000000000000000b", activeSecondary: nil,
+                 speaker: "000000000000000c", noiseBaselineDb: noiseBaselineDb, activePrimary: "000000000000000b", activeSecondary: nil,
                  members: [member("000000000000000a", "Rohith's MacBook", local: true, coord: true),
                            member("000000000000000b", "Amaan's MacBook", active: true),
                            member("000000000000000c", "Meeting MacBook", speaker: true),

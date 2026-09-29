@@ -111,7 +111,7 @@ final class NoiseMeterTests: XCTestCase {
 
     func testSliderPushesTheBaselineOnlyAfterAPauseOrWhenTheDragEnds() {
         let clock = ManualScheduler()
-        var commits: [Double] = []
+        var commits: [Double?] = []
         let slider = BaselineSliderModel(delay: 0.3, schedule: clock.schedule)
         slider.commit = { commits.append($0) }
         slider.drag(to: -60.2)
@@ -163,6 +163,126 @@ final class NoiseMeterTests: XCTestCase {
         slider.endDrag()
         XCTAssertEqual(core.calls.filter { $0 == "settings" }.count, 1)
         XCTAssertEqual(core.lastSettings?.noiseBaselineDb, -40)
+    }
+
+    // MARK: room vs this Mac
+
+    func testOutsideARoomTheBaselineEditsThisMacsDefault() {
+        let core = FakeCore()
+        let model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
+        model.attach(core: core)
+        XCTAssertFalse(model.inRoom)
+        model.setNoiseBaseline(-50)
+        XCTAssertEqual(model.settings.noiseBaselineDb, -50)
+        XCTAssertEqual(model.noiseBaselineDb, -50)
+        XCTAssertEqual(core.lastSettings?.noiseBaselineDb, -50)
+        model.setNoiseBaseline(nil)
+        XCTAssertNil(model.settings.noiseBaselineDb)
+        XCTAssertFalse(core.calls.contains { $0.hasPrefix("roomBaseline") })
+        XCTAssertEqual(NoiseBaselineSection.title(roomName: nil), "Background noise")
+        XCTAssertEqual(NoiseBaselineSection.scopeCaption(inRoom: false), "Used as the starting baseline for rooms you create.")
+    }
+
+    func testInARoomTheBaselineEditsTheRoomsBaseline() {
+        let core = FakeCore()
+        let model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
+        model.attach(core: core)
+        model.settings.noiseBaselineDb = -60
+        model.apply(.roomChanged(state: sampleRoom(noiseBaselineDb: -48)))
+        core.calls = []
+        XCTAssertEqual(model.noiseBaselineDb, -48, "the room's value, not this Mac's")
+        model.setNoiseBaseline(-44)
+        XCTAssertEqual(core.calls, ["roomBaseline:-44.0"])
+        XCTAssertEqual(model.settings.noiseBaselineDb, -60, "this Mac's default is untouched")
+        model.setNoiseBaseline(nil)
+        XCTAssertEqual(core.calls.last, "roomBaseline:nil")
+        XCTAssertEqual(NoiseBaselineSection.title(roomName: "Conference Room"), "Background noise — Conference Room")
+        XCTAssertEqual(NoiseBaselineSection.scopeCaption(inRoom: true), "The baseline applies to every Mac in this room.")
+        // A measurement (or the picker) goes through the slider model to the room too.
+        let slider = BaselineSliderModel(delay: 0.3, schedule: ManualScheduler().schedule)
+        slider.commit = { model.setNoiseBaseline($0) }
+        slider.set(-41)
+        XCTAssertEqual(core.calls.last, "roomBaseline:-41.0")
+        // A failure is reported.
+        core.fail = FfiError.NotInRoom(message: "This Mac is not in a room")
+        model.setNoiseBaseline(-40)
+        XCTAssertEqual(model.lastError, "This Mac is not in a room")
+    }
+
+    func testARemoteRoomChangeShowsWhenNotDragging() {
+        let core = FakeCore()
+        let model = AppModel(settings: SettingsStore(defaults: makeDefaults()))
+        model.attach(core: core)
+        model.apply(.roomChanged(state: sampleRoom(noiseBaselineDb: -50)))
+        let slider = BaselineSliderModel(delay: 0.3, schedule: ManualScheduler().schedule)
+        slider.commit = { model.setNoiseBaseline($0) }
+        XCTAssertEqual(slider.displayed(committed: model.noiseBaselineDb), -50)
+        // Another Mac sets -40.
+        model.apply(.roomChanged(state: sampleRoom(noiseBaselineDb: -40)))
+        slider.committedChanged(to: model.noiseBaselineDb)
+        XCTAssertEqual(slider.displayed(committed: model.noiseBaselineDb), -40)
+        // ... and then Automatic.
+        model.apply(.roomChanged(state: sampleRoom(noiseBaselineDb: nil)))
+        slider.committedChanged(to: model.noiseBaselineDb)
+        XCTAssertNil(slider.displayed(committed: model.noiseBaselineDb))
+    }
+
+    func testARemoteRoomChangeDoesNotFightADrag() {
+        let clock = ManualScheduler()
+        var room: Double? = -50
+        var commits: [Double?] = []
+        let slider = BaselineSliderModel(delay: 0.3, schedule: clock.schedule)
+        slider.commit = { commits.append($0) }
+        // Grabbing the thumb without moving it yet: a remote change doesn't move it.
+        slider.beginDrag(committed: room)
+        room = -40
+        slider.committedChanged(to: room)
+        XCTAssertEqual(slider.displayed(committed: room), -50)
+        slider.drag(to: -55, committed: room)
+        room = -35
+        slider.committedChanged(to: room)
+        XCTAssertEqual(slider.displayed(committed: room), -55, "the drag stays under the pointer")
+        // A pause pushes -55 mid-drag; it stays shown until the room has it.
+        clock.advance(0.3)
+        XCTAssertEqual(commits, [-55])
+        XCTAssertEqual(slider.displayed(committed: room), -55)
+        slider.endDrag()
+        XCTAssertEqual(slider.displayed(committed: room), -55, "waiting for the room")
+        room = -55
+        slider.committedChanged(to: room)
+        XCTAssertEqual(slider.displayed(committed: room), -55)
+        XCTAssertTrue(slider.awaiting.isEmpty)
+        // With nothing in progress, the next remote change shows at once.
+        room = -45
+        slider.committedChanged(to: room)
+        XCTAssertEqual(slider.displayed(committed: room), -45)
+    }
+
+    func testAPushedValueStaysShownThroughItsOwnStaleEchoes() {
+        let clock = ManualScheduler()
+        var room: Double? = -60
+        let slider = BaselineSliderModel(delay: 0.3, echoTimeout: 2, schedule: clock.schedule)
+        slider.beginDrag(committed: room)
+        slider.drag(to: -50, committed: room)
+        clock.advance(0.3) // pushes -50
+        slider.drag(to: -45, committed: room)
+        slider.endDrag() // pushes -45
+        XCTAssertEqual(slider.awaiting, [-50, -45])
+        room = -50 // the first push arrives
+        slider.committedChanged(to: room)
+        XCTAssertEqual(slider.displayed(committed: room), -45, "not back to -50")
+        room = -45
+        slider.committedChanged(to: room)
+        XCTAssertEqual(slider.displayed(committed: room), -45)
+        XCTAssertTrue(slider.awaiting.isEmpty)
+        // A push the room never reflects (the change was lost) stops showing after the timeout.
+        slider.set(-70)
+        XCTAssertEqual(slider.displayed(committed: room), -70)
+        clock.advance(2)
+        XCTAssertEqual(slider.displayed(committed: room), -45)
+        // Setting Automatic shows Automatic until the room says otherwise.
+        slider.set(nil)
+        XCTAssertNil(slider.displayed(committed: room))
     }
 
     // MARK: meter lifetime

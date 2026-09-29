@@ -24,8 +24,9 @@ final class SettingsStore {
     var autoElectCoordinator: Bool { didSet { d.set(autoElectCoordinator, forKey: "autoElect"); onChange?() } }
     var fallbackSpeakerToCoordinator: Bool { didSet { d.set(fallbackSpeakerToCoordinator, forKey: "fallbackSpeaker"); onChange?() } }
     var showWindowAtLaunch: Bool { didSet { d.set(showWindowAtLaunch, forKey: "showWindow") } }
-    /// This Mac's mic noise baseline in dBFS (after processing); `nil` = Automatic. Anything at or
-    /// below it never counts as speech on the coordinator.
+    /// This Mac's noise baseline preference in dBFS (after processing); `nil` = Automatic. A room
+    /// this Mac creates starts with it, and the mic meter uses it outside a room. In a room, the
+    /// room's own baseline applies (`AppModel.noiseBaselineDb`).
     var noiseBaselineDb: Double? {
         didSet {
             // "Custom" is stored explicitly, so a user who chose Automatic keeps it even if the
