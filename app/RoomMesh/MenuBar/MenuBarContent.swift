@@ -39,6 +39,7 @@ struct MenuBarContent: View {
             Button("Audio Diagnostics…") { model.settingsTab = .advanced; NSApp.activate(); openSettings() }
             Button("Settings…") { model.settingsTab = .general; NSApp.activate(); openSettings() }
                 .keyboardShortcut(",")
+            updateItems
             Divider()
             Button("Leave Room") { model.leaveRoom() }
         } else {
@@ -52,9 +53,17 @@ struct MenuBarContent: View {
             Button("Create Room") { model.createRoom(name: model.defaultRoomName) }
             Button("Open RoomMesh…") { MainWindowController.shared.show() }
             Button("Settings…") { NSApp.activate(); openSettings() }.keyboardShortcut(",")
+            updateItems
         }
         Divider()
         Button("Quit RoomMesh") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    @ViewBuilder private var updateItems: some View {
+        if let update = model.updates.update {
+            Button("Update to \(update.version.description)…") { model.updates.presentWindow() }
+        }
+        Button("Check for Updates…") { Task { await model.updates.checkForUpdates(userInitiated: true) } }
     }
 
     static func promptTitle(_ model: AppModel) -> String? {

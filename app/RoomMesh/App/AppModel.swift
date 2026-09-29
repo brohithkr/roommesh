@@ -32,6 +32,8 @@ final class AppModel {
     static let shared = AppModel()
 
     let settings: SettingsStore
+    /// Check for Updates (GitHub Releases).
+    let updates: UpdateChecker
     @ObservationIgnored private(set) var core: (any RoomMeshCoreProtocol)?
     private(set) var localPeerId = ""
 
@@ -94,9 +96,13 @@ final class AppModel {
     /// Id of the sheet SwiftUI last presented (see `sheetDidPresent`).
     @ObservationIgnored private(set) var presentedSheetID: String?
 
-    /// `nil` → the app's persisted settings. (A `SettingsStore(...)` default argument would be
-    /// evaluated outside the main actor.)
-    init(settings: SettingsStore? = nil) { self.settings = settings ?? SettingsStore(defaults: .roomMesh) }
+    /// `nil` → the app's persisted settings / the live update checker. (A `SettingsStore(...)`
+    /// default argument would be evaluated outside the main actor.)
+    init(settings: SettingsStore? = nil, updates: UpdateChecker? = nil) {
+        let settings = settings ?? SettingsStore(defaults: .roomMesh)
+        self.settings = settings
+        self.updates = updates ?? UpdateChecker.live(settings: settings)
+    }
 
     func bootstrap(driverInstalled: Bool) {
         guard core == nil else { return }

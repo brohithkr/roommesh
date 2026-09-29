@@ -24,6 +24,14 @@ final class SettingsStore {
     var autoElectCoordinator: Bool { didSet { d.set(autoElectCoordinator, forKey: "autoElect"); onChange?() } }
     var fallbackSpeakerToCoordinator: Bool { didSet { d.set(fallbackSpeakerToCoordinator, forKey: "fallbackSpeaker"); onChange?() } }
     var showWindowAtLaunch: Bool { didSet { d.set(showWindowAtLaunch, forKey: "showWindow") } }
+    /// Look for a new release once at launch and then daily (`UpdateChecker`).
+    var checkForUpdatesAutomatically: Bool { didSet { d.set(checkForUpdatesAutomatically, forKey: "autoUpdateCheck") } }
+    /// Offer GitHub pre-releases too.
+    var includePrereleases: Bool { didSet { d.set(includePrereleases, forKey: "updatePrereleases") } }
+    /// The last successful update check.
+    var lastUpdateCheck: Date? { didSet { d.set(lastUpdateCheck, forKey: "lastUpdateCheck") } }
+    /// The version whose "available" status line the user put off with "Later".
+    var dismissedUpdateVersion: String? { didSet { d.set(dismissedUpdateVersion, forKey: "dismissedUpdateVersion") } }
     /// This Mac's noise baseline preference in dBFS (after processing); `nil` = Automatic. A room
     /// this Mac creates starts with it, and the mic meter uses it outside a room. In a room, the
     /// room's own baseline applies (`AppModel.noiseBaselineDb`).
@@ -45,7 +53,8 @@ final class SettingsStore {
     init(defaults: UserDefaults) {
         d = defaults
         // micLatency 70 ms matches the core's default.
-        d.register(defaults: ["aec": true, "ns": true, "micLatency": 70, "playout": 80, "autoElect": true, "showWindow": true])
+        d.register(defaults: ["aec": true, "ns": true, "micLatency": 70, "playout": 80, "autoElect": true, "showWindow": true,
+                              "autoUpdateCheck": true])
         inputDevice = d.string(forKey: "inputDevice")
         outputDevice = d.string(forKey: "outputDevice")
         allowSimultaneousTalkers = d.bool(forKey: "multiTalk")
@@ -56,6 +65,10 @@ final class SettingsStore {
         autoElectCoordinator = d.bool(forKey: "autoElect")
         fallbackSpeakerToCoordinator = d.bool(forKey: "fallbackSpeaker")
         showWindowAtLaunch = d.bool(forKey: "showWindow")
+        checkForUpdatesAutomatically = d.bool(forKey: "autoUpdateCheck")
+        includePrereleases = d.bool(forKey: "updatePrereleases")
+        lastUpdateCheck = d.object(forKey: "lastUpdateCheck") as? Date
+        dismissedUpdateVersion = d.string(forKey: "dismissedUpdateVersion")
         if d.object(forKey: "noiseBaselineCustom") == nil {
             noiseBaselineDb = Self.defaultNoiseBaselineDb
         } else {

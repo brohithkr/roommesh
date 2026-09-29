@@ -24,6 +24,17 @@ struct StatusBanner: View {
             if let err = model.lastError {
                 banner(err, action: "Dismiss") { model.lastError = nil }
             }
+            if let update = model.updates.bannerUpdate {
+                HStack(alignment: .center) {
+                    Image(systemName: "arrow.down.circle").foregroundStyle(.tint)
+                    Text("RoomMesh \(update.version.description) is available").font(.callout)
+                    Spacer()
+                    Button("Later") { model.updates.later() }.controlSize(.small)
+                    Button("Update…") { model.updates.presentWindow() }.controlSize(.small)
+                }
+                .padding(8)
+                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
             if let notice = model.notice {
                 // Transient, informational: neutral styling, no action; AppModel clears it after a few seconds.
                 HStack(alignment: .top) {

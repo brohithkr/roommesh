@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             model.bootstrap(driverInstalled: VirtualDeviceStatus.installed)
             model.refreshStatus()
+            model.updates.startAutomaticChecks()
             if Permissions.microphone == .undetermined { Task { _ = await Permissions.requestMicrophone() } }
             if model.settings.showWindowAtLaunch && !Self.launchedAsLoginItem { MainWindowController.shared.show() }
             // .common mode: keep polling while a menu is open or a control is tracking.
