@@ -165,6 +165,41 @@ final class NoiseMeterTests: XCTestCase {
         XCTAssertEqual(core.lastSettings?.noiseBaselineDb, -40)
     }
 
+    // MARK: meter lifetime
+
+    func testTheMeterIsReleasedWhenTheModelGoesAway() {
+        var enabled: [Bool] = []
+        do {
+            let meter = NoiseMeterModel()
+            meter.start(read: { nil }, enable: { enabled.append($0) }, timer: true)
+            XCTAssertEqual(enabled, [true])
+        }
+        XCTAssertEqual(enabled, [true, false], "deinit stops the timer and disables the meter")
+    }
+
+    func testResigningActiveStopsTheMeterWhenSettingsIsClosed() {
+        let center = NotificationCenter()
+        var visible = true
+        var enabled: [Bool] = []
+        let meter = NoiseMeterModel(center: center)
+        meter.start(read: { nil }, enable: { enabled.append($0) }, timer: false, visible: { visible })
+        let resign = { center.post(name: NSApplication.didResignActiveNotification, object: nil) }
+        let activate = { center.post(name: NSApplication.didBecomeActiveNotification, object: nil) }
+        resign()
+        XCTAssertEqual(enabled, [true], "Settings still on screen: keep metering")
+        visible = false
+        resign()
+        XCTAssertEqual(enabled, [true, false])
+        activate()
+        XCTAssertEqual(enabled, [true, false], "Settings closed: stays off")
+        visible = true
+        activate()
+        XCTAssertEqual(enabled, [true, false, true], "back on screen: resumes")
+        meter.stop()
+        activate()
+        XCTAssertEqual(enabled, [true, false, true, false], "stopped for good")
+    }
+
     // MARK: presentation
 
     func testAccessibilityValue() {

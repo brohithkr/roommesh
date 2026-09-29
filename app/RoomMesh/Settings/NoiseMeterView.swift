@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// "Measure room noise": the custom baseline from a few seconds of quiet-room readings.
@@ -105,6 +106,10 @@ final class BaselineSliderModel {
 
 /// Polls the core's live mic meter at 20 Hz while the Settings view is visible, and runs a
 /// "Measure room noise" pass over those readings.
+///
+/// The core meter costs an extra echo canceller and keeps the mic open, so it is released not
+/// only on `stop()` (the view's onDisappear) but also when the model goes away, and it is
+/// suspended while the app is inactive with Settings closed.
 @MainActor @Observable
 final class NoiseMeterModel {
     private(set) var reading: FfiMicMeter?
@@ -115,39 +120,80 @@ final class NoiseMeterModel {
 
     @ObservationIgnored private var read: () -> FfiMicMeter? = { nil }
     @ObservationIgnored private var enable: (Bool) -> Void = { _ in }
-    @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var visible: () -> Bool = { true }
+    @ObservationIgnored private var useTimer = true
     @ObservationIgnored private var measureEnd: Date?
     @ObservationIgnored private var samples: [Float] = []
-    @ObservationIgnored private var running = false
+    /// `start` was called and `stop` wasn't: metering resumes when Settings is back on screen.
+    @ObservationIgnored private var wanted = false
+    /// The timer, the meter's release and the app-state observers; torn down by `deinit` too.
+    @ObservationIgnored private let lease: MeterLease
 
     static let interval: TimeInterval = 0.05
 
-    func start(model: AppModel, timer: Bool = true) {
-        start(read: { [weak model] in model?.micMeter() }, enable: { [weak model] in model?.setMicMeterEnabled($0) }, timer: timer)
+    init(center: NotificationCenter = .default) {
+        lease = MeterLease(center: center)
     }
 
-    /// `timer: false` leaves ticking to the caller (tests).
-    func start(read: @escaping () -> FfiMicMeter?, enable: @escaping (Bool) -> Void, timer: Bool = true) {
+    deinit {
+        let lease = lease
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { lease.release() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { lease.release() } }
+        }
+    }
+
+    func start(model: AppModel, timer: Bool = true, visible: @escaping () -> Bool = { true }) {
+        start(read: { [weak model] in model?.micMeter() }, enable: { [weak model] in model?.setMicMeterEnabled($0) },
+              timer: timer, visible: visible)
+    }
+
+    /// `timer: false` leaves ticking to the caller (tests). `visible`: whether the view is on
+    /// screen (its Settings window is open).
+    func start(read: @escaping () -> FfiMicMeter?, enable: @escaping (Bool) -> Void, timer: Bool = true,
+               visible: @escaping () -> Bool = { true }) {
         stop()
         self.read = read
         self.enable = enable
-        running = true
-        enable(true)
-        guard timer else { return }
-        // Common modes: keeps refreshing while a slider is being dragged.
-        let t = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick(now: Date()) }
+        self.visible = visible
+        useTimer = timer
+        wanted = true
+        lease.observe(NSApplication.didResignActiveNotification) { [weak self] in
+            guard let self, !self.visible() else { return }
+            self.suspend()
         }
-        RunLoop.main.add(t, forMode: .common)
-        self.timer = t
+        lease.observe(NSApplication.didBecomeActiveNotification) { [weak self] in
+            guard let self, self.wanted, self.visible() else { return }
+            self.resume()
+        }
+        resume()
     }
 
     func stop() {
-        guard running else { return }
-        running = false
-        timer?.invalidate()
-        timer = nil
-        enable(false)
+        wanted = false
+        lease.stopObserving()
+        suspend()
+    }
+
+    private func resume() {
+        guard !lease.isRunning else { return }
+        enable(true)
+        var timer: Timer?
+        if useTimer {
+            // Common modes: keeps refreshing while a slider is being dragged.
+            let t = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.tick(now: Date()) }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        }
+        lease.running(timer: timer, release: enable)
+    }
+
+    private func suspend() {
+        guard lease.isRunning else { return }
+        lease.release(observers: false)
         reading = nil
         measureEnd = nil
         countdown = nil
@@ -272,11 +318,80 @@ struct NoiseMeterBar: View {
     }
 }
 
+/// What `NoiseMeterModel` must undo: its timer, the core meter and its notification observers.
+/// A separate object so `deinit` can release them.
+@MainActor
+private final class MeterLease: @unchecked Sendable {
+    private let center: NotificationCenter
+    private var timer: Timer?
+    private var disable: ((Bool) -> Void)?
+    private var observers: [NSObjectProtocol] = []
+
+    init(center: NotificationCenter) { self.center = center }
+
+    var isRunning: Bool { disable != nil }
+
+    func running(timer: Timer?, release: @escaping (Bool) -> Void) {
+        self.timer = timer
+        disable = release
+    }
+
+    /// App activation notifications arrive on the main thread.
+    func observe(_ name: Notification.Name, _ handler: @escaping @MainActor @Sendable () -> Void) {
+        observers.append(center.addObserver(forName: name, object: nil, queue: nil) { _ in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { handler() }
+            } else {
+                DispatchQueue.main.async { MainActor.assumeIsolated { handler() } }
+            }
+        })
+    }
+
+    func stopObserving() {
+        observers.forEach(center.removeObserver)
+        observers = []
+    }
+
+    /// Stops the timer and disables the core meter (and, by default, stops observing).
+    func release(observers: Bool = true) {
+        timer?.invalidate()
+        timer = nil
+        disable?(false)
+        disable = nil
+        if observers { stopObserving() }
+    }
+}
+
+/// Reports the NSWindow a view is in (nil until it is in one).
+private struct WindowReader: NSViewRepresentable {
+    let onWindow: (NSWindow?) -> Void
+    final class Probe: NSView {
+        var onWindow: (NSWindow?) -> Void = { _ in }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onWindow(window)
+        }
+    }
+    func makeNSView(context: Context) -> Probe {
+        let v = Probe()
+        v.onWindow = onWindow
+        return v
+    }
+    func updateNSView(_ v: Probe, context: Context) { v.onWindow = onWindow }
+}
+
+/// Holds the Settings window weakly for `NoiseMeterModel`'s visibility check.
+@MainActor
+private final class WeakWindow {
+    weak var window: NSWindow?
+}
+
 /// Settings › Audio › Background noise: the live meter and the Automatic / Custom baseline.
 struct NoiseBaselineSection: View {
     @Environment(AppModel.self) private var model
     @State private var meter = NoiseMeterModel()
     @State private var slider = BaselineSliderModel()
+    @State private var window = WeakWindow()
     @State private var measureMessage: String?
 
     var body: some View {
@@ -289,6 +404,7 @@ struct NoiseBaselineSection: View {
                     .foregroundStyle(meter.reading.map { NoiseMeterBar.isBackground($0) } ?? true ? .secondary : .primary)
             }
             .padding(.vertical, 2)
+            .background(WindowReader { [window] in window.window = $0 })
             Picker("Baseline", selection: customBinding) {
                 Text("Automatic").tag(false)
                 Text("Custom baseline").tag(true)
@@ -344,7 +460,7 @@ struct NoiseBaselineSection: View {
                 }
             }
             slider.commit = { [weak model] v in model?.settings.noiseBaselineDb = v }
-            meter.start(model: model)
+            meter.start(model: model, visible: { [window] in window.window?.isVisible == true })
         }
         .onDisappear {
             slider.endDrag()
