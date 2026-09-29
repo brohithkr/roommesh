@@ -20,6 +20,8 @@ commands:
   shm-selftest      in-process ring round trip; no driver needed
   mic-loopback      write a tone into the mic ring and capture it from \"RoomMesh Microphone\"
   speaker-loopback  play a tone into \"RoomMesh Speaker\" and read it back from the speaker ring
+  noise-probe       measure this room through the default microphone and the app's processing
+                    (echo canceller + noise suppression + voice detection): 15 s quiet, 10 s talking
 
 options:
   --force           run a loopback even while the RoomMesh app looks live
@@ -27,7 +29,7 @@ options:
 
 The loopbacks drive the shared memory directly, so quit RoomMesh first; they refuse to run
 while the app's heartbeat is fresh or a client is capturing from RoomMesh Microphone.
-mic-loopback needs microphone permission: run it from Terminal.app.
+mic-loopback and noise-probe need microphone permission: run them from Terminal.app.
 exit status: 0 = PASS, 1 = FAIL or error, 2 = usage error";
 
 /// Liveness window for the app heartbeat (same threshold the driver uses for its own).
@@ -290,6 +292,139 @@ fn cmd_speaker_loopback(force: bool) -> Outcome {
     Ok(pass)
 }
 
+/// Level percentiles of `v` (dB), as "p5 / p50 / p95".
+fn percentiles(v: &mut [f32]) -> String {
+    if v.is_empty() {
+        return "n/a".into();
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let at = |q: f32| v[((v.len() - 1) as f32 * q) as usize];
+    format!(
+        "p5 {:.1} / p50 {:.1} / p95 {:.1} dB",
+        at(0.05),
+        at(0.5),
+        at(0.95)
+    )
+}
+
+#[derive(Default)]
+struct PhaseStats {
+    raw_db: Vec<f32>,
+    processed_db: Vec<f32>,
+    floor_db: Vec<f32>,
+    snr_db: Vec<f32>,
+    speech_frames: usize,
+    frames: usize,
+}
+
+impl PhaseStats {
+    fn report(&mut self, name: &str) {
+        println!("{name} ({} frames of 10 ms):", self.frames);
+        println!("  raw mic level       {}", percentiles(&mut self.raw_db));
+        println!(
+            "  after processing    {}",
+            percentiles(&mut self.processed_db)
+        );
+        println!("  VAD noise floor     {}", percentiles(&mut self.floor_db));
+        println!("  VAD SNR             {}", percentiles(&mut self.snr_db));
+        println!(
+            "  judged speech       {:.1}% of frames",
+            100.0 * self.speech_frames as f32 / self.frames.max(1) as f32
+        );
+    }
+}
+
+/// Captures the default microphone and runs it through the same chain the coordinator uses
+/// for every mic (WebRTC AEC with noise suppression, fed silence as the far-end reference, then
+/// the VAD), reporting levels for a quiet phase and a talking phase.
+fn cmd_noise_probe() -> Outcome {
+    use roommesh_core::audio::device_io::{DeviceHost, DeviceSelector};
+    use roommesh_core::dsp::aec::{EchoCanceller, WebRtcAec};
+    use roommesh_core::dsp::level::measure;
+    use roommesh_core::dsp::vad::Vad;
+    use roommesh_core::engine::uplink::FrameAssembler;
+
+    const WARMUP_S: f32 = 2.0;
+    const QUIET_S: f32 = 15.0;
+    const TALK_S: f32 = 10.0;
+    let host = DeviceHost::spawn();
+    let mut cap = host
+        .start_capture(DeviceSelector::Default)
+        .map_err(|e| format!("cannot open the default microphone: {e}"))?;
+    println!("microphone: {} ({} Hz)", cap.device_name, cap.sample_rate);
+    let mut assembler = FrameAssembler::new(cap.sample_rate);
+    let mut aec = WebRtcAec::new(true).map_err(|e| format!("echo canceller: {e}"))?;
+    let mut vad = Vad::new();
+    let reference = [0.0f32; 480];
+    let (mut quiet, mut talk) = (PhaseStats::default(), PhaseStats::default());
+    let mut first_frames = Vec::new();
+    let (mut frames, mut all_zero) = (0usize, true);
+    println!(
+        "Stay QUIET for {:.0} s (normal room noise is fine)...",
+        WARMUP_S + QUIET_S
+    );
+    let mut prompted_talk = false;
+    let start = Instant::now();
+    while start.elapsed().as_secs_f32() < WARMUP_S + QUIET_S + TALK_S {
+        while let Ok(b) = cap.blocks.pop() {
+            assembler.push(b.first_frame, b.capture_ns, &b.samples[..b.len as usize]);
+        }
+        while let Some(frame) = assembler.pop_frame() {
+            let t = frames as f32 * 0.01;
+            frames += 1;
+            let mut x = frame.samples;
+            all_zero &= x.iter().all(|v| *v == 0.0);
+            let raw = measure(&x).rms_db;
+            aec.process(&reference, &mut x);
+            let processed = measure(&x).rms_db;
+            let r = vad.process(&x);
+            if first_frames.len() < 5 {
+                first_frames.push(processed);
+            }
+            let phase = if t < WARMUP_S {
+                continue;
+            } else if t < WARMUP_S + QUIET_S {
+                &mut quiet
+            } else {
+                &mut talk
+            };
+            phase.frames += 1;
+            phase.raw_db.push(raw);
+            phase.processed_db.push(processed);
+            phase.floor_db.push(r.noise_floor_db);
+            phase.snr_db.push(r.snr_db);
+            phase.speech_frames += r.is_speech as usize;
+        }
+        if !prompted_talk && start.elapsed().as_secs_f32() >= WARMUP_S + QUIET_S {
+            prompted_talk = true;
+            println!("Now TALK normally for {TALK_S:.0} s (from where you'd sit in a meeting)...");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    host.stop_capture();
+    if frames == 0 {
+        println!("FAIL noise-probe: no audio frames captured");
+        return Ok(false);
+    }
+    if all_zero {
+        println!("FAIL noise-probe: every sample was exactly 0");
+        println!("hint: that is what macOS feeds a process without microphone permission; run from Terminal.app");
+        return Ok(false);
+    }
+    println!();
+    println!(
+        "first processed frames: {}",
+        first_frames
+            .iter()
+            .map(|d| format!("{d:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    quiet.report("QUIET");
+    talk.report("TALKING");
+    Ok(true)
+}
+
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
@@ -319,6 +454,7 @@ fn main() -> ExitCode {
         "shm-selftest" => cmd_shm_selftest(),
         "mic-loopback" => cmd_mic_loopback(force),
         "speaker-loopback" => cmd_speaker_loopback(force),
+        "noise-probe" => cmd_noise_probe(),
         other => return usage_error(&format!("unknown command '{other}'")),
     };
     match outcome {
