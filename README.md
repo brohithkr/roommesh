@@ -82,6 +82,17 @@ The app gates what each device actually carries based on the Mac's current role 
 / room speaker / neither) — role changes never require touching the meeting app's device
 settings again.
 
+**After installing or reinstalling the driver, quit and reopen the browser and meeting apps.**
+Installing restarts macOS audio and recreates the RoomMesh devices; an app that was already
+running (seen with Arc) keeps a stale view of them, and opening RoomMesh Microphone fails with
+"Could not start audio source" / Meet refuses to unmute, while other microphones still work.
+
+**Testing needs someone outside the room.** When every participant is a RoomMesh Mac in the
+same room, nobody hears anything through the room speaker — by design: Meet sends each Mac
+only the other participants' audio, the other room Macs send silence, and the people in the
+room hear each other directly. Join from a phone (or a Mac with headphones, outside the room)
+to hear the room and to be heard through the room speaker.
+
 ## Background noise and the noise baseline
 
 The coordinator picks the active mic with a voice-activity detector that runs once per mic,

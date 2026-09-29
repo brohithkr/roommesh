@@ -278,7 +278,9 @@ final class AppModel {
         if present || attempt >= 10 {
             driverOperation = nil
             refreshStatus()
-            if !present {
+            if present {
+                showNotice("RoomMesh driver installed. Quit and reopen your browser and meeting apps (Meet, Zoom, Teams) so they see the RoomMesh devices.", clearAfter: 20)
+            } else {
                 showNotice("The RoomMesh devices haven't appeared yet. Restart the Mac to finish installing the driver.", clearAfter: 20)
             }
             return
