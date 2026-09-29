@@ -1,0 +1,209 @@
+# Builds, tests and publishes a RoomMesh release. Manual only:
+#   gh workflow run release.yml -f version=1.1.0 [-f prerelease=true] [-f universal=true] [-f notes='...']
+# Publishes the GitHub release v<version> with RoomMesh-<version>.dmg, RoomMesh-<version>.pkg and
+# SHA256SUMS.txt. The app's update checker reads /repos/brohithkr/roommesh/releases/latest and looks
+# for exactly these asset names, so don't rename them.
+# Signing and notarization are optional and driven by repository secrets (see scripts/ci-signing.sh
+# and the Releases section of README.md); without them the release is built unsigned.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, X.Y.Z (tagged v<version>)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as a pre-release (releases/latest, and so the update checker, skips it)"
+        required: false
+        type: boolean
+        default: false
+      universal:
+        description: "Build for arm64 + x86_64 (much slower: WebRTC is compiled twice)"
+        required: false
+        type: boolean
+        default: false
+      notes:
+        description: "Release notes (Markdown), shown above the generated changelog"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+# One release at a time; a second dispatch waits instead of cancelling the running one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Latest stable Xcode 16.x on the image (a partial version excludes betas and Xcode 26).
+  XCODE_VERSION: "16"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: RoomMesh ${{ inputs.version }}
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+      UNIVERSAL: ${{ inputs.universal && '1' || '0' }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the version and that the tag is new
+        run: scripts/check-release-tag.sh "$VERSION"
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen meson ninja pkg-config
+          command -v cmake >/dev/null || brew install cmake # preinstalled on the macOS images
+          # Installs the remaining Xcode components; without it xcodebuild can fail to load its
+          # plug-ins (scripts/build-core.sh works around that, but the app build can't).
+          sudo xcodebuild -runFirstLaunch
+          xcodebuild -version
+          cmake --version | head -n1
+          xcodegen --version
+
+      - name: Install Rust
+        id: rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          targets=(aarch64-apple-darwin)
+          if [ "$UNIVERSAL" = 1 ]; then targets+=(x86_64-apple-darwin); fi
+          rustup target add "${targets[@]}"
+          rustc -V
+          echo "version=$(rustc -V | awk '{print $2}')" >>"$GITHUB_OUTPUT"
+
+      - name: Cache cargo registry and core/target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            core/target/
+          key: ${{ runner.os }}-${{ runner.arch }}-release-universal${{ env.UNIVERSAL }}-rust${{ steps.rust.outputs.version }}-${{ hashFiles('core/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-release-universal${{ env.UNIVERSAL }}-rust${{ steps.rust.outputs.version }}-
+
+      - name: Set the version (${{ inputs.version }}, build ${{ github.run_number }})
+        run: scripts/set-version.sh "$VERSION" "$BUILD_NUMBER"
+
+      - name: Set up signing
+        id: signing
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_INSTALLER_CERT_P12_BASE64: ${{ secrets.MACOS_INSTALLER_CERT_P12_BASE64 }}
+          MACOS_INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+          DEVELOPER_ID_APP: ${{ secrets.DEVELOPER_ID_APP }}
+          DEVELOPER_ID_INSTALLER: ${{ secrets.DEVELOPER_ID_INSTALLER }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: scripts/ci-signing.sh setup
+
+      # cargo test + clippy, the driver's ctest, and the app's unit tests. The app is ad-hoc signed
+      # (CODE_SIGN_IDENTITY "-"), so no certificate is needed here.
+      - name: Test
+        run: make test UNIVERSAL="$UNIVERSAL"
+
+      - name: Build the pkg and dmg
+        run: make package UNIVERSAL="$UNIVERSAL"
+
+      - name: Check the build
+        run: |
+          app=app/build/Build/Products/Release/RoomMesh.app
+          plist="$app/Contents/Info.plist"
+          got_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
+          got_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")
+          [ "$got_version" = "$VERSION" ] || { echo "::error::app version is $got_version, expected $VERSION"; exit 1; }
+          [ "$got_build" = "$BUILD_NUMBER" ] || { echo "::error::app build is $got_build, expected $BUILD_NUMBER"; exit 1; }
+          for f in "dist/RoomMesh-$VERSION.dmg" "dist/RoomMesh-$VERSION.pkg"; do
+            [ -s "$f" ] || { echo "::error::$f was not built"; exit 1; }
+          done
+          echo "app: $(lipo -archs "$app/Contents/MacOS/RoomMesh")"
+          pkgutil --check-signature "dist/RoomMesh-$VERSION.pkg" || true # "no signature" when unsigned
+          ls -l dist
+
+      - name: Write SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          shasum -a 256 "RoomMesh-$VERSION.dmg" "RoomMesh-$VERSION.pkg" >SHA256SUMS.txt
+          shasum -a 256 -c SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomMesh-${{ inputs.version }}
+          path: |
+            dist/RoomMesh-${{ inputs.version }}.dmg
+            dist/RoomMesh-${{ inputs.version }}.pkg
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Write the release notes
+        env:
+          NOTES: ${{ inputs.notes }}
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          {
+            if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+            case "$SIGNING_MODE" in
+              unsigned)
+                echo "> **Unsigned build.** macOS blocks it the first time: right-click (Control-click) **Install RoomMesh.pkg** → **Open**, or allow it in **System Settings → Privacy & Security**."
+                echo ;;
+              signed)
+                echo "> **Signed but not notarized.** macOS may block it the first time: right-click (Control-click) **Install RoomMesh.pkg** → **Open**, or allow it in **System Settings → Privacy & Security**."
+                echo ;;
+            esac
+            if [ "$UNIVERSAL" = 1 ]; then
+              echo "Runs on Apple silicon and Intel Macs with macOS 14.2 or later."
+            else
+              echo "Runs on Apple silicon Macs with macOS 14.2 or later (this build does not install on Intel Macs)."
+            fi
+            echo
+            echo "Open **RoomMesh-$VERSION.dmg** and run **Install RoomMesh.pkg** (or install **RoomMesh-$VERSION.pkg** directly). Verify the download with \`shasum -a 256 -c SHA256SUMS.txt\`."
+          } >"$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }} # only this step gets it, not the build's scripts
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # The build takes a while; make sure nobody created the tag in the meantime, since
+          # gh would attach the release to an existing tag instead of failing.
+          scripts/check-release-tag.sh "$VERSION"
+          args=(--title "RoomMesh $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" --generate-notes
+                --target "$GITHUB_SHA")
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}" \
+            "dist/RoomMesh-$VERSION.dmg" "dist/RoomMesh-$VERSION.pkg" dist/SHA256SUMS.txt
+          gh release view "$TAG" --json url,isPrerelease,assets --jq '{url, isPrerelease, assets: [.assets[].name]}'
+
+      - name: Remove the signing keychain
+        if: always() && steps.signing.outcome != 'skipped'
+        run: scripts/ci-signing.sh cleanup
