@@ -7,6 +7,9 @@ struct StatusBanner: View {
             if model.micPermission == .denied {
                 banner("Microphone access is off for RoomMesh.", action: "Open Settings") { Permissions.openPrivacySettings("Privacy_Microphone") }
             }
+            if model.showsNotificationsOffBanner {
+                banner("Notifications are off for RoomMesh — you'll still see invites here", action: "Open Settings") { Notifications.openSettings() }
+            }
             if model.localNetworkDenied {
                 banner("Local Network access is off, so nearby Macs can't be found.", action: "Open Settings") { Permissions.openPrivacySettings("Privacy_LocalNetwork") }
             }

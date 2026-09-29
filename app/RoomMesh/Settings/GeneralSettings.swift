@@ -22,6 +22,18 @@ struct GeneralSettings: View {
             }
             Toggle("Show the RoomMesh window when the app opens", isOn: $settings.showWindowAtLaunch)
             Toggle("Choose a new coordinator automatically if it disconnects", isOn: $settings.autoElectCoordinator)
+            LabeledContent("Notifications") {
+                HStack {
+                    Text(model.notificationStatus ?? "Checking…").foregroundStyle(.secondary)
+                    if model.notificationsAllowed != true {
+                        Button("Open Settings") { Notifications.openSettings() }.controlSize(.small)
+                    }
+                }
+            }
+            if model.showsNotificationsOffBanner {
+                Text("Invites still appear: RoomMesh plays a sound, brings its window to the front and marks the menu-bar icon.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             LabeledContent("Version", value: "\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (core \(coreVersion()))")
         }
         .formStyle(.grouped)

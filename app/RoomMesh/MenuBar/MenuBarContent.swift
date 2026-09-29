@@ -5,6 +5,11 @@ struct MenuBarContent: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
+        if let prompt = Self.promptTitle(model) {
+            // Where the badged icon leads: straight to the waiting sheet.
+            Button(prompt) { MainWindowController.shared.show() }
+            Divider()
+        }
         if let room = model.room {
             Text(room.name)
             Text("\(model.connectedCount) \(model.connectedCount == 1 ? "Mac" : "Macs") connected · \(model.health.label)")
@@ -50,5 +55,12 @@ struct MenuBarContent: View {
         }
         Divider()
         Button("Quit RoomMesh") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    static func promptTitle(_ model: AppModel) -> String? {
+        if let i = model.incomingInvite { return "Invitation to “\(i.roomName)” from \(i.fromName)…" }
+        if model.coordinatorLostCandidates != nil { return "Coordinator Disconnected — Choose a New One…" }
+        if model.speakerLostCandidates != nil { return "Room Speaker Disconnected — Choose Another…" }
+        return nil
     }
 }

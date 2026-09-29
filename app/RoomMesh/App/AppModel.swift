@@ -37,9 +37,15 @@ final class AppModel {
 
     var room: FfiRoomState?
     var nearby: [FfiNearbyPeer] = []
-    var incomingInvite: PendingInvite?
-    var coordinatorLostCandidates: [String]?
-    var speakerLostCandidates: [String]?
+    var incomingInvite: PendingInvite? { didSet { updateWindowFloating() } }
+    var coordinatorLostCandidates: [String]? { didSet { updateWindowFloating() } }
+    var speakerLostCandidates: [String]? { didSet { updateWindowFloating() } }
+    /// Whether macOS will show RoomMesh's banners; `nil` until Notification Center's settings are
+    /// read. When not `true`, invites and prompts use the in-app fallback (see `AttentionPlan`).
+    /// Set from `Notifications.onStatusChange` (and directly by tests).
+    var notificationsAllowed: Bool? { didSet { updateWindowFloating() } }
+    /// Human-readable notification status for Settings › General.
+    var notificationStatus: String?
     var showInviteSheet = false
     var lastError: String?
     /// Transient, non-error status line (auto-clears); see `showNotice`.
@@ -62,7 +68,8 @@ final class AppModel {
     @ObservationIgnored var notifyInvite: (String, String) -> Void = { Notifications.shared.inviteReceived(roomName: $0, from: $1) }
     /// Removes the delivered invite notification once the invite is answered.
     @ObservationIgnored var inviteAnswered: () -> Void = { Notifications.shared.inviteAnswered() }
-    /// True when the invite sheet will be on screen anyway (app active, main window up): no banner then.
+    /// True when the invite sheet will be on screen anyway (app active, main window up): no banner
+    /// (or fallback sound) then. Also used for the coordinator/speaker prompts.
     @ObservationIgnored var inviteUIVisible: () -> Bool = { NSApp.isActive && MainWindowController.shared.isVisible }
     /// Blocking privileged driver work, run off the main thread. Returns false if the user cancelled.
     @ObservationIgnored var driverWork: @Sendable (DriverOperation) throws -> Bool = { try DriverInstaller.perform($0) }
@@ -75,6 +82,11 @@ final class AppModel {
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
+    /// The fallback's short sound when notifications are off.
+    @ObservationIgnored var playAttentionSound: () -> Void = { NSSound(named: "Glass")?.play() }
+    /// Floats the main window above other apps while a prompt waits and notifications are off.
+    @ObservationIgnored var setWindowFloating: (Bool) -> Void = { MainWindowController.shared.setFloating($0) }
+    @ObservationIgnored private var windowFloating = false
     @ObservationIgnored var devicesPresent: () -> Bool = { VirtualDeviceStatus.installed }
     @ObservationIgnored private var transport: AppleP2PTransport?
     @ObservationIgnored private var sink: CoreSink?
@@ -146,6 +158,12 @@ final class AppModel {
     var useMyMic: Bool { localMember?.micEnabled ?? true }
     var defaultRoomName: String { "\(Host.current().localizedName ?? "Mac")'s Room" }
     var invitableNearby: [FfiNearbyPeer] { nearby.filter { !$0.inMyRoom } }
+    /// An invite or failure prompt is waiting for an answer.
+    var hasAttentionPrompt: Bool { incomingInvite != nil || coordinatorLostCandidates != nil || speakerLostCandidates != nil }
+    /// A dot on the menu-bar icon until the prompt is answered — only when banners can't do the job.
+    var showsAttentionBadge: Bool { notificationsAllowed != true && hasAttentionPrompt }
+    /// Only once the settings were actually read, so the banner doesn't flash at launch.
+    var showsNotificationsOffBanner: Bool { notificationsAllowed == false }
 
     var health: RoomHealth {
         let ids = Set(room?.members.filter(\.online).map(\.id) ?? [])
@@ -192,6 +210,24 @@ final class AppModel {
         case .speakerLost: speakerLostCandidates = nil
         case .invite: showInviteSheet = false
         }
+    }
+
+    // MARK: attention
+    /// Notifies (or falls back to a sound) and brings the window to the front for a new prompt.
+    private func getAttention(_ kind: AttentionKind, invite: (roomName: String, from: String)? = nil) {
+        let plan = AttentionPlan.make(for: kind, notificationsAllowed: notificationsAllowed, uiVisible: inviteUIVisible())
+        if plan.postNotification, let invite { notifyInvite(invite.roomName, invite.from) }
+        if plan.playSound { playAttentionSound() }
+        if plan.bringToFront { presentWindow() }
+    }
+
+    /// Keeps the main window floating exactly while `showsAttentionBadge` holds (prompt waiting,
+    /// banners unavailable); the controller restores the window's own level afterwards.
+    private func updateWindowFloating() {
+        let want = showsAttentionBadge
+        guard want != windowFloating else { return }
+        windowFloating = want
+        setWindowFloating(want)
     }
 
     // MARK: actions
@@ -330,11 +366,10 @@ final class AppModel {
             // so its sender isn't left waiting. (Its notification is replaced by the new one's.)
             if let old = incomingInvite, old.id != roomId { run { try $0.respondToInvite(roomId: old.id, accept: false) } }
             incomingInvite = PendingInvite(id: roomId, roomName: roomName, fromPeer: fromPeer, fromName: fromName, sas: sas)
-            if !inviteUIVisible() { notifyInvite(roomName, fromName) }
-            presentWindow()
+            getAttention(.invite, invite: (roomName, fromName))
         case .inviteDeclined(let peerId): lastError = "\(name(of: peerId) ?? "The other Mac") declined the invitation."
-        case .coordinatorLost(let c): coordinatorLostCandidates = c; presentWindow()
-        case .speakerLost(let c): speakerLostCandidates = c; presentWindow()
+        case .coordinatorLost(let c): coordinatorLostCandidates = c; getAttention(.coordinatorLost)
+        case .speakerLost(let c): speakerLostCandidates = c; getAttention(.speakerLost)
         case .coordinatorChanged: coordinatorLostCandidates = nil
         case .speakerChanged(let p): if p != nil { speakerLostCandidates = nil }
         case .connectionQualityChanged(let p, let q): qualities[p] = q

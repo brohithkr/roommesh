@@ -15,7 +15,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Notifications.shared.onOpen = {
                 DispatchQueue.main.async { MainActor.assumeIsolated { MainWindowController.shared.show() } }
             }
+            Notifications.shared.onStatusChange = { status in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        let model = AppModel.shared
+                        if model.notificationsAllowed != status.allowed { model.notificationsAllowed = status.allowed }
+                        if model.notificationStatus != status.label { model.notificationStatus = status.label }
+                    }
+                }
+            }
             Notifications.shared.setUp()
+            // The user may change it in System Settings at any time: re-read it whenever we're back.
+            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+                Notifications.shared.refreshStatus()
+            }
             model.bootstrap(driverInstalled: VirtualDeviceStatus.installed)
             model.refreshStatus()
             if Permissions.microphone == .undetermined { Task { _ = await Permissions.requestMicrophone() } }

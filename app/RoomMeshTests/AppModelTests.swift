@@ -20,6 +20,8 @@ final class AppModelTests: XCTestCase {
         model.notifyInvite = { _, _ in }
         model.inviteAnswered = {}
         model.inviteUIVisible = { false }
+        model.playAttentionSound = {}
+        model.setWindowFloating = { _ in }
         model.driverWork = { _ in XCTFail("driver work must be stubbed per test"); return false }
         model.confirmAudioRestart = { XCTFail("unexpected confirmation"); return false }
         model.attach(core: core)
