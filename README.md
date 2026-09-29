@@ -154,8 +154,7 @@ with these steps:
 3. **License**: currently a placeholder (see below).
 4. **Destination Select**: the package installs only on the startup disk, so Installer usually
    goes straight through this step.
-5. **Installation Type**: a standard install of both components. **Customize** shows two
-   checkboxes:
+5. **Installation Type**: two checkboxes, shown straight away:
    - **RoomMesh App** (`io.github.brohithkr.RoomMesh.app.pkg`: `RoomMesh.app` in `/Applications`). This is
      always installed, so its checkbox is disabled.
    - **RoomMesh Audio Driver** (`io.github.brohithkr.RoomMesh.driver.pkg`: `RoomMesh.driver` in

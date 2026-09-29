@@ -11,7 +11,7 @@
     <license file="license.html" mime-type="text/html"/>
     <conclusion file="conclusion.html" mime-type="text/html"/>
 
-    <options customize="allow" require-scripts="false" rootVolumeOnly="true" hostArchitectures="@HOST_ARCHITECTURES@"/>
+    <options customize="always" require-scripts="false" rootVolumeOnly="true" hostArchitectures="@HOST_ARCHITECTURES@"/>
     <domains enable_localSystem="true"/>
 
     <!-- Minimum macOS (<os-version min="@MIN_OS@"/>), checked by script so it can say why. -->
