@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  XCODE_VERSION: "16" # latest stable 16.x; keep in step with release.yml
+  XCODE_VERSION: "latest-stable" # newest Xcode on the runner image; keep in step with release.yml
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
   CARGO_INCREMENTAL: "0"

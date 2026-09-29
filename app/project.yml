@@ -18,6 +18,10 @@ targets:
     platform: macOS
     sources:
       - path: RoomMesh
+      - path: ../LICENSE
+        buildPhase: resources
+      - path: ../THIRD_PARTY_NOTICES.md
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.brohithkr.RoomMesh

@@ -40,7 +40,7 @@ concurrency:
 
 env:
   # Latest stable Xcode 16.x on the image (a partial version excludes betas and Xcode 26).
-  XCODE_VERSION: "16"
+  XCODE_VERSION: "latest-stable"
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
   CARGO_INCREMENTAL: "0"

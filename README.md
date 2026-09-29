@@ -209,7 +209,7 @@ with these steps:
 2. **Read Me**: requirements (macOS 14.2 or later, Apple silicon unless built with `UNIVERSAL=1`),
    what the audio driver does, and the steps after installing (grant Microphone and Local Network
    access; select RoomMesh Microphone and RoomMesh Speaker in the meeting app on every Mac).
-3. **License**: currently a placeholder (see below).
+3. **License**: the GPL-3.0 text and the third-party notices, which must be agreed to.
 4. **Destination Select**: the package installs only on the startup disk, so Installer usually
    goes straight through this step.
 5. **Installation Type**: two checkboxes, shown straight away:
@@ -228,8 +228,8 @@ build (the default) also declares `hostArchitectures="arm64"`, so Installer refu
 Mac. Both components are non-relocatable, so they always install to the paths above, even if
 another copy of the app exists elsewhere on the disk.
 
-**Before distributing:** `installer/resources/license.html` is a placeholder. Replace it with the
-real license text.
+The License page is built from `LICENSE` and `THIRD_PARTY_NOTICES.md` at packaging time, and
+both files are also bundled inside `RoomMesh.app/Contents/Resources`.
 
 ### Signing
 

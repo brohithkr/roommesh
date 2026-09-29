@@ -125,11 +125,20 @@ subst() {
     -e "s|@ARCH_REQUIREMENT@|$ARCH_REQUIREMENT|g" \
     -e "s|@APP_PKG@|$APP_PKG_NAME|g" -e "s|@DRIVER_PKG@|$DRIVER_PKG_NAME|g" "$1"
 }
+# license.html carries the full GPL text and the third-party notices (HTML-escaped).
+embed_notices() {
+  LICENSE_FILE="$ROOT/LICENSE" NOTICES_FILE="$ROOT/THIRD_PARTY_NOTICES.md" /usr/bin/python3 -c '
+import html, os, sys
+page = sys.stdin.read()
+for marker, path in (("@LICENSE_TEXT@", os.environ["LICENSE_FILE"]), ("@THIRD_PARTY_NOTICES@", os.environ["NOTICES_FILE"])):
+    page = page.replace(marker, html.escape(open(path, encoding="utf-8").read()))
+sys.stdout.write(page)'
+}
 RESOURCES="$WORK/resources"
 mkdir -p "$RESOURCES"
 for f in "$INSTALLER"/resources/*; do
   case "$f" in
-    *.html) subst "$f" >"$RESOURCES/$(basename "$f")" ;;
+    *.html) subst "$f" | embed_notices >"$RESOURCES/$(basename "$f")" ;;
     *) ditto "$f" "$RESOURCES/$(basename "$f")" ;;
   esac
 done
