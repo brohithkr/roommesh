@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 /// keys and SAS derived from a transcript hash of both Hellos.
 pub const PROTOCOL_VERSION: u16 = 3;
 
+/// The furthest a manifest may move the epoch forward in one step. Legitimate jumps are a few
+/// epochs at most (one per coordinator change, including both sides of a healed split brain);
+/// the cap stops a member from pushing the room's epoch to `u32::MAX` (where `Epoch::next`
+/// saturates and coordinator changes stop being orderable) in one message.
+pub const MAX_EPOCH_JUMP: u32 = 1_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Capabilities {
     pub can_coordinate: bool,
@@ -108,6 +114,8 @@ pub enum RejectReason {
     NotCoordinator,
     NotMember,
     LostTieBreak,
+    /// The epoch moves forward by more than [`MAX_EPOCH_JUMP`].
+    EpochJump,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +141,9 @@ pub fn evaluate_manifest(
         return Reject(StaleEpoch);
     }
     if incoming.epoch > cur.epoch {
+        if incoming.epoch.0 - cur.epoch.0 > MAX_EPOCH_JUMP {
+            return Reject(EpochJump);
+        }
         return if cur.is_member(sender) {
             Accept
         } else {
@@ -237,6 +248,29 @@ mod tests {
         assert_eq!(
             evaluate_manifest(Some(&cur), &next, PeerId(99)),
             Acceptance::Reject(RejectReason::NotMember)
+        );
+    }
+    #[test]
+    fn epoch_jumps_beyond_the_cap_are_rejected() {
+        let mut cur = room();
+        cur.upsert_member(member(4));
+        cur.epoch = Epoch(10);
+        let mut next = cur.clone();
+        next.coordinator = PeerId(4);
+        next.epoch = Epoch(10 + MAX_EPOCH_JUMP);
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(4)),
+            Acceptance::Accept
+        );
+        next.epoch = Epoch(11 + MAX_EPOCH_JUMP);
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(4)),
+            Acceptance::Reject(RejectReason::EpochJump)
+        );
+        next.epoch = Epoch(u32::MAX);
+        assert_eq!(
+            evaluate_manifest(Some(&cur), &next, PeerId(4)),
+            Acceptance::Reject(RejectReason::EpochJump)
         );
     }
     #[test]

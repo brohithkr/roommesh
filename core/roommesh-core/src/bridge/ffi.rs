@@ -21,6 +21,10 @@ pub enum FfiError {
     NoSuchInvite,
     #[error("That Mac is not a member of the room")]
     NotMember,
+    /// The change speaks for another Mac (for example its microphone), which only that Mac may
+    /// make.
+    #[error("Only that Mac can change this")]
+    NotPermitted,
     #[error("Invalid peer id")]
     InvalidPeerId,
     /// The command was not applied (the core was busy, or it was called from inside an event
@@ -39,6 +43,7 @@ impl From<RoomError> for FfiError {
             RoomError::NotInRoom => Self::NotInRoom,
             RoomError::NoSuchInvite => Self::NoSuchInvite,
             RoomError::NotMember => Self::NotMember,
+            RoomError::NotPermitted => Self::NotPermitted,
             RoomError::Timeout => Self::Timeout,
             RoomError::Internal => Self::Internal,
         }
@@ -698,6 +703,10 @@ mod tests {
         assert!(matches!(
             FfiError::from(RoomError::NotMember),
             FfiError::NotMember
+        ));
+        assert!(matches!(
+            FfiError::from(RoomError::NotPermitted),
+            FfiError::NotPermitted
         ));
         assert!(matches!(
             FfiError::from(RoomError::Timeout),

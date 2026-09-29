@@ -13,6 +13,23 @@
 //! room alive, so a peer that was offline or asleep doesn't come back as a phantom coordinator.
 //! Trade-off: when a room splits into a minority and a majority, the minority waits for a
 //! manual pick.
+//!
+//! Joining needs an invitation. The member that sends an `Invite` remembers the invitee for
+//! [`INVITE_TTL_MS`], and the invitee sends its `JoinRequest` back to that member. The
+//! coordinator admits a direct `JoinRequest` only from a peer it invited itself (or from a
+//! current member re-joining); any other member relays the request to the coordinator only for
+//! a peer it invited, and the coordinator admits requests relayed by members. The invitation
+//! list is local to the inviter rather than replicated in the manifest: the inviter is the one
+//! that vouches, it is reachable by the invitee (it just talked to it), and the manifest would
+//! need a shared clock for the expiry. An invitation is used up once the invitee is a member,
+//! and a member that leaves or is removed is denied until it is invited again. Knowing the
+//! `RoomId` alone therefore gets nobody in.
+//!
+//! Trust model: every member is trusted with the room's roles. Any member may invite, remove
+//! members, pick the coordinator or the speaker, and rename the room. Changes that speak for a
+//! particular member (its name and capabilities, and whether its mic is used) are accepted only
+//! from that member itself, and only directly (a relayed one would be indistinguishable from a
+//! forged one).
 use crate::ids::{PeerId, RoomId};
 use crate::room::election::{elect_coordinator, speaker_candidates};
 use crate::room::events::*;
@@ -21,6 +38,9 @@ use crate::room::state::{
     evaluate_manifest, is_valid_coordinator_command, Acceptance, MemberInfo, RoomManifest,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// How long an invitation lets its invitee join.
+pub const INVITE_TTL_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 pub struct RoomConfig {
@@ -69,6 +89,10 @@ pub enum RoomError {
     NoSuchInvite,
     #[error("peer is not a room member")]
     NotMember,
+    /// The change speaks for another member (for example switching its mic), which only that
+    /// member may do.
+    #[error("only that member may make this change")]
+    NotPermitted,
     /// The core's control thread did not take the command in time (busy, or called
     /// re-entrantly from an event callback). The command was not applied.
     #[error("timed out")]
@@ -91,8 +115,8 @@ struct Nearby {
     connected: bool,
     sas: Option<String>,
 }
+/// An invitation we received: the member that sent it (our join request goes back to it).
 struct PendingInvite {
-    manifest: RoomManifest,
     from: PeerId,
 }
 
@@ -108,6 +132,37 @@ fn message_room(msg: &ControlMessage) -> Option<RoomId> {
         | ControlMessage::Heartbeat { room_id, .. }
         | ControlMessage::ActiveMic { room_id, .. } => Some(*room_id),
         ControlMessage::PeerReport(_) => None,
+    }
+}
+
+/// A change that speaks for one particular member: accepted only from that member.
+fn speaks_for_a_member(change: &ChangeRequest) -> bool {
+    matches!(
+        change,
+        ChangeRequest::UpdateMember(_) | ChangeRequest::SetMicEnabled { .. }
+    )
+}
+
+/// Whether member `from` may make `change` (see the trust model in the module docs).
+fn permitted(change: &ChangeRequest, from: PeerId) -> bool {
+    match change {
+        ChangeRequest::UpdateMember(info) => info.id == from,
+        ChangeRequest::SetMicEnabled { peer, .. } => *peer == from,
+        ChangeRequest::SetCoordinator(_)
+        | ChangeRequest::SetSpeaker(_)
+        | ChangeRequest::RemoveMember(_)
+        | ChangeRequest::Rename(_) => true,
+    }
+}
+
+/// What the coordinator tells a peer that is not (or no longer) a member: the room's version
+/// and coordinator, so the peer accepts it and sees it's out, but no names or member list.
+fn removal_notice(m: &RoomManifest) -> RoomManifest {
+    RoomManifest {
+        name: String::new(),
+        members: vec![],
+        speaker: None,
+        ..m.clone()
     }
 }
 
@@ -133,6 +188,10 @@ pub struct RoomEngine {
     last_online: Vec<PeerId>,
     /// Peers a `Connect` was emitted for since the last `take_outputs` (dedupe).
     connects: HashSet<PeerId>,
+    /// Peers we invited to the current room, with when the invitation expires.
+    invited: HashMap<PeerId, u64>,
+    /// Peers that left or were removed from the current room: denied until invited again.
+    denied: HashSet<PeerId>,
     out: Vec<Output>,
 }
 
@@ -157,6 +216,8 @@ impl RoomEngine {
             last_roles: None,
             last_online: vec![],
             connects: HashSet::new(),
+            invited: HashMap::new(),
+            denied: HashSet::new(),
             out: vec![],
         }
     }
@@ -463,6 +524,8 @@ impl RoomEngine {
             Command::Invite(peer) => {
                 let m = self.manifest.clone().ok_or(RoomError::NotInRoom)?;
                 if !m.is_member(peer) {
+                    self.invited.insert(peer, now + INVITE_TTL_MS);
+                    self.denied.remove(&peer);
                     self.send(
                         peer,
                         ControlMessage::Invite {
@@ -490,8 +553,10 @@ impl RoomEngine {
                         self.leave(now);
                     }
                     self.joining = Some((room_id, now));
+                    // Back to the inviter: it vouches for us (directly if it coordinates,
+                    // otherwise by relaying to the coordinator).
                     self.send(
-                        inv.manifest.coordinator,
+                        inv.from,
                         ControlMessage::JoinRequest {
                             room_id,
                             member: self.cfg.local.clone(),
@@ -529,20 +594,30 @@ impl RoomEngine {
         if target.is_some_and(|p| !m.is_member(p)) {
             return Err(RoomError::NotMember);
         }
-        if m.coordinator == self.local() {
-            self.apply_change(now, change);
+        let local = self.local();
+        if !permitted(&change, local) {
+            return Err(RoomError::NotPermitted);
+        }
+        if m.coordinator == local {
+            self.apply_change(now, local, change);
         } else {
             match change {
                 ChangeRequest::SetCoordinator(p) if self.coordinator_lost(now, &m) => {
                     self.propose_coordinator(now, p)
                 }
                 other => {
+                    let direct = speaks_for_a_member(&other);
                     let msg = ControlMessage::Request {
                         room_id: m.room_id,
                         epoch: m.epoch,
                         change: other,
                     };
-                    self.send_to_coordinator(now, &m, msg)
+                    if direct {
+                        // Only accepted straight from us (see `permitted`): no relaying.
+                        self.send(m.coordinator, msg)
+                    } else {
+                        self.send_to_coordinator(now, &m, msg)
+                    }
                 }
             }
         }
@@ -563,7 +638,7 @@ impl RoomEngine {
             return;
         }
         if m.coordinator == info.id {
-            self.apply_change(now, ChangeRequest::UpdateMember(info));
+            self.apply_change(now, info.id, ChangeRequest::UpdateMember(info));
             return;
         }
         let msg = ControlMessage::Request {
@@ -571,10 +646,11 @@ impl RoomEngine {
             epoch: m.epoch,
             change: ChangeRequest::UpdateMember(info),
         };
+        // Straight to the coordinator: it accepts our info only from us, never relayed.
         if queue {
-            self.send_to_coordinator(now, &m, msg);
-        } else if let Some(to) = self.coordinator_route(now, &m) {
-            self.send_if_connected(to, msg);
+            self.send(m.coordinator, msg);
+        } else {
+            self.send_if_connected(m.coordinator, msg);
         }
     }
 
@@ -588,11 +664,14 @@ impl RoomEngine {
         }
     }
 
-    /// Coordinator only.
-    fn apply_change(&mut self, now: u64, change: ChangeRequest) {
+    /// Coordinator only. `from` is the member the change comes from (us, for local commands).
+    fn apply_change(&mut self, now: u64, from: PeerId, change: ChangeRequest) {
         let Some(mut m) = self.manifest.clone() else {
             return;
         };
+        if !m.is_member(from) || !permitted(&change, from) {
+            return;
+        }
         let mut removed = None;
         match change {
             ChangeRequest::SetCoordinator(p) => {
@@ -642,7 +721,7 @@ impl RoomEngine {
         }
         self.publish(now, m.clone());
         if let Some(p) = removed {
-            self.send(p, ControlMessage::Manifest(m));
+            self.send(p, ControlMessage::Manifest(removal_notice(&m)));
         }
     }
 
@@ -691,9 +770,19 @@ impl RoomEngine {
         }
         self.manifest = None;
         self.reset_room_flags();
+        self.reset_invitations();
         self.event(RoomEvent::LeftRoom);
         self.emit_room();
         self.emit_roles();
+    }
+
+    fn reset_invitations(&mut self) {
+        self.invited.clear();
+        self.denied.clear();
+    }
+
+    fn invitation_valid(&self, now: u64, p: PeerId) -> bool {
+        self.invited.get(&p).is_some_and(|&until| now < until)
     }
 
     fn reset_room_flags(&mut self) {
@@ -711,11 +800,13 @@ impl RoomEngine {
         if let Some(o) = old.as_ref().filter(|o| o.room_id != new.room_id) {
             let rid = o.room_id;
             self.drop_queued_for_room(rid);
+            self.reset_invitations();
         }
         let old = old.filter(|o| o.room_id == new.room_id);
         if !new.is_member(local) {
             self.drop_queued_for_room(new.room_id);
             self.reset_room_flags();
+            self.reset_invitations();
             self.event(RoomEvent::LeftRoom);
             self.emit_room();
             self.emit_roles();
@@ -778,6 +869,16 @@ impl RoomEngine {
         if old.as_ref().map(|o| o.speaker) != Some(new.speaker) {
             self.speaker_lost_prompted = false;
         }
+        // Invitations are used up by joining; a member that left or was removed needs a new one.
+        for id in new.member_ids() {
+            self.invited.remove(&id);
+        }
+        if let Some(o) = &old {
+            for id in o.member_ids().into_iter().filter(|&id| !new.is_member(id)) {
+                self.invited.remove(&id);
+                self.denied.insert(id);
+            }
+        }
         for id in new.member_ids() {
             if id == local {
                 continue;
@@ -815,8 +916,7 @@ impl RoomEngine {
                 }
                 let sas = self.sas(from).unwrap_or_default();
                 let (room_id, room_name) = (manifest.room_id, manifest.name.clone());
-                self.invites_in
-                    .insert(room_id, PendingInvite { manifest, from });
+                self.invites_in.insert(room_id, PendingInvite { from });
                 self.event(RoomEvent::InviteReceived {
                     room_id,
                     room_name,
@@ -843,6 +943,18 @@ impl RoomEngine {
                     return;
                 }
                 if m.coordinator == local {
+                    // Admitted: a member re-joining, a request relayed by a member (who
+                    // vouches: it only relays for peers it invited), or one we invited and that
+                    // hasn't been denied since.
+                    let admitted = m.is_member(member.id)
+                        || relayed
+                        || (self.invitation_valid(now, member.id)
+                            && !self.denied.contains(&member.id));
+                    if !admitted {
+                        log::info!("ignoring a join request from uninvited {}", member.id);
+                        return;
+                    }
+                    self.denied.remove(&member.id);
                     let mut next = m;
                     let mut member = member;
                     // A member re-joining keeps the room's mic setting for it.
@@ -852,9 +964,12 @@ impl RoomEngine {
                     next.upsert_member(member);
                     next.revision += 1;
                     self.publish(now, next);
-                } else if m.coordinator != from {
+                } else if m.coordinator != from
+                    && (relayed || self.invitation_valid(now, member.id))
+                {
                     // One relay hop at most: the originator may pick a relayer, but a relayer
-                    // sends straight to the coordinator (queued if there's no session).
+                    // sends straight to the coordinator (queued if there's no session). We
+                    // relay a joiner's own request only if we invited it.
                     self.send(
                         m.coordinator,
                         ControlMessage::JoinRequest { room_id, member },
@@ -876,7 +991,7 @@ impl RoomEngine {
                 if cur.coordinator == local {
                     // A request made under an older coordinator term is stale.
                     if epoch >= cur.epoch {
-                        self.apply_change(now, change);
+                        self.apply_change(now, from, change);
                     }
                 } else if cur.coordinator != from {
                     // Relay unchanged (keeping the requester's epoch), never back to its sender,
@@ -917,9 +1032,10 @@ impl RoomEngine {
                     return self.reply_not_in_room(from, room_id);
                 };
                 if !cur.is_member(from) {
-                    // e.g. a removed peer that missed its removal: show it the manifest.
+                    // e.g. a removed peer that missed its removal: tell it it's out, without
+                    // showing a non-member the room's member list.
                     if cur.coordinator == local {
-                        self.send(from, ControlMessage::Manifest(cur));
+                        self.send(from, ControlMessage::Manifest(removal_notice(&cur)));
                     }
                     return;
                 }
@@ -1042,6 +1158,7 @@ impl RoomEngine {
     // ---------- timers ----------
     pub fn tick(&mut self, now: u64) {
         self.now = now;
+        self.invited.retain(|_, until| now < *until);
         if let Some((rid, since)) = self.joining {
             if now.saturating_sub(since) > self.cfg.join_timeout_ms {
                 self.joining = None;
@@ -1154,7 +1271,7 @@ impl RoomEngine {
         match m.speaker {
             Some(s) if !self.is_alive(now, s) => {
                 if m.coordinator == local && self.cfg.fallback_speaker_to_coordinator {
-                    self.apply_change(now, ChangeRequest::SetSpeaker(Some(local)));
+                    self.apply_change(now, local, ChangeRequest::SetSpeaker(Some(local)));
                 } else if !self.speaker_lost_prompted {
                     self.speaker_lost_prompted = true;
                     let candidates = speaker_candidates(&m, |p| self.is_alive(now, p));
@@ -1824,7 +1941,7 @@ mod tests {
     fn set_local_info_propagates_through_coordinator() {
         let mut n = room(&[1, 2, 3]);
         n.cmd(
-            1,
+            3,
             Command::SetMicEnabled {
                 peer: PeerId(3),
                 enabled: false,
@@ -2136,11 +2253,263 @@ mod tests {
         assert_eq!(e1.manifest(), Some(&cur));
     }
 
+    // ---------- join authorization and member permissions ----------
+
+    /// The coordinator engine of `n` (peer 1), with its outputs drained.
+    fn coordinator(n: &mut Net) -> &mut RoomEngine {
+        let e = n.engines.get_mut(&PeerId(1)).unwrap();
+        e.take_outputs();
+        e
+    }
+    fn join_request(id: u64, room_id: RoomId) -> ControlMessage {
+        ControlMessage::JoinRequest {
+            room_id,
+            member: MemberInfo {
+                id: PeerId(id),
+                name: format!("Mac {id}"),
+                mic_enabled: true,
+                capabilities: Capabilities::full(),
+            },
+        }
+    }
+    fn published(outs: &[Output]) -> bool {
+        outs.iter().any(|o| {
+            matches!(
+                o,
+                Output::Send {
+                    msg: ControlMessage::Manifest(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    #[test]
+    fn join_request_from_an_uninvited_peer_is_ignored() {
+        // Knowing the RoomId is not enough to get in.
+        let mut n = room(&[1, 2]);
+        let cur = n.converged(&[1, 2]);
+        let now = n.now;
+        let e1 = coordinator(&mut n);
+        e1.on_session_up(now, PeerId(7), "Mallory".into(), "000 000".into());
+        e1.on_message(now, PeerId(7), join_request(7, cur.room_id));
+        assert_eq!(e1.manifest(), Some(&cur));
+        assert!(!published(&e1.take_outputs()));
+    }
+
+    #[test]
+    fn invitation_expires_after_ten_minutes() {
+        let mut n = Net::new(&[1, 2]);
+        n.cmd(1, Command::CreateRoom { name: "R".into() });
+        n.cmd(1, Command::Invite(PeerId(2)));
+        let room_id = n.invite_for(2);
+        let invited_at = n.now;
+        let e1 = coordinator(&mut n);
+        e1.on_message(
+            invited_at + INVITE_TTL_MS,
+            PeerId(2),
+            join_request(2, room_id),
+        );
+        assert!(!e1.manifest().unwrap().is_member(PeerId(2)), "expired");
+        e1.command(invited_at + INVITE_TTL_MS, Command::Invite(PeerId(2)))
+            .unwrap();
+        e1.on_message(
+            invited_at + INVITE_TTL_MS + 1,
+            PeerId(2),
+            join_request(2, room_id),
+        );
+        assert!(e1.manifest().unwrap().is_member(PeerId(2)), "re-invited");
+    }
+
+    #[test]
+    fn removed_member_cannot_rejoin_until_invited_again() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(2, Command::RemoveMember(PeerId(3)));
+        let cur = n.converged(&[1, 2]);
+        assert!(!cur.is_member(PeerId(3)));
+        let now = n.now;
+        // Neither directly at the coordinator nor relayed by a member that once invited it.
+        for via in [1, 2] {
+            let e = n.engines.get_mut(&PeerId(via)).unwrap();
+            e.on_message(now, PeerId(3), join_request(3, cur.room_id));
+            n.pump();
+        }
+        assert!(!n.manifest(1).unwrap().is_member(PeerId(3)));
+        assert_eq!(n.converged(&[1, 2]), cur);
+        // A fresh invitation lifts it.
+        n.cmd(1, Command::Invite(PeerId(3)));
+        let room_id = n.invite_for(3);
+        n.cmd(
+            3,
+            Command::RespondToInvite {
+                room_id,
+                accept: true,
+            },
+        );
+        assert!(n.converged(&[1, 2, 3]).is_member(PeerId(3)));
+    }
+
+    #[test]
+    fn a_member_that_left_needs_a_new_invitation() {
+        let mut n = room(&[1, 2, 3]);
+        let room_id = n.converged(&[1, 2, 3]).room_id;
+        n.cmd(3, Command::Leave);
+        n.advance(200);
+        let now = n.now;
+        let e1 = coordinator(&mut n);
+        e1.on_message(now, PeerId(3), join_request(3, room_id));
+        assert!(!e1.manifest().unwrap().is_member(PeerId(3)));
+    }
+
+    #[test]
+    fn invitation_by_a_non_coordinator_is_relayed_by_the_inviter() {
+        let mut n = room(&[1, 2]);
+        n.engines.insert(
+            PeerId(3),
+            Net::new(&[3]).engines.remove(&PeerId(3)).unwrap(),
+        );
+        n.cmd(2, Command::Invite(PeerId(3)));
+        let room_id = n.invite_for(3);
+        n.cmd(
+            3,
+            Command::RespondToInvite {
+                room_id,
+                accept: true,
+            },
+        );
+        n.advance(300);
+        let m = n.converged(&[1, 2, 3]);
+        assert!(m.is_member(PeerId(3)));
+        assert_eq!(m.coordinator, PeerId(1));
+    }
+
+    #[test]
+    fn heartbeat_from_a_non_member_does_not_leak_the_manifest() {
+        let mut n = room(&[1, 2]);
+        let cur = n.converged(&[1, 2]);
+        let now = n.now;
+        let e1 = coordinator(&mut n);
+        e1.on_session_up(now, PeerId(7), "Mallory".into(), "000 000".into());
+        e1.take_outputs();
+        e1.on_message(
+            now,
+            PeerId(7),
+            ControlMessage::Heartbeat {
+                room_id: cur.room_id,
+                epoch: cur.epoch,
+                revision: 0,
+                manifest: None,
+                sees_coordinator: true,
+            },
+        );
+        for o in e1.take_outputs() {
+            if let Output::Send {
+                to,
+                msg: ControlMessage::Manifest(m),
+            } = o
+            {
+                assert_eq!(to, PeerId(7));
+                assert!(m.members.is_empty(), "no member list: {m:?}");
+                assert!(m.name.is_empty(), "no room name");
+            }
+        }
+    }
+
+    #[test]
+    fn members_may_only_update_their_own_info() {
+        let mut n = room(&[1, 2, 3]);
+        let cur = n.converged(&[1, 2, 3]);
+        let now = n.now;
+        let mut forged = cur.member(PeerId(3)).unwrap().clone();
+        forged.name = "Forged".into();
+        let e1 = coordinator(&mut n);
+        e1.on_message(
+            now,
+            PeerId(2),
+            ControlMessage::Request {
+                room_id: cur.room_id,
+                epoch: cur.epoch,
+                change: ChangeRequest::UpdateMember(forged),
+            },
+        );
+        assert_eq!(e1.manifest(), Some(&cur));
+    }
+
+    #[test]
+    fn members_may_only_switch_their_own_mic() {
+        let mut n = room(&[1, 2, 3]);
+        let cur = n.converged(&[1, 2, 3]);
+        let now = n.now;
+        let req = |peer| ControlMessage::Request {
+            room_id: cur.room_id,
+            epoch: cur.epoch,
+            change: ChangeRequest::SetMicEnabled {
+                peer: PeerId(peer),
+                enabled: false,
+            },
+        };
+        let e1 = coordinator(&mut n);
+        e1.on_message(now, PeerId(2), req(3));
+        assert_eq!(e1.manifest(), Some(&cur), "2 can't switch 3's mic");
+        e1.on_message(now, PeerId(2), req(2));
+        assert!(
+            !e1.manifest()
+                .unwrap()
+                .member(PeerId(2))
+                .unwrap()
+                .mic_enabled
+        );
+        // Locally, even the coordinator can't switch someone else's mic.
+        assert_eq!(
+            e1.command(
+                now,
+                Command::SetMicEnabled {
+                    peer: PeerId(3),
+                    enabled: false,
+                },
+            ),
+            Err(RoomError::NotPermitted)
+        );
+        assert!(
+            e1.manifest()
+                .unwrap()
+                .member(PeerId(3))
+                .unwrap()
+                .mic_enabled
+        );
+    }
+
+    #[test]
+    fn any_member_may_remove_members_or_pick_the_coordinator() {
+        // The trust model: every member may change roles and membership.
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(3, Command::RemoveMember(PeerId(2)));
+        assert_eq!(
+            n.converged(&[1, 3]).member_ids(),
+            vec![PeerId(1), PeerId(3)]
+        );
+        n.cmd(3, Command::SetCoordinator(PeerId(3)));
+        assert_eq!(n.converged(&[1, 3]).coordinator, PeerId(3));
+    }
+
+    #[test]
+    fn a_manifest_jumping_the_epoch_too_far_is_ignored() {
+        let mut n = room(&[1, 2, 3]);
+        let cur = n.converged(&[1, 2, 3]);
+        let mut forged = cur.clone();
+        forged.epoch = Epoch(u32::MAX);
+        forged.coordinator = PeerId(2);
+        let now = n.now;
+        let e3 = n.engines.get_mut(&PeerId(3)).unwrap();
+        e3.on_message(now, PeerId(2), ControlMessage::Manifest(forged));
+        assert_eq!(e3.manifest(), Some(&cur));
+    }
+
     #[test]
     fn member_rejoin_keeps_room_mic_setting() {
         let mut n = room(&[1, 2]);
         n.cmd(
-            1,
+            2,
             Command::SetMicEnabled {
                 peer: PeerId(2),
                 enabled: false,
