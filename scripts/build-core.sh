@@ -49,7 +49,7 @@ BINDGEN=(cargo run -q -p uniffi-bindgen --)
   --link-frameworks CoreAudio --link-frameworks AudioToolbox --link-frameworks CoreFoundation \
   "$DYLIB" "$MODDIR"
 sed -i '' 's/^}$/    link "c++"\n}/' "$MODDIR/module.modulemap"
-if ! grep -q 'link "c++"' "$MODDIR/module.modulemap"; then
+if ! grep -qx '[[:space:]]*link "c++"' "$MODDIR/module.modulemap"; then
   echo "error: failed to add 'link \"c++\"' to $MODDIR/module.modulemap" >&2
   exit 1
 fi
