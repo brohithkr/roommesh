@@ -140,6 +140,88 @@ the control protocol (version 5), so builds from before it can't connect to newe
 `cargo run -p roommesh-devtool -- noise-probe` from `core/` (in Terminal.app, with microphone
 permission).
 
+## Latency: Mic latency and Speaker delay
+
+Audio from another Mac crosses Wi-Fi, which usually takes a few milliseconds and sometimes much
+longer. Two settings in **Settings → Advanced** decide how long RoomMesh waits for it.
+
+- **Mic latency** (default 70 ms). The coordinator hands the meeting app a new 10 ms slice of
+  room audio every 10 ms, and it builds each slice from the room as it sounded *Mic latency*
+  ago. That gives the other Macs' mics that long to arrive. The coordinator's own mic is
+  instant; a mic on another Mac has to make it in time. Audio that arrives later than that
+  misses its slice, which has already gone to the meeting, so the slice goes out as silence.
+- **Speaker delay** (default 80 ms). Meeting audio is scheduled to play on the room-speaker Mac
+  *Speaker delay* in the future, giving it time to cross Wi-Fi. Because the coordinator knows
+  exactly when each sound will play, echo cancellation can remove it from every mic.
+
+| Setting | Covers | Too short | Longer |
+|---|---|---|---|
+| Mic latency | other Macs' mics reaching the coordinator | gaps in what remote people hear from the room | remote people hear the room slightly later |
+| Speaker delay | meeting audio reaching the room-speaker Mac | gaps in the room speaker | the room hears remote people slightly later |
+
+Meeting apps add 100–300 ms of their own, so an extra 50–100 ms here is hard to notice.
+Missing words are not.
+
+### Where the time goes (mic path, default settings)
+
+| Stage | Typical |
+|---|---|
+| Mic capture buffer | 5–10 ms |
+| Framing into 10 ms packets | 10 ms |
+| Opus encode + decode (codec delay) | 6.5 ms |
+| Wi-Fi between Macs | 1–5 ms, with spikes of 100–300 ms on the direct peer-to-peer link |
+| Coordinator processing (echo cancel, VAD, mix) | < 1 ms |
+| Driver read-behind before the meeting app reads it | 20–30 ms |
+
+The spikes are why the default leaves headroom. The direct Mac-to-Mac link (AWDL, the one
+AirDrop uses) pauses now and then while the Wi-Fi radio switches between it and your normal
+Wi-Fi network.
+
+## Troubleshooting
+
+**Short gaps (¼–½ s) when someone talks near a Mac that isn't the coordinator.** That Mac's
+audio is arriving too late.
+1. On the coordinator, open **Settings → Advanced** and watch that Mac's row while someone talks.
+   **Loss** above 0 %, **Jitter** well over 10 ms, or **Buffer** at or below 0 means late or lost
+   audio.
+2. Raise **Mic latency** on the coordinator to 120–150 ms.
+3. Put all the Macs on the **same Wi-Fi network**, ideally 5 GHz, or on Ethernet. The direct
+   peer-to-peer link works without a shared network but pauses more. **Settings → Network**
+   shows which link is in use.
+4. Keep Wi-Fi turned on even on Ethernet-only Macs; the peer-to-peer link needs the radio.
+
+**Gaps or crackle in the room speaker.** Raise **Speaker delay** on the coordinator, and check
+the room-speaker Mac's row in **Settings → Advanced**.
+
+**Meet won't unmute with RoomMesh Microphone selected** ("Could not start audio source"), while
+other microphones work. Quit and reopen the browser or meeting app. An app that was running
+while the driver was installed keeps a stale view of the RoomMesh devices.
+
+**Remote people hear an echo.** Give echo cancellation a few seconds after the call starts or
+after the room speaker changes (**Settings → Advanced** shows "AEC: converged"). Make sure every
+Mac's meeting app uses **RoomMesh Speaker**, not the built-in speakers: a Mac playing the meeting
+on its own speakers is an echo source RoomMesh can't cancel.
+
+**You hear your own voice from a laptop, slightly delayed.** That Mac's meeting app is set to
+its built-in speakers. Select **RoomMesh Speaker**.
+
+**Nothing comes out of the room speaker.** If everyone in the call is a RoomMesh Mac in the
+same room, that's expected: the room speaker only plays people outside the room. Test with
+someone joining from a phone.
+
+**The active mic switches while nobody is talking.** Background noise is being heard as speech.
+Set a baseline in **Settings → Audio → Background noise** (see above), or use **Measure room
+noise** while the room is quiet.
+
+**No invite notification appears.** Invites still bring the RoomMesh window to the front with a
+sound and a dot on the menu-bar icon. To get banners, allow notifications for RoomMesh in System
+Settings → Notifications. Unsigned builds may not be allowed to register at all; signed releases
+can.
+
+**Two Macs can't see or join each other.** Both need the same RoomMesh version (the network
+protocol changes between some releases), Wi-Fi turned on, and Local Network access allowed for
+RoomMesh in System Settings → Privacy & Security.
+
 ## Verifying the audio path (roommesh-devtool)
 
 Run these from `core/`:
