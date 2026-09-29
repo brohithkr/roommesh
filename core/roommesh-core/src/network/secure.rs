@@ -38,7 +38,9 @@
 //! before it sees `hello_hi`, and has to fix its key toward `lo` (step 2) before `lo` reveals
 //! `hello_lo`. On each leg one side's contribution is random and unseen when the attacker
 //! commits, so the two legs' SAS match only by chance (1 in 10^6 per attempt). It cannot search
-//! offline for a matching pair.
+//! offline for a matching pair. As initiator it does learn each attempt's code before revealing,
+//! though, and can abandon attempts until one matches, so the responder limits attempts: one per
+//! connection, rate-limited per peer id and globally (`network::control::ResponderLimiter`).
 //!
 //! Control frames use an implicit per-direction counter nonce (TCP is ordered). Realtime packets
 //! use nonce = kind | epoch | stream | sequence and the 44-byte header as AAD, so reordering and

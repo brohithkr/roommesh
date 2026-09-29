@@ -46,13 +46,32 @@ and UDP, no TLS). All confidentiality and integrity come from the Rust core
 - **SAS.** 8 bytes expanded from the same HKDF with the label `roommesh v3 sas`, reduced to a
   6-digit code (`"482 913"`). The code is shown next to an invitation (`InviteReceived.sas`) and
   in the nearby list, for the two users to compare out of band.
-- **Why a man in the middle can't grind the SAS.** A MITM has to commit to its key toward the
-  responder before it sees the responder's Hello. It also has to send its reply to the
-  initiator before the initiator reveals its Hello. So on each leg, one side's key is random and
-  still unseen when the attacker makes its choice, and each leg's code is uniformly random to
-  the attacker. The two codes match with probability 10^-6 per attempt, and it can't search
-  offline for a match. Each further try costs a full new connection, and the displayed code
-  changes every time.
+- **How far a man in the middle can search for a matching SAS.** On the leg where the attacker
+  is the responder, it has to send its key before the initiator reveals its Hello, so it can't
+  influence that leg's code. It completes that leg and learns its code, `S_A`. On the leg where
+  it is the initiator, it has committed, then sees the responder's key, and can compute that
+  leg's code before deciding to reveal. So it can walk away from every attempt whose code isn't
+  `S_A` and try again. Each attempt matches with probability 10^-6, so the question is how many
+  attempts it gets. The responder bounds that (`ResponderLimiter` in `control.rs`):
+  - **One attempt per transport connection.** A second, different COMMIT on a connection that
+    already had its responder handshake, or a reveal that doesn't match its commitment, drops
+    the connection (`HandshakeRestart` / `CommitMismatch`). Identical retransmits are still
+    answered identically.
+  - **Per claimed peer id:** at most one new responder handshake every 2 s. After each
+    abandoned attempt (committed but never revealed, or a bad reveal), the wait doubles, up to
+    60 s. A completed handshake resets it.
+  - **Globally:** at most 20 new responder handshakes a minute across all ids, because the
+    preamble is unauthenticated and ids can be rotated. A refused COMMIT drops the connection.
+    The redial, at most every 2 s, is a new attempt.
+
+  At the global limit that is at most 1,200 attempts an hour: about a 0.1% chance of a match per
+  hour of sustained attack, and about 35 days for an even chance. With one fixed id (the one the
+  victim expects), the 60 s backoff gives about 1.9 years. After 3 abandoned attempts in a row
+  from one id, and whenever the global limit is hit (at most every 10 min), the user sees
+  "Repeated failed secure connections from <name> — possible interference". Honest paths aren't
+  slowed: a first connection, the simultaneous-dial collapse (an identical, resent COMMIT) and
+  a peer restart more than 2 s after the previous handshake are answered at once. A restart
+  within 2 s is refused once and completes on the redial.
 - **Retransmits and re-keys.** The responder answers a repeated copy of the Commit it is
   answering with the identical Hello. Once a session is up, it silently ignores a Commit or
   reveal of the handshake that produced that session. Duplicates are recognised by the
@@ -145,8 +164,9 @@ and inject traffic, advertise Bonjour services, and open connections under any P
 Mitigated:
 
 - eavesdropping, tampering and replay of sealed traffic;
-- man-in-the-middle on a handshake whose SAS the users actually compared (including an offline
-  search for matching codes);
+- man-in-the-middle on a handshake whose SAS the users actually compared. There is no offline
+  search, and the online search is limited to about 20 attempts a minute (see
+  [Session setup](#session-setup));
 - name or id rewriting in Hellos;
 - joining a room by knowing its `RoomId`.
 
@@ -156,8 +176,9 @@ Local attackers on the same Mac are covered only as described under
 Out of scope:
 
 - **Denial of service**: dropping traffic, flooding, forged connections that claim a peer's id,
-  forged Commits or reveals that abandon a handshake attempt, and forged version failures that
-  trigger the redial backoff.
+  forged Commits or reveals that abandon a handshake attempt, exhausting the handshake rate
+  limits (which delays honest reconnects), and forged version failures that trigger the redial
+  backoff.
 - **Traffic analysis**: who talks to whom, packet timing and sizes, and the names and ids in
   cleartext Hellos and Bonjour records.
 - **A malicious member**: members are trusted with roles and membership, see the
@@ -168,9 +189,8 @@ Out of scope:
 - **M8: reconnects are unauthenticated (no key continuity).** Every reconnect, including an
   automatic one after a network blip, sleep or driver restart, is a fresh, unauthenticated DH.
   The SAS is only shown at invite time, so an attacker who can force a reconnect (for example
-  by dropping traffic until the watchdog tears the link down) gets a new 1-in-10^6 chance to
-  man-in-the-middle an existing member's later session each time, without anyone comparing a
-  code. Future work: key continuity (pin a long-term identity key per peer on first SAS
+  by dropping traffic until the watchdog tears the link down) can man-in-the-middle an existing
+  member's later session with nobody comparing a code, without needing a matching SAS at all. Future work: key continuity (pin a long-term identity key per peer on first SAS
   confirmation and sign later handshakes with it), or re-show the SAS whenever an existing
   member's session is re-established.
 - **The preamble is unauthenticated.** Anyone can claim any id in `RMHELLO1:`. The core only

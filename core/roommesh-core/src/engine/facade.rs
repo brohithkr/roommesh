@@ -27,7 +27,9 @@ use crate::engine::runtime::{
 };
 use crate::ids::{Epoch, PeerId, StreamId};
 use crate::network::clock_sync::ClockSample;
-use crate::network::control::{ControlChannel, ControlError, ControlEvent, RtSessions};
+use crate::network::control::{
+    ControlChannel, ControlError, ControlEvent, HandshakeAlert, RtSessions,
+};
 use crate::network::realtime::{decode_packet, decode_times, encode_times, PacketKind, RtHeader};
 use crate::network::secure::{RtCipher, SecureError};
 use crate::network::transport::{LocalAdvertisement, PeerTransport, TransportEvent};
@@ -571,6 +573,9 @@ impl ControlLoop {
                     log::info!("handshake with {p} stalled; reconnecting");
                     self.transport.disconnect(p);
                 }
+                for a in self.control.take_alerts() {
+                    self.handshake_alert(a);
+                }
             }
             if now.saturating_sub(self.last_quality_ms) >= QUALITY_MS {
                 self.last_quality_ms = now;
@@ -629,59 +634,88 @@ impl ControlLoop {
                     self.engine.on_session_down(now, p);
                 }
             }
-            TransportEvent::Control { peer, frame } => match self.control.on_frame(peer, &frame) {
-                Ok(out) => {
-                    if let Some(r) = out.reply {
-                        self.transport.send_control(peer, r);
-                    }
-                    match out.event {
-                        Some(ControlEvent::SessionUp { peer, name, sas }) => {
-                            self.version_backoff.remove(&peer);
-                            self.engine.on_session_up(now, peer, name, sas);
+            TransportEvent::Control { peer, frame } => {
+                match self.control.on_frame(peer, &frame, now) {
+                    Ok(out) => {
+                        if let Some(r) = out.reply {
+                            self.transport.send_control(peer, r);
                         }
-                        Some(ControlEvent::Message {
-                            msg: ControlMessage::PeerReport(r),
-                            from,
-                        }) => {
-                            // Only the peer itself may report on its own link, only to the
-                            // coordinator, and only while it is a member of our room.
-                            let accept =
-                                r.peer == from
+                        match out.event {
+                            Some(ControlEvent::SessionUp { peer, name, sas }) => {
+                                self.version_backoff.remove(&peer);
+                                self.engine.on_session_up(now, peer, name, sas);
+                            }
+                            Some(ControlEvent::Message {
+                                msg: ControlMessage::PeerReport(r),
+                                from,
+                            }) => {
+                                // Only the peer itself may report on its own link, only to the
+                                // coordinator, and only while it is a member of our room.
+                                let accept = r.peer == from
                                     && self.cache.roles.lock().as_ref().is_some_and(|l| {
                                         l.is_coordinator && l.members.contains(&from)
                                     });
-                            if accept {
-                                self.runtime_shared.metrics.lock().apply_report(&r);
+                                if accept {
+                                    self.runtime_shared.metrics.lock().apply_report(&r);
+                                }
                             }
+                            Some(ControlEvent::Message { from, msg }) => {
+                                self.engine.on_message(now, from, msg)
+                            }
+                            // A legitimate in-band re-open (HELLO_REQUEST we answered, or a peer
+                            // that's still connected but restarted): notify the engine only, the
+                            // connection itself is fine (or already being re-handshaked over).
+                            Some(ControlEvent::SessionDown(p)) => {
+                                self.cache.ping_replay.lock().remove(&p);
+                                self.engine.on_session_down(now, p);
+                            }
+                            // Crypto desync with no re-open in progress: the connection itself is
+                            // suspect, so tear it down too and let a fresh `on_connected` start a
+                            // clean handshake.
+                            Some(ControlEvent::SessionFailed(p)) => {
+                                self.cache.ping_replay.lock().remove(&p);
+                                self.engine.on_session_down(now, p);
+                                self.transport.disconnect(p);
+                            }
+                            None => {}
                         }
-                        Some(ControlEvent::Message { from, msg }) => {
-                            self.engine.on_message(now, from, msg)
-                        }
-                        // A legitimate in-band re-open (HELLO_REQUEST we answered, or a peer
-                        // that's still connected but restarted): notify the engine only, the
-                        // connection itself is fine (or already being re-handshaked over).
-                        Some(ControlEvent::SessionDown(p)) => {
-                            self.cache.ping_replay.lock().remove(&p);
-                            self.engine.on_session_down(now, p);
-                        }
-                        // Crypto desync with no re-open in progress: the connection itself is
-                        // suspect, so tear it down too and let a fresh `on_connected` start a
-                        // clean handshake.
-                        Some(ControlEvent::SessionFailed(p)) => {
-                            self.cache.ping_replay.lock().remove(&p);
-                            self.engine.on_session_down(now, p);
-                            self.transport.disconnect(p);
-                        }
-                        None => {}
                     }
+                    Err(ControlError::Secure(SecureError::Version(v))) => {
+                        self.incompatible(now, peer, v)
+                    }
+                    // The handshake attempt on this connection is used up (or refused): drop the
+                    // connection, as for a crypto failure. Any redial is a new, rate-limited attempt.
+                    Err(e) if e.disconnects() => {
+                        log::warn!("control frame from {peer}: {e}; disconnecting");
+                        self.transport.disconnect(peer);
+                    }
+                    Err(e) => log::warn!("control frame from {peer}: {e}"),
                 }
-                Err(ControlError::Secure(SecureError::Version(v))) => {
-                    self.incompatible(now, peer, v)
-                }
-                Err(e) => log::warn!("control frame from {peer}: {e}"),
-            },
+            }
             TransportEvent::Realtime(_) => {} // handled on the caller's thread
         }
+    }
+
+    /// Tells the user about handshakes that keep being abandoned: what someone searching for a
+    /// matching security code would look like.
+    fn handshake_alert(&mut self, a: HandshakeAlert) {
+        let message = match a {
+            HandshakeAlert::RepeatedFailures(peer) => {
+                let name = self
+                    .engine
+                    .nearby_peers()
+                    .into_iter()
+                    .find(|n| n.id == peer && !n.name.is_empty())
+                    .map_or_else(|| "a nearby Mac".to_string(), |n| n.name);
+                format!("Repeated failed secure connections from {name} — possible interference")
+            }
+            HandshakeAlert::TooManyAttempts => {
+                "Many failed secure connections from nearby devices — possible interference"
+                    .to_string()
+            }
+        };
+        log::warn!("{message}");
+        self.sink.on_event(RoomEvent::Error { message });
     }
 
     /// `peer`'s handshake failed on its protocol version `version`: back off redialing it, and
@@ -1193,7 +1227,7 @@ mod tests {
                     }
                 }
                 Ok(TransportEvent::Control { peer, frame }) => {
-                    if let Some(r) = p.control.on_frame(peer, &frame).unwrap().reply {
+                    if let Some(r) = p.control.on_frame(peer, &frame, 0).unwrap().reply {
                         p.transport.send_control(peer, r);
                     }
                 }
@@ -1402,6 +1436,42 @@ mod tests {
             t = b.until_ms;
         }
         assert_eq!(b.delay_ms, VERSION_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn a_second_commit_on_one_connection_makes_the_core_drop_it() {
+        use crate::network::secure::{commit_frame, Handshake, FRAME_HELLO};
+        let net = LoopbackNetwork::new();
+        let a = node(&net, 5, Box::new(NullAudio));
+        let (tx, rx) = unbounded();
+        let m = net.transport(PeerId(1), tx);
+        let commit = || commit_frame(&Handshake::new(PeerId(1), "M".into()).hello());
+        let next = |pred: &dyn Fn(&TransportEvent) -> bool| {
+            let end = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < end {
+                if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                    if pred(&e) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        m.connect(PeerId(5));
+        assert!(next(&|e| *e == TransportEvent::Connected(PeerId(5))));
+        m.send_control(PeerId(5), commit());
+        assert!(
+            next(
+                &|e| matches!(e, TransportEvent::Control { frame, .. } if frame[0] == FRAME_HELLO)
+            ),
+            "the first commit is answered"
+        );
+        m.send_control(PeerId(5), commit());
+        assert!(
+            next(&|e| *e == TransportEvent::Disconnected(PeerId(5))),
+            "a second, different commit on the same connection drops it"
+        );
+        drop(a);
     }
 
     #[test]

@@ -19,8 +19,20 @@ use crate::network::secure::{
 };
 use crate::room::protocol::{self, ControlMessage, ProtocolError};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+/// Minimum spacing between two new responder handshakes for the same peer id.
+pub const RESPONDER_SPACING_MS: u64 = 2_000;
+/// Longest per-peer wait after repeatedly abandoned responder handshakes.
+pub const RESPONDER_BACKOFF_MAX_MS: u64 = 60_000;
+/// New responder handshakes allowed per minute, across all peer ids.
+pub const RESPONDER_GLOBAL_PER_MIN: usize = 20;
+/// Consecutive abandoned responder handshakes from one peer before the user is warned.
+pub const ABANDONED_ALERT_AFTER: u32 = 3;
+const MINUTE_MS: u64 = 60_000;
+/// A repeated global-limit warning is raised at most this often.
+const GLOBAL_ALERT_INTERVAL_MS: u64 = 10 * MINUTE_MS;
 
 pub type RtSessions = Arc<RwLock<HashMap<PeerId, Arc<RtCipher>>>>;
 
@@ -74,6 +86,124 @@ pub enum ControlError {
     /// handshake attempt is abandoned.
     #[error("the revealed hello does not match its commitment")]
     CommitMismatch,
+    /// A second, different Commit on a connection that already had its one responder
+    /// handshake. Every responder handshake hands the initiator a fresh key whose SAS it can
+    /// compute before deciding to reveal, so each connection gets one attempt.
+    #[error("a second handshake attempt on the same connection")]
+    HandshakeRestart,
+    /// Too many new responder handshakes recently, for this peer id or overall (see
+    /// `ResponderLimiter`).
+    #[error("too many handshake attempts; try again later")]
+    RateLimited,
+}
+
+impl ControlError {
+    /// The caller should drop the transport connection, as for `ControlEvent::SessionFailed`:
+    /// the handshake attempt on it is used up.
+    pub fn disconnects(&self) -> bool {
+        matches!(
+            self,
+            Self::HandshakeRestart | Self::RateLimited | Self::CommitMismatch
+        )
+    }
+}
+
+/// Something the user should hear about: handshakes keep being started and abandoned, which
+/// is what an attacker searching for a matching SAS would look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeAlert {
+    /// Handshakes from this peer id were abandoned [`ABANDONED_ALERT_AFTER`] times in a row.
+    RepeatedFailures(PeerId),
+    /// The global responder limit was hit.
+    TooManyAttempts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Peer,
+    Global,
+}
+
+#[derive(Debug, Default)]
+struct PeerAttempts {
+    last_ms: u64,
+    /// Consecutive attempts that ended without a session.
+    abandoned: u32,
+    alerted: bool,
+}
+
+/// Limits new responder handshakes. As responder we hand the initiator a fresh key before it
+/// reveals its own Hello, so it learns each attempt's SAS and can simply walk away from the ones
+/// it doesn't like. Bounding attempts bounds that search: per claimed peer id, one new attempt
+/// per [`RESPONDER_SPACING_MS`], doubling after each abandoned attempt up to
+/// [`RESPONDER_BACKOFF_MAX_MS`]; overall (ids are unauthenticated and can be rotated), at most
+/// [`RESPONDER_GLOBAL_PER_MIN`] per minute. At that limit, an expected match for a given 6-digit
+/// code (10^6 attempts) takes about 35 days.
+#[derive(Debug, Default)]
+struct ResponderLimiter {
+    peers: HashMap<PeerId, PeerAttempts>,
+    /// When each attempt of the last minute was admitted, oldest first.
+    recent: VecDeque<u64>,
+    global_alerted_ms: Option<u64>,
+}
+
+impl ResponderLimiter {
+    fn gap_ms(abandoned: u32) -> u64 {
+        (RESPONDER_SPACING_MS << abandoned.min(16)).min(RESPONDER_BACKOFF_MAX_MS)
+    }
+    /// Admits (and records) a new responder handshake for `peer` at `now`.
+    fn admit(&mut self, peer: PeerId, now: u64) -> Result<(), Refusal> {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&t| now.saturating_sub(t) >= MINUTE_MS)
+        {
+            self.recent.pop_front();
+        }
+        if let Some(p) = self.peers.get(&peer) {
+            if now.saturating_sub(p.last_ms) < Self::gap_ms(p.abandoned) {
+                return Err(Refusal::Peer);
+            }
+        }
+        if self.recent.len() >= RESPONDER_GLOBAL_PER_MIN {
+            return Err(Refusal::Global);
+        }
+        self.recent.push_back(now);
+        self.peers.entry(peer).or_default().last_ms = now;
+        Ok(())
+    }
+    /// Records an attempt from `peer` that ended without a session; true when the user should
+    /// now be warned about it (once per run of failures).
+    fn abandoned(&mut self, peer: PeerId) -> bool {
+        let p = self.peers.entry(peer).or_default();
+        p.abandoned = p.abandoned.saturating_add(1);
+        if p.abandoned >= ABANDONED_ALERT_AFTER && !p.alerted {
+            p.alerted = true;
+            return true;
+        }
+        false
+    }
+    fn completed(&mut self, peer: PeerId) {
+        if let Some(p) = self.peers.get_mut(&peer) {
+            p.abandoned = 0;
+            p.alerted = false;
+        }
+    }
+    /// True when a global refusal at `now` should be reported (at most every 10 minutes).
+    fn global_alert(&mut self, now: u64) -> bool {
+        let due = self
+            .global_alerted_ms
+            .is_none_or(|t| now.saturating_sub(t) >= GLOBAL_ALERT_INTERVAL_MS);
+        if due {
+            self.global_alerted_ms = Some(now);
+        }
+        due
+    }
+    /// Forgets peers idle long enough that their backoff has fully expired.
+    fn prune(&mut self, now: u64) {
+        self.peers
+            .retain(|_, p| now.saturating_sub(p.last_ms) < 10 * RESPONDER_BACKOFF_MAX_MS);
+    }
 }
 
 /// An in-flight handshake we (the lower `PeerId`) initiated: the key material, the opening
@@ -124,6 +254,11 @@ pub struct ControlChannel {
     /// and silently ignored instead of either erroring (log spam over a harmless network-level
     /// duplicate) or re-keying a session that's already correct.
     answered: HashMap<PeerId, Commitment>,
+    /// Peers whose current transport connection already had its one responder handshake.
+    /// Cleared by `on_connected` and `on_disconnected` (a new connection).
+    attempted: HashSet<PeerId>,
+    limiter: ResponderLimiter,
+    alerts: Vec<HandshakeAlert>,
 }
 
 impl ControlChannel {
@@ -138,6 +273,19 @@ impl ControlChannel {
             awaiting: HashMap::new(),
             fresh: HashMap::new(),
             answered: HashMap::new(),
+            attempted: HashSet::new(),
+            limiter: ResponderLimiter::default(),
+            alerts: Vec::new(),
+        }
+    }
+    /// Warnings raised since the last call (see [`HandshakeAlert`]).
+    pub fn take_alerts(&mut self) -> Vec<HandshakeAlert> {
+        std::mem::take(&mut self.alerts)
+    }
+    /// Drops `peer`'s responder handshake, if any, counting it as abandoned.
+    fn abandon_responding(&mut self, peer: PeerId) {
+        if self.responding.remove(&peer).is_some() && self.limiter.abandoned(peer) {
+            self.alerts.push(HandshakeAlert::RepeatedFailures(peer));
         }
     }
     pub fn realtime_sessions(&self) -> RtSessions {
@@ -199,6 +347,7 @@ impl ControlChannel {
     /// be unable to complete the (now superseded) later one.
     pub fn on_connected(&mut self, peer: PeerId, now_ms: u64) -> Option<Vec<u8>> {
         self.fresh.insert(peer, now_ms);
+        self.attempted.remove(&peer);
         if self.sessions.contains_key(&peer) {
             return None;
         }
@@ -212,10 +361,16 @@ impl ControlChannel {
         Some(self.start_handshake(peer))
     }
 
-    pub fn on_frame(&mut self, peer: PeerId, frame: &[u8]) -> Result<FrameOutcome, ControlError> {
+    /// Handles one control frame from `peer`, received at `now_ms`.
+    pub fn on_frame(
+        &mut self,
+        peer: PeerId,
+        frame: &[u8],
+        now_ms: u64,
+    ) -> Result<FrameOutcome, ControlError> {
         match frame.first() {
             None => Err(ControlError::Empty),
-            Some(&FRAME_COMMIT) => self.on_commit(peer, frame),
+            Some(&FRAME_COMMIT) => self.on_commit(peer, frame, now_ms),
             Some(&FRAME_HELLO) => self.on_hello(peer, frame),
             Some(&FRAME_HELLO_REQUEST) => {
                 // A HELLO_REQUEST carries no payload: anything else riding on the tag byte is
@@ -306,7 +461,14 @@ impl ControlChannel {
     }
 
     /// Step 1 of the handshake, at the responder (higher id): answer a Commit with our Hello.
-    fn on_commit(&mut self, peer: PeerId, frame: &[u8]) -> Result<FrameOutcome, ControlError> {
+    /// One new attempt per transport connection, and new attempts are rate-limited (see
+    /// `ResponderLimiter`).
+    fn on_commit(
+        &mut self,
+        peer: PeerId,
+        frame: &[u8],
+        now_ms: u64,
+    ) -> Result<FrameOutcome, ControlError> {
         // Version first, whatever our role: a mismatch must surface as `Version`.
         let c = decode_commit(frame)?;
         if self.local < peer {
@@ -336,6 +498,21 @@ impl ControlChannel {
                 return Err(ControlError::UnexpectedHello);
             }
         }
+        if self.attempted.contains(&peer) {
+            // This connection already had its attempt: a second, different Commit on it is
+            // either a confused peer or someone shopping for a SAS. Give up on the connection.
+            self.abandon_responding(peer);
+            return Err(ControlError::HandshakeRestart);
+        }
+        if let Err(why) = self.limiter.admit(peer, now_ms) {
+            if why == Refusal::Global && self.limiter.global_alert(now_ms) {
+                self.alerts.push(HandshakeAlert::TooManyAttempts);
+            }
+            return Err(ControlError::RateLimited);
+        }
+        self.attempted.insert(peer);
+        // A new attempt replaces one still waiting for its reveal (the peer restarted).
+        self.abandon_responding(peer);
         self.fresh.remove(&peer);
         self.pending.remove(&peer); // defensive; the higher id never legitimately has one
         let hs = Handshake::new(self.local, self.name.clone());
@@ -407,15 +584,23 @@ impl ControlChannel {
                     return Err(ControlError::UnexpectedHello);
                 };
                 if r.commitment != c {
-                    self.responding.remove(&peer);
+                    self.abandon_responding(peer);
                     return Err(ControlError::CommitMismatch);
                 }
                 let result = r.hs.complete(&r.hello_bytes, frame);
-                let r = self.responding.remove(&peer).expect("responding");
-                let session = result?;
+                let commitment = r.commitment;
+                let session = match result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.abandon_responding(peer);
+                        return Err(e.into());
+                    }
+                };
+                self.responding.remove(&peer);
+                self.limiter.completed(peer);
                 self.awaiting.remove(&peer);
                 self.fresh.remove(&peer);
-                self.answered.insert(peer, r.commitment);
+                self.answered.insert(peer, commitment);
                 let ev = self.install(peer, session);
                 Ok(FrameOutcome {
                     event: Some(ev),
@@ -432,7 +617,7 @@ impl ControlChannel {
 
     fn drop_session(&mut self, peer: PeerId) -> bool {
         self.pending.remove(&peer);
-        self.responding.remove(&peer);
+        self.abandon_responding(peer);
         self.fresh.remove(&peer);
         self.awaiting.remove(&peer);
         self.answered.remove(&peer);
@@ -441,6 +626,7 @@ impl ControlChannel {
     }
 
     pub fn on_disconnected(&mut self, peer: PeerId) -> Option<ControlEvent> {
+        self.attempted.remove(&peer);
         self.drop_session(peer)
             .then_some(ControlEvent::SessionDown(peer))
     }
@@ -454,6 +640,7 @@ impl ControlChannel {
     pub fn stalled(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<PeerId> {
         self.fresh
             .retain(|_, set| now_ms.saturating_sub(*set) < timeout_ms);
+        self.limiter.prune(now_ms);
         let mut out = Vec::new();
         for (&peer, started) in self.awaiting.iter_mut() {
             match *started {
@@ -484,15 +671,24 @@ mod tests {
         b: &mut ControlChannel,
         commit: &[u8],
     ) -> (FrameOutcome, FrameOutcome) {
-        let ob = b.on_frame(a.local, commit).unwrap();
+        finish_at(a, b, commit, 0)
+    }
+    /// [`finish`] with every frame delivered at `now`.
+    fn finish_at(
+        a: &mut ControlChannel,
+        b: &mut ControlChannel,
+        commit: &[u8],
+        now: u64,
+    ) -> (FrameOutcome, FrameOutcome) {
+        let ob = b.on_frame(a.local, commit, now).unwrap();
         assert!(
             ob.event.is_none(),
             "the responder has no session before the reveal"
         );
         let reply = ob.reply.expect("b answers the commit with its hello");
-        let oa = a.on_frame(b.local, &reply).unwrap();
+        let oa = a.on_frame(b.local, &reply, now).unwrap();
         let reveal = oa.reply.clone().expect("a reveals its hello");
-        let ob = b.on_frame(a.local, &reveal).unwrap();
+        let ob = b.on_frame(a.local, &reveal, now).unwrap();
         assert!(ob.reply.is_none(), "b must not answer the reveal");
         (oa, ob)
     }
@@ -532,7 +728,7 @@ mod tests {
         assert_eq!((n1.as_str(), n2.as_str()), ("B", "A"));
         let msg = ControlMessage::Leave { room_id: RoomId(3) };
         let frame = a.seal(PeerId(2), &msg).unwrap();
-        match b.on_frame(PeerId(1), &frame).unwrap().event {
+        match b.on_frame(PeerId(1), &frame, 0).unwrap().event {
             Some(ControlEvent::Message { from, msg: m }) => {
                 assert_eq!(from, PeerId(1));
                 assert_eq!(m, msg);
@@ -555,11 +751,11 @@ mod tests {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ca = a.on_connected(PeerId(2), 0).unwrap();
-        let reply = b.on_frame(PeerId(1), &ca).unwrap().reply.unwrap();
+        let reply = b.on_frame(PeerId(1), &ca, 0).unwrap().reply.unwrap();
         assert!(!b.has_session(PeerId(1)));
-        let oa = a.on_frame(PeerId(2), &reply).unwrap();
+        let oa = a.on_frame(PeerId(2), &reply, 0).unwrap();
         assert!(a.has_session(PeerId(2)) && !b.has_session(PeerId(1)));
-        let ob = b.on_frame(PeerId(1), &oa.reply.unwrap()).unwrap();
+        let ob = b.on_frame(PeerId(1), &oa.reply.unwrap(), 0).unwrap();
         assert!(matches!(ob.event, Some(ControlEvent::SessionUp { .. })));
         assert_eq!(a.sas(PeerId(2)), b.sas(PeerId(1)));
     }
@@ -568,17 +764,17 @@ mod tests {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ca = a.on_connected(PeerId(2), 0).unwrap();
-        let reply = b.on_frame(PeerId(1), &ca).unwrap().reply.unwrap();
+        let reply = b.on_frame(PeerId(1), &ca, 0).unwrap().reply.unwrap();
         // A man in the middle that answered the commitment can't substitute its own opening
         // Hello (another key, same id and name) at the reveal.
         let forged = Handshake::new(PeerId(1), "A".into()).hello();
-        let err = b.on_frame(PeerId(1), &forged).unwrap_err();
+        let err = b.on_frame(PeerId(1), &forged, 0).unwrap_err();
         assert!(matches!(err, ControlError::CommitMismatch), "{err:?}");
         assert!(!b.has_session(PeerId(1)));
         // The attempt is abandoned: even the genuine reveal no longer completes it.
-        let reveal = a.on_frame(PeerId(2), &reply).unwrap().reply.unwrap();
+        let reveal = a.on_frame(PeerId(2), &reply, 0).unwrap().reply.unwrap();
         assert!(matches!(
-            b.on_frame(PeerId(1), &reveal).unwrap_err(),
+            b.on_frame(PeerId(1), &reveal, 0).unwrap_err(),
             ControlError::UnexpectedHello
         ));
         assert!(!b.has_session(PeerId(1)));
@@ -588,7 +784,7 @@ mod tests {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let hello = Handshake::new(PeerId(1), "A".into()).hello();
         assert!(matches!(
-            b.on_frame(PeerId(1), &hello).unwrap_err(),
+            b.on_frame(PeerId(1), &hello, 0).unwrap_err(),
             ControlError::UnexpectedHello
         ));
         assert!(!b.has_session(PeerId(1)));
@@ -600,7 +796,7 @@ mod tests {
         frame.extend(postcard::to_allocvec(&(crate::room::state::PROTOCOL_VERSION + 1)).unwrap());
         frame.extend([0xAA; 40]);
         assert!(matches!(
-            b.on_frame(PeerId(1), &frame).unwrap_err(),
+            b.on_frame(PeerId(1), &frame, 0).unwrap_err(),
             ControlError::Secure(SecureError::Version(v)) if v == crate::room::state::PROTOCOL_VERSION + 1
         ));
     }
@@ -609,18 +805,18 @@ mod tests {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ca = a.on_connected(PeerId(2), 0).unwrap();
-        let r1 = b.on_frame(PeerId(1), &ca).unwrap().reply.unwrap();
-        let r2 = b.on_frame(PeerId(1), &ca).unwrap().reply.unwrap();
+        let r1 = b.on_frame(PeerId(1), &ca, 0).unwrap().reply.unwrap();
+        let r2 = b.on_frame(PeerId(1), &ca, 0).unwrap().reply.unwrap();
         assert_eq!(r1, r2, "the same commit gets the same answer, not new keys");
-        let reveal = a.on_frame(PeerId(2), &r1).unwrap().reply.unwrap();
+        let reveal = a.on_frame(PeerId(2), &r1, 0).unwrap().reply.unwrap();
         // The duplicate answer reaches a after its session is up: ignored.
-        let o = a.on_frame(PeerId(2), &r2).unwrap();
+        let o = a.on_frame(PeerId(2), &r2, 0).unwrap();
         assert!(o.event.is_none() && o.reply.is_none());
-        b.on_frame(PeerId(1), &reveal).unwrap();
+        b.on_frame(PeerId(1), &reveal, 0).unwrap();
         let sas = b.sas(PeerId(1));
         // Retransmissions of the commit and the reveal after b's session is up: ignored.
         for f in [&ca, &reveal] {
-            let o = b.on_frame(PeerId(1), f).unwrap();
+            let o = b.on_frame(PeerId(1), f, 0).unwrap();
             assert!(o.event.is_none() && o.reply.is_none());
         }
         assert_eq!(b.sas(PeerId(1)), sas);
@@ -655,7 +851,7 @@ mod tests {
         // only ever initiates): rejected, and the session (and SAS) stays untouched.
         let forged = Handshake::new(PeerId(2), "B".into()).hello();
         for f in [commit_frame(&forged), forged] {
-            let err = a.on_frame(PeerId(2), &f).unwrap_err();
+            let err = a.on_frame(PeerId(2), &f, 0).unwrap_err();
             assert!(matches!(err, ControlError::UnexpectedHello));
         }
         assert!(a.has_session(PeerId(2)));
@@ -663,7 +859,8 @@ mod tests {
         // A new commit at B while its session isn't `fresh`: rejected too.
         let forged = Handshake::new(PeerId(1), "A".into()).hello();
         assert!(matches!(
-            b.on_frame(PeerId(1), &commit_frame(&forged)).unwrap_err(),
+            b.on_frame(PeerId(1), &commit_frame(&forged), 0)
+                .unwrap_err(),
             ControlError::UnexpectedHello
         ));
         assert_eq!(b.sas(PeerId(1)), sas_before);
@@ -677,7 +874,7 @@ mod tests {
         let mut frame = a.seal(PeerId(2), &msg).unwrap();
         let last = frame.len() - 1;
         frame[last] ^= 0xff; // corrupt the ciphertext/tag
-        let outcome = b.on_frame(PeerId(1), &frame).unwrap();
+        let outcome = b.on_frame(PeerId(1), &frame, 0).unwrap();
         // Distinct from SessionDown: the connection itself is suspect, so the caller is expected
         // to disconnect the transport too, not just notify the engine.
         assert!(matches!(outcome.event, Some(ControlEvent::SessionFailed(p)) if p == PeerId(1)));
@@ -692,13 +889,13 @@ mod tests {
         // A reply that matches A's pending commitment but fails to complete (bad version).
         let mut bad_reply = decode_hello(&hs_b.hello_reply(&c)).unwrap();
         bad_reply.protocol_version += 1;
-        assert!(a.on_frame(PeerId(2), &encode_hello(&bad_reply)).is_err());
+        assert!(a.on_frame(PeerId(2), &encode_hello(&bad_reply), 0).is_err());
         assert!(!a.has_session(PeerId(2)));
         // The pending handshake must still be there: a subsequent, well-formed reply to the
         // *same* Commit completes normally.
         let good_reply = hs_b.hello_reply(&c);
         assert!(matches!(
-            a.on_frame(PeerId(2), &good_reply).unwrap().event,
+            a.on_frame(PeerId(2), &good_reply, 0).unwrap().event,
             Some(ControlEvent::SessionUp { .. })
         ));
         assert!(a.has_session(PeerId(2)));
@@ -708,17 +905,17 @@ mod tests {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ca = a.on_connected(PeerId(2), 0).unwrap();
-        let reply = b.on_frame(PeerId(1), &ca).unwrap().reply.unwrap();
+        let reply = b.on_frame(PeerId(1), &ca, 0).unwrap().reply.unwrap();
         assert!(matches!(
-            a.on_frame(PeerId(9), &reply).unwrap_err(),
+            a.on_frame(PeerId(9), &reply, 0).unwrap_err(),
             ControlError::IdentityMismatch
         ));
-        let reveal = a.on_frame(PeerId(2), &reply).unwrap().reply.unwrap();
+        let reveal = a.on_frame(PeerId(2), &reply, 0).unwrap().reply.unwrap();
         assert!(matches!(
-            b.on_frame(PeerId(9), &reveal).unwrap_err(),
+            b.on_frame(PeerId(9), &reveal, 0).unwrap_err(),
             ControlError::IdentityMismatch
         ));
-        b.on_frame(PeerId(1), &reveal).unwrap();
+        b.on_frame(PeerId(1), &reveal, 0).unwrap();
         let h = RtHeader {
             kind: PacketKind::Mic,
             epoch: Epoch(1),
@@ -750,6 +947,176 @@ mod tests {
         assert!(b.realtime_sessions().read().get(&PeerId(1)).is_none());
     }
 
+    // -- SAS grinding at the responder (review C1) --
+
+    /// A fresh Commit from an attacker claiming `id`.
+    fn attacker_commit(id: u64) -> Vec<u8> {
+        commit_frame(&Handshake::new(PeerId(id), "A".into()).hello())
+    }
+
+    #[test]
+    fn many_commits_on_one_connection_get_one_answer_and_then_a_disconnect() {
+        // The reviewer's attack: on one connection, send COMMIT after COMMIT, compute each
+        // answer's SAS locally and reveal only on a match. The responder must hand out one key
+        // per connection, then tell the caller to drop it.
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        b.on_connected(PeerId(1), 0);
+        let first = attacker_commit(1);
+        let reply = b.on_frame(PeerId(1), &first, 0).unwrap().reply.unwrap();
+        let mut answers = 1;
+        for i in 1..1_000u64 {
+            match b.on_frame(PeerId(1), &attacker_commit(1), i * 10) {
+                Ok(o) => answers += usize::from(o.reply.is_some()),
+                Err(e) => {
+                    assert!(matches!(e, ControlError::HandshakeRestart), "{e:?}");
+                    assert!(e.disconnects());
+                }
+            }
+        }
+        assert_eq!(answers, 1, "one responder key per connection");
+        // The identical Commit is still answered identically (a harmless retransmit) ...
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        b.on_connected(PeerId(1), 0);
+        let r1 = b.on_frame(PeerId(1), &first, 0).unwrap().reply.unwrap();
+        assert_eq!(b.on_frame(PeerId(1), &first, 5).unwrap().reply.unwrap(), r1);
+        assert_ne!(r1, reply, "a new responder key per attempt");
+    }
+    #[test]
+    fn a_failed_reveal_uses_up_the_connection() {
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        b.on_connected(PeerId(1), 0);
+        b.on_frame(PeerId(1), &attacker_commit(1), 0).unwrap();
+        let wrong = Handshake::new(PeerId(1), "A".into()).hello();
+        let e = b.on_frame(PeerId(1), &wrong, 0).unwrap_err();
+        assert!(matches!(e, ControlError::CommitMismatch) && e.disconnects());
+        assert!(matches!(
+            b.on_frame(PeerId(1), &attacker_commit(1), 10_000)
+                .unwrap_err(),
+            ControlError::HandshakeRestart
+        ));
+    }
+    #[test]
+    fn reconnecting_to_grind_is_rate_limited_per_peer_with_backoff() {
+        // Same attack with a new connection per attempt, all claiming one peer id, never
+        // revealing, as fast as the limiter lets it for ten simulated minutes.
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        let mut accepted = vec![];
+        let mut now = 0;
+        while now < 10 * MINUTE_MS {
+            b.on_connected(PeerId(1), now);
+            if b.on_frame(PeerId(1), &attacker_commit(1), now).is_ok() {
+                accepted.push(now);
+            }
+            b.on_disconnected(PeerId(1));
+            now += 100;
+        }
+        // Abandoned attempts back off 4, 8, 16, 32 and then 60 s: 13 attempts, not ~6000.
+        assert_eq!(&accepted[..5], &[0, 4_000, 12_000, 28_000, 60_000]);
+        assert_eq!(accepted.len(), 13);
+        let gaps: Vec<u64> = accepted.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.iter().skip(4).all(|&g| g == RESPONDER_BACKOFF_MAX_MS),
+            "{gaps:?}"
+        );
+    }
+    #[test]
+    fn reconnecting_under_rotating_ids_is_rate_limited_globally() {
+        let mut b = ControlChannel::new(PeerId(1_000_000), "B".into());
+        let mut accepted = 0;
+        let mut id = 1;
+        let mut now = 0;
+        while now < 10 * MINUTE_MS {
+            b.on_connected(PeerId(id), now);
+            if b.on_frame(PeerId(id), &attacker_commit(id), now).is_ok() {
+                accepted += 1;
+            }
+            b.on_disconnected(PeerId(id));
+            id += 1;
+            now += 100;
+        }
+        assert_eq!(accepted, 10 * RESPONDER_GLOBAL_PER_MIN);
+        // One global warning in those ten minutes.
+        let alerts = b.take_alerts();
+        assert_eq!(
+            alerts
+                .iter()
+                .filter(|a| **a == HandshakeAlert::TooManyAttempts)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn repeated_abandoned_attempts_warn_once_and_a_completed_one_resets() {
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        let mut now = 0;
+        let abandon = |b: &mut ControlChannel, now: &mut u64| {
+            *now += RESPONDER_BACKOFF_MAX_MS;
+            b.on_connected(PeerId(1), *now);
+            b.on_frame(PeerId(1), &attacker_commit(1), *now).unwrap();
+            b.on_disconnected(PeerId(1)); // committed, never revealed
+        };
+        for _ in 0..ABANDONED_ALERT_AFTER - 1 {
+            abandon(&mut b, &mut now);
+        }
+        assert!(b.take_alerts().is_empty());
+        abandon(&mut b, &mut now);
+        assert_eq!(
+            b.take_alerts(),
+            vec![HandshakeAlert::RepeatedFailures(PeerId(1))]
+        );
+        abandon(&mut b, &mut now);
+        assert!(
+            b.take_alerts().is_empty(),
+            "warned once per run of failures"
+        );
+        // An honest, completed handshake resets the backoff: the next one only waits 2 s.
+        now += RESPONDER_BACKOFF_MAX_MS;
+        let mut a = ControlChannel::new(PeerId(1), "A".into());
+        let c = a.on_connected(PeerId(2), now).unwrap();
+        b.on_connected(PeerId(1), now);
+        finish_at(&mut a, &mut b, &c, now);
+        b.on_disconnected(PeerId(1));
+        let mut a = ControlChannel::new(PeerId(1), "A".into());
+        let c = a
+            .on_connected(PeerId(2), now + RESPONDER_SPACING_MS)
+            .unwrap();
+        b.on_connected(PeerId(1), now + RESPONDER_SPACING_MS);
+        finish_at(&mut a, &mut b, &c, now + RESPONDER_SPACING_MS);
+        assert!(b.has_session(PeerId(1)));
+    }
+    #[test]
+    fn honest_first_connects_to_many_peers_are_not_delayed() {
+        // A wake from sleep in a big room: every peer's first handshake completes at once.
+        let mut b = ControlChannel::new(PeerId(100), "B".into());
+        for id in 1..=RESPONDER_GLOBAL_PER_MIN as u64 {
+            let mut a = ControlChannel::new(PeerId(id), "A".into());
+            let c = a.on_connected(PeerId(100), 5).unwrap();
+            b.on_connected(PeerId(id), 5);
+            finish_at(&mut a, &mut b, &c, 5);
+            assert!(b.has_session(PeerId(id)));
+        }
+    }
+    #[test]
+    fn a_rate_limited_commit_disconnects_and_a_later_redial_succeeds() {
+        let mut a = ControlChannel::new(PeerId(1), "A".into());
+        let mut b = ControlChannel::new(PeerId(2), "B".into());
+        session(&mut a, &mut b);
+        b.on_disconnected(PeerId(1));
+        // The peer restarted immediately (within the 2 s spacing): refused, disconnect ...
+        let mut a2 = ControlChannel::new(PeerId(1), "A".into());
+        let c = a2.on_connected(PeerId(2), 500).unwrap();
+        b.on_connected(PeerId(1), 500);
+        let e = b.on_frame(PeerId(1), &c, 500).unwrap_err();
+        assert!(matches!(e, ControlError::RateLimited) && e.disconnects());
+        // ... and the redial (at most every 2 s) completes.
+        a2.on_disconnected(PeerId(2));
+        b.on_disconnected(PeerId(1));
+        let c = a2.on_connected(PeerId(2), 2_500).unwrap();
+        b.on_connected(PeerId(1), 2_500);
+        finish_at(&mut a2, &mut b, &c, 2_500);
+        assert_eq!(a2.sas(PeerId(2)), b.sas(PeerId(1)));
+    }
+
     // -- Regressions ported from the reviewer's `review_probe` scratch module --
 
     #[test]
@@ -765,11 +1132,11 @@ mod tests {
             h1, h2,
             "must resend the identical pending Commit, not generate new key material"
         );
-        let r1 = b.on_frame(PeerId(1), &h1).unwrap().reply.unwrap();
+        let r1 = b.on_frame(PeerId(1), &h1, 0).unwrap().reply.unwrap();
         // The byte-identical h2 is answered with the identical reply (F4).
-        assert_eq!(b.on_frame(PeerId(1), &h2).unwrap().reply.unwrap(), r1);
-        let reveal = a.on_frame(PeerId(2), &r1).unwrap().reply.unwrap();
-        b.on_frame(PeerId(1), &reveal).unwrap();
+        assert_eq!(b.on_frame(PeerId(1), &h2, 0).unwrap().reply.unwrap(), r1);
+        let reveal = a.on_frame(PeerId(2), &r1, 0).unwrap().reply.unwrap();
+        b.on_frame(PeerId(1), &reveal, 0).unwrap();
         assert!(a.has_session(PeerId(2)) && b.has_session(PeerId(1)));
     }
     #[test]
@@ -790,7 +1157,7 @@ mod tests {
             .seal(PeerId(2), &ControlMessage::Leave { room_id: RoomId(1) })
             .unwrap();
         assert!(matches!(
-            b.on_frame(PeerId(1), &f).unwrap().event,
+            b.on_frame(PeerId(1), &f, 0).unwrap().event,
             Some(ControlEvent::Message { .. })
         ));
     }
@@ -800,18 +1167,20 @@ mod tests {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         session(&mut a, &mut b);
         let old_sas = b.sas(PeerId(1));
-        // A restarts (fresh process, no memory of the old session) and reconnects.
+        // A restarts (fresh process, no memory of the old session) and reconnects, a few
+        // seconds later (a relaunch takes longer than the responder's per-peer spacing).
+        let t = 3_000;
         let mut a2 = ControlChannel::new(PeerId(1), "A".into());
-        let c = a2.on_connected(PeerId(2), 20).unwrap();
+        let c = a2.on_connected(PeerId(2), t).unwrap();
         // b's transport hasn't told it about this yet: reject rather than starting a re-key.
-        assert!(b.on_frame(PeerId(1), &c).is_err());
+        assert!(b.on_frame(PeerId(1), &c, t).is_err());
         assert!(b.has_session(PeerId(1)));
         // Once b's transport does tell it about the (re)connection, the restart is accepted.
         assert!(
-            b.on_connected(PeerId(1), 21).is_none(),
+            b.on_connected(PeerId(1), t + 1).is_none(),
             "b already has a session: on_connected is a no-op"
         );
-        let (oa, ob) = finish(&mut a2, &mut b, &c);
+        let (oa, ob) = finish_at(&mut a2, &mut b, &c, t + 1);
         assert!(matches!(oa.event, Some(ControlEvent::SessionUp { .. })));
         assert!(matches!(ob.event, Some(ControlEvent::SessionUp { .. })));
         assert!(a2.has_session(PeerId(2)) && b.has_session(PeerId(1)));
@@ -828,7 +1197,7 @@ mod tests {
         // the lower id may open a handshake, so this must be rejected outright, and it must not
         // disturb A's real outstanding attempt.
         let err = a
-            .on_frame(PeerId(2), &commit_frame(&mallory.hello()))
+            .on_frame(PeerId(2), &commit_frame(&mallory.hello()), 0)
             .unwrap_err();
         assert!(matches!(err, ControlError::UnexpectedHello));
         assert!(!a.has_session(PeerId(2)));
@@ -843,7 +1212,7 @@ mod tests {
         // b (higher) tells a (lower) it's connected: a opens. a never calls on_connected itself
         // here; instead a HELLO_REQUEST arrives out of band (e.g. from a retried Connected).
         let req = vec![FRAME_HELLO_REQUEST];
-        let out = a.on_frame(PeerId(2), &req).unwrap();
+        let out = a.on_frame(PeerId(2), &req, 0).unwrap();
         assert!(out.event.is_none());
         let commit = out
             .reply
@@ -856,7 +1225,7 @@ mod tests {
     fn hello_request_while_pending_resends_the_same_commit() {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let ca = a.on_connected(PeerId(2), 0).unwrap();
-        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert_eq!(
             out.reply.unwrap(),
             ca,
@@ -872,7 +1241,7 @@ mod tests {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         session(&mut a, &mut b);
         let sas_before = a.sas(PeerId(2));
-        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(
             out.event.is_none() && out.reply.is_none(),
             "ignored: no fresh Connected since the session came up"
@@ -889,7 +1258,7 @@ mod tests {
         // an unsolicited HELLO_REQUEST as a legitimate request to restart the handshake (e.g.
         // b actually restarted and lost its session).
         a.on_connected(PeerId(2), 5);
-        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(matches!(out.event, Some(ControlEvent::SessionDown(p)) if p == PeerId(2)));
         assert!(!a.has_session(PeerId(2)));
         assert_eq!(
@@ -901,12 +1270,14 @@ mod tests {
     #[test]
     fn hello_request_with_extra_bytes_is_malformed() {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
-        assert!(a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST, 0x00]).is_err());
+        assert!(a
+            .on_frame(PeerId(2), &[FRAME_HELLO_REQUEST, 0x00], 0)
+            .is_err());
     }
     #[test]
     fn higher_id_never_answers_a_hello_request() {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
-        let out = b.on_frame(PeerId(1), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = b.on_frame(PeerId(1), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(out.event.is_none() && out.reply.is_none());
     }
 
@@ -946,7 +1317,7 @@ mod tests {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let ca = a.on_connected(PeerId(2), 0).unwrap();
         // b answers the commit without ever having seen a Connected: lazily stamped.
-        b.on_frame(PeerId(1), &ca).unwrap();
+        b.on_frame(PeerId(1), &ca, 0).unwrap();
         assert_eq!(b.stalled(1_000, 1), Vec::new(), "first poll only stamps");
         assert_eq!(
             b.stalled(1_001, 1),
@@ -956,7 +1327,7 @@ mod tests {
         // With a Connected first, the stamp is that of the Connected.
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         b.on_connected(PeerId(1), 100);
-        b.on_frame(PeerId(1), &ca).unwrap();
+        b.on_frame(PeerId(1), &ca, 0).unwrap();
         assert_eq!(b.stalled(1_099, 1_000), Vec::new());
         assert_eq!(b.stalled(1_100, 1_000), vec![PeerId(1)]);
     }
@@ -964,7 +1335,7 @@ mod tests {
     fn hello_request_cold_answer_is_lazily_watched_by_the_watchdog() {
         let mut a = ControlChannel::new(PeerId(1), "A".into());
         let _commit = a
-            .on_frame(PeerId(2), &[FRAME_HELLO_REQUEST])
+            .on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0)
             .unwrap()
             .reply
             .unwrap();
@@ -1018,16 +1389,16 @@ mod tests {
         let ca = a.on_connected(b.local, 0).unwrap();
         let rq = b.on_connected(a.local, 0).unwrap();
         // a gets b's request before anything else: resends the same (still pending) commit.
-        let dup = a.on_frame(b.local, &rq).unwrap().reply.unwrap();
+        let dup = a.on_frame(b.local, &rq, 0).unwrap().reply.unwrap();
         assert_eq!(dup, ca);
-        let r = b.on_frame(a.local, &ca).unwrap().reply.unwrap();
+        let r = b.on_frame(a.local, &ca, 0).unwrap().reply.unwrap();
         // b answers the duplicate commit identically.
-        assert_eq!(b.on_frame(a.local, &dup).unwrap().reply.unwrap(), r);
-        let reveal = a.on_frame(b.local, &r).unwrap().reply.unwrap();
+        assert_eq!(b.on_frame(a.local, &dup, 0).unwrap().reply.unwrap(), r);
+        let reveal = a.on_frame(b.local, &r, 0).unwrap().reply.unwrap();
         // a's session is up: the second, identical reply is ignored.
-        let o = a.on_frame(b.local, &r).unwrap();
+        let o = a.on_frame(b.local, &r, 0).unwrap();
         assert!(o.event.is_none() && o.reply.is_none());
-        b.on_frame(a.local, &reveal).unwrap();
+        b.on_frame(a.local, &reveal, 0).unwrap();
         assert!(a.has_session(b.local) && b.has_session(a.local));
     }
     #[test]
@@ -1041,7 +1412,7 @@ mod tests {
         assert_eq!(a.stalled(5_999, 5_000), Vec::new());
         assert!(a.fresh.contains_key(&PeerId(2)), "still within the window");
         assert_eq!(a.stalled(6_000, 5_000), Vec::new());
-        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(
             out.event.is_none() && out.reply.is_none(),
             "expired: the request is ignored"
@@ -1050,7 +1421,7 @@ mod tests {
         // Within the window a HELLO_REQUEST is still honoured.
         a.on_connected(PeerId(2), 10_000);
         a.stalled(12_000, 5_000);
-        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(matches!(out.event, Some(ControlEvent::SessionDown(p)) if p == PeerId(2)));
     }
     #[test]
@@ -1060,14 +1431,14 @@ mod tests {
         up(&mut a, &mut b);
         let sas = a.sas(PeerId(2));
         // Attacker injects a bare HELLO_REQUEST claiming to be from b.
-        let o = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let o = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(o.event.is_none() && o.reply.is_none());
         assert!(a.has_session(PeerId(2)));
         assert_eq!(a.sas(PeerId(2)), sas);
         // Normal traffic keeps flowing afterward.
         let f = b.seal(PeerId(1), &msg()).unwrap();
         assert!(matches!(
-            a.on_frame(PeerId(2), &f).unwrap().event,
+            a.on_frame(PeerId(2), &f, 0).unwrap().event,
             Some(ControlEvent::Message { .. })
         ));
         assert_eq!(a.stalled(10_000, 5_000), Vec::new());
@@ -1082,7 +1453,7 @@ mod tests {
         // Attacker injects a HELLO_REQUEST hoping A will answer with a fresh Commit it can then
         // reply to (impersonating b) and hijack. A has nothing pending and no `fresh`
         // Connected, so the request is ignored outright.
-        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST]).unwrap();
+        let out = a.on_frame(PeerId(2), &[FRAME_HELLO_REQUEST], 0).unwrap();
         assert!(
             out.reply.is_none(),
             "the request is ignored: no fresh commit to attack"
@@ -1102,12 +1473,12 @@ mod tests {
         // An authenticated sealed frame proves the session is current: it must clear the
         // lingering fresh flag left over from the redundant on_connected above.
         let f = a.seal(PeerId(2), &msg()).unwrap();
-        assert!(b.on_frame(PeerId(1), &f).is_ok());
+        assert!(b.on_frame(PeerId(1), &f, 0).is_ok());
         // Long after, an attacker injects a forged Commit: it must now be rejected, not
         // silently accepted via the lingering fresh flag.
         let mallory = Handshake::new(PeerId(1), "A".into());
         let err = b
-            .on_frame(PeerId(1), &commit_frame(&mallory.hello()))
+            .on_frame(PeerId(1), &commit_frame(&mallory.hello()), 0)
             .unwrap_err();
         assert!(matches!(err, ControlError::UnexpectedHello));
         assert!(b.has_session(PeerId(1)));
@@ -1122,14 +1493,14 @@ mod tests {
             h1, h2,
             "on_connected with a pending handshake must resend the same commit"
         );
-        let r1 = b.on_frame(PeerId(1), &h1).unwrap().reply.unwrap();
+        let r1 = b.on_frame(PeerId(1), &h1, 0).unwrap().reply.unwrap();
         assert_eq!(
-            b.on_frame(PeerId(1), &h2).unwrap().reply.unwrap(),
+            b.on_frame(PeerId(1), &h2, 0).unwrap().reply.unwrap(),
             r1,
             "identical duplicate is answered identically"
         );
-        let reveal = a.on_frame(PeerId(2), &r1).unwrap().reply.unwrap();
-        b.on_frame(PeerId(1), &reveal).unwrap();
+        let reveal = a.on_frame(PeerId(2), &r1, 0).unwrap().reply.unwrap();
+        b.on_frame(PeerId(1), &reveal, 0).unwrap();
         assert!(a.has_session(PeerId(2)) && b.has_session(PeerId(1)));
         assert_eq!(
             a.stalled(5_010, 5_000),
@@ -1144,7 +1515,7 @@ mod tests {
         let mut b = ControlChannel::new(PeerId(2), "B".into());
         let rq = b.on_connected(PeerId(1), 0).unwrap();
         // a answers the cold request before its own Connected notification ever arrives.
-        let h1 = a.on_frame(PeerId(2), &rq).unwrap().reply.unwrap();
+        let h1 = a.on_frame(PeerId(2), &rq, 0).unwrap().reply.unwrap();
         // a's own Connected notification arrives afterward: must reuse the same pending
         // handshake started above rather than generating new keys (F3).
         let h2 = a.on_connected(PeerId(2), 0).unwrap();
