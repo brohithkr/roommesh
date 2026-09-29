@@ -114,10 +114,10 @@ buffer's duplicate and late checks.
   the change, get a removal notice: the room's version and coordinator id, with no name and no
   member list.
 - **Trust model.** Every member is trusted with the room's roles. Any member may invite, remove
-  members, pick the coordinator or the room speaker, and rename the room, directly or relayed.
-  Changes that speak for one member (its name and capabilities, and whether its microphone is
-  used) are accepted only from that member itself, and only directly, because a relayed request
-  can't be told from a forged one.
+  members, pick the coordinator or the room speaker, switch any member's microphone on or off
+  for the room, and rename the room, directly or relayed. Changes that speak for one member (its
+  name and capabilities) are accepted only from that member itself, and only directly, because a
+  relayed request can't be told from a forged one.
 - **Epoch cap.** A manifest may move the epoch forward by at most 1000 in one step, so no member
   can push the room's epoch to `u32::MAX`. Legitimate jumps (coordinator changes, a healed split
   brain) are a few epochs.
@@ -183,4 +183,4 @@ Out of scope:
   id of a pair, it logs a malformed frame instead of reporting the version mismatch, and the
   version-3 side's handshake watchdog keeps reconnecting.
 - Changes that speak for one member aren't relayed. While a member has no direct link to the
-  coordinator, its own name, capability and mic changes wait until the link returns.
+  coordinator, its own name and capability changes wait until the link returns.

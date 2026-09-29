@@ -137,18 +137,17 @@ fn message_room(msg: &ControlMessage) -> Option<RoomId> {
 
 /// A change that speaks for one particular member: accepted only from that member.
 fn speaks_for_a_member(change: &ChangeRequest) -> bool {
-    matches!(
-        change,
-        ChangeRequest::UpdateMember(_) | ChangeRequest::SetMicEnabled { .. }
-    )
+    matches!(change, ChangeRequest::UpdateMember(_))
 }
 
 /// Whether member `from` may make `change` (see the trust model in the module docs).
 fn permitted(change: &ChangeRequest, from: PeerId) -> bool {
     match change {
         ChangeRequest::UpdateMember(info) => info.id == from,
-        ChangeRequest::SetMicEnabled { peer, .. } => *peer == from,
-        ChangeRequest::SetCoordinator(_)
+        // Choosing which room mics are used is a room control, like picking the speaker: any
+        // member may switch any member's mic (removing a member is already open to all).
+        ChangeRequest::SetMicEnabled { .. }
+        | ChangeRequest::SetCoordinator(_)
         | ChangeRequest::SetSpeaker(_)
         | ChangeRequest::RemoveMember(_)
         | ChangeRequest::Rename(_) => true,
@@ -2465,43 +2464,27 @@ mod tests {
     }
 
     #[test]
-    fn members_may_only_switch_their_own_mic() {
+    fn any_member_may_switch_any_members_mic() {
+        // Room mic selection is a room control (the plan's per-member mic toggle).
         let mut n = room(&[1, 2, 3]);
-        let cur = n.converged(&[1, 2, 3]);
-        let now = n.now;
-        let req = |peer| ControlMessage::Request {
-            room_id: cur.room_id,
-            epoch: cur.epoch,
-            change: ChangeRequest::SetMicEnabled {
-                peer: PeerId(peer),
+        n.cmd(
+            2,
+            Command::SetMicEnabled {
+                peer: PeerId(3),
                 enabled: false,
             },
-        };
-        let e1 = coordinator(&mut n);
-        e1.on_message(now, PeerId(2), req(3));
-        assert_eq!(e1.manifest(), Some(&cur), "2 can't switch 3's mic");
-        e1.on_message(now, PeerId(2), req(2));
-        assert!(
-            !e1.manifest()
-                .unwrap()
-                .member(PeerId(2))
-                .unwrap()
-                .mic_enabled
         );
-        // Locally, even the coordinator can't switch someone else's mic.
-        assert_eq!(
-            e1.command(
-                now,
-                Command::SetMicEnabled {
-                    peer: PeerId(3),
-                    enabled: false,
-                },
-            ),
-            Err(RoomError::NotPermitted)
+        let m = n.converged(&[1, 2, 3]);
+        assert!(!m.member(PeerId(3)).unwrap().mic_enabled);
+        n.cmd(
+            1,
+            Command::SetMicEnabled {
+                peer: PeerId(3),
+                enabled: true,
+            },
         );
         assert!(
-            e1.manifest()
-                .unwrap()
+            n.converged(&[1, 2, 3])
                 .member(PeerId(3))
                 .unwrap()
                 .mic_enabled
