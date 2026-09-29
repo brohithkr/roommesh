@@ -4,13 +4,18 @@ struct MemberPicker: View {
     let title: String
     let selection: String?
     let members: [FfiMember]
+    /// Members without the RoomMesh driver are shown as "(no driver)" and can't be picked.
+    var requiresDriver = false
     let onSelect: (String) -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title).font(.caption).foregroundStyle(.secondary)
             Picker(title, selection: Binding(get: { selection ?? "" }, set: { if !$0.isEmpty { onSelect($0) } })) {
                 if selection == nil { Text("None").tag("") }
-                ForEach(members, id: \.id) { m in Text(m.name).tag(m.id) }
+                ForEach(members, id: \.id) { m in
+                    let unavailable = requiresDriver && !m.driverInstalled
+                    Text(unavailable ? "\(m.name) (no driver)" : m.name).tag(m.id).disabled(unavailable)
+                }
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -30,7 +35,8 @@ struct RoomView: View {
                         .font(.subheadline)
                     Text("\(model.connectedCount) \(model.connectedCount == 1 ? "Mac" : "Macs")").foregroundStyle(.secondary)
                 }
-                MemberPicker(title: "Coordinator", selection: room.coordinator, members: room.members.filter(\.online)) { model.setCoordinator($0) }
+                MemberPicker(title: "Coordinator", selection: room.coordinator, members: room.members.filter(\.online),
+                             requiresDriver: true) { model.setCoordinator($0) }
                 MemberPicker(title: "Room Speaker", selection: room.speaker, members: room.members.filter(\.online)) { model.setSpeaker($0) }
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Active Microphone").font(.caption).foregroundStyle(.secondary)

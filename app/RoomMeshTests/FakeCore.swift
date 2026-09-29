@@ -38,8 +38,10 @@ final class FakeCore: RoomMeshCoreProtocol, @unchecked Sendable {
     func virtualDeviceAvailable() -> Bool { true }
 }
 
-func member(_ id: String, _ name: String, local: Bool = false, coord: Bool = false, speaker: Bool = false, active: Bool = false, online: Bool = true) -> FfiMember {
-    FfiMember(id: id, name: name, isLocal: local, online: online, micEnabled: true, isCoordinator: coord, isSpeaker: speaker, isActiveMic: active)
+func member(_ id: String, _ name: String, local: Bool = false, coord: Bool = false, speaker: Bool = false, active: Bool = false, online: Bool = true,
+            driver: Bool = true) -> FfiMember {
+    FfiMember(id: id, name: name, isLocal: local, online: online, micEnabled: true, isCoordinator: coord, isSpeaker: speaker, isActiveMic: active,
+              driverInstalled: driver)
 }
 func sampleRoom() -> FfiRoomState {
     FfiRoomState(roomId: "00000000000000ff", name: "Conference Room", epoch: 1, coordinator: "000000000000000a",

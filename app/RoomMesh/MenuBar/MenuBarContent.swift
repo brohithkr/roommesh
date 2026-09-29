@@ -11,8 +11,10 @@ struct MenuBarContent: View {
             Divider()
             Menu("Coordinator: \(model.coordinatorName ?? "—")") {
                 ForEach(room.members, id: \.id) { m in
-                    Toggle(m.name, isOn: Binding(get: { m.isCoordinator }, set: { if $0 { model.setCoordinator(m.id) } }))
-                        .disabled(!m.online)
+                    // A Mac without the RoomMesh driver can't coordinate.
+                    Toggle(m.driverInstalled ? m.name : "\(m.name) (no driver)",
+                           isOn: Binding(get: { m.isCoordinator }, set: { if $0 { model.setCoordinator(m.id) } }))
+                        .disabled(!m.online || !m.driverInstalled)
                 }
             }
             Menu("Room Speaker: \(model.speakerName ?? "None")") {

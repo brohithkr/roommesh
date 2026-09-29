@@ -333,6 +333,7 @@ impl RoomEngine {
                     is_coordinator: x.id == m.coordinator,
                     is_speaker: m.speaker == Some(x.id),
                     is_active_mic: self.active.0 == Some(x.id) || self.active.1 == Some(x.id),
+                    driver_installed: x.capabilities.driver_installed,
                 })
                 .collect(),
         })
@@ -1986,6 +1987,34 @@ mod tests {
         n.engines.get_mut(&PeerId(2)).unwrap().set_local_info(info);
         n.advance(2_000);
         assert_eq!(n.converged(&[1, 2, 3]).version(), v);
+    }
+
+    #[test]
+    fn snapshot_reports_whether_each_member_has_the_driver() {
+        let mut n = room(&[1, 2]);
+        n.engines
+            .get_mut(&PeerId(2))
+            .unwrap()
+            .set_local_info(MemberInfo {
+                id: PeerId(2),
+                name: "Mac 2".into(),
+                mic_enabled: true,
+                capabilities: Capabilities {
+                    driver_installed: false,
+                    ..Capabilities::full()
+                },
+            });
+        n.pump();
+        let snap = n.engines[&PeerId(1)].snapshot().unwrap();
+        let driver = |id| {
+            snap.members
+                .iter()
+                .find(|m| m.id == PeerId(id))
+                .unwrap()
+                .driver_installed
+        };
+        assert!(driver(1));
+        assert!(!driver(2));
     }
 
     #[test]

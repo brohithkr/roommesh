@@ -20,6 +20,8 @@ pub struct MemberSnapshot {
     pub is_coordinator: bool,
     pub is_speaker: bool,
     pub is_active_mic: bool,
+    /// The member has the RoomMesh audio driver installed (without it, it can't coordinate).
+    pub driver_installed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

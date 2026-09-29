@@ -84,6 +84,8 @@ pub struct FfiMember {
     pub is_coordinator: bool,
     pub is_speaker: bool,
     pub is_active_mic: bool,
+    /// The Mac has the RoomMesh audio driver installed; one without it can't coordinate.
+    pub driver_installed: bool,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -248,6 +250,7 @@ fn room(s: RoomSnapshot) -> FfiRoomState {
                 is_coordinator: m.is_coordinator,
                 is_speaker: m.is_speaker,
                 is_active_mic: m.is_active_mic,
+                driver_installed: m.driver_installed,
             })
             .collect(),
     }
@@ -723,6 +726,35 @@ mod tests {
         assert_eq!(
             FfiError::Internal.to_string(),
             "RoomMesh stopped unexpectedly — restart the app"
+        );
+        let member = |id, driver_installed| crate::room::events::MemberSnapshot {
+            id: PeerId(id),
+            name: format!("Mac {id}"),
+            is_local: id == 1,
+            online: true,
+            mic_enabled: true,
+            is_coordinator: id == 1,
+            is_speaker: false,
+            is_active_mic: false,
+            driver_installed,
+        };
+        let r = room(RoomSnapshot {
+            room_id: RoomId(9),
+            name: "R".into(),
+            epoch: crate::ids::Epoch(1),
+            revision: 0,
+            coordinator: PeerId(1),
+            speaker: None,
+            active_primary: None,
+            active_secondary: None,
+            members: vec![member(1, true), member(2, false)],
+        });
+        assert_eq!(
+            r.members
+                .iter()
+                .map(|m| m.driver_installed)
+                .collect::<Vec<_>>(),
+            vec![true, false]
         );
         assert!(parse_peer("00000000000000AB").is_err());
         assert_eq!(parse_peer("00000000000000ab").unwrap(), PeerId(0xab));
