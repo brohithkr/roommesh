@@ -27,9 +27,8 @@
 //!
 //! Trust model: every member is trusted with the room's roles. Any member may invite, remove
 //! members, pick the coordinator or the speaker, and rename the room. Changes that speak for a
-//! particular member (its name and capabilities, and whether its mic is used) are accepted only
-//! from that member itself, and only directly (a relayed one would be indistinguishable from a
-//! forged one).
+//! particular member (its name and capabilities) are accepted only from that member itself, and
+//! only directly (a relayed one would be indistinguishable from a forged one).
 use crate::ids::{PeerId, RoomId};
 use crate::room::election::{elect_coordinator, speaker_candidates};
 use crate::room::events::*;
@@ -89,8 +88,8 @@ pub enum RoomError {
     NoSuchInvite,
     #[error("peer is not a room member")]
     NotMember,
-    /// The change speaks for another member (for example switching its mic), which only that
-    /// member may do.
+    /// The change speaks for another member (its name or capabilities), which only that member
+    /// may do.
     #[error("only that member may make this change")]
     NotPermitted,
     /// The core's control thread did not take the command in time (busy, or called

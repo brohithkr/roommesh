@@ -21,7 +21,7 @@ pub enum FfiError {
     NoSuchInvite,
     #[error("That Mac is not a member of the room")]
     NotMember,
-    /// The change speaks for another Mac (for example its microphone), which only that Mac may
+    /// The change speaks for another Mac (its name or capabilities), which only that Mac may
     /// make.
     #[error("Only that Mac can change this")]
     NotPermitted,
