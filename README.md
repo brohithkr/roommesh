@@ -273,3 +273,19 @@ Installer volume. It removes the app, the driver and the installer receipts, the
 
 4. Optionally, remove its settings: `defaults delete io.github.brohithkr.RoomMesh`. A second-instance
    profile has its own domain, for example `io.github.brohithkr.RoomMesh.b`.
+
+## License
+
+RoomMesh is free software, licensed under the [GNU General Public License v3.0](LICENSE)
+(GPL-3.0). It builds on third-party components under permissive licenses that are compatible
+with GPL-3.0:
+
+- [libASPL](https://github.com/gavv/libASPL) (the driver's HAL plug-in framework): MIT
+- [WebRTC Audio Processing](https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing)
+  (echo cancellation and noise suppression): BSD-3-Clause
+- [libopus](https://opus-codec.org): BSD-3-Clause
+- [UniFFI](https://github.com/mozilla/uniffi-rs) (the Rust ↔ Swift bindings): MPL-2.0
+- [cpal](https://github.com/RustAudio/cpal) (audio device access): Apache-2.0
+
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists them with their copyright notices, along
+with the other Rust crates the core depends on.
