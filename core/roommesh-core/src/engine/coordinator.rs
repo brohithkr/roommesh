@@ -50,6 +50,18 @@ impl Default for CoordinatorConfig {
     }
 }
 
+/// The per-mic processing ahead of the VAD: WebRTC AEC (with noise suppression when enabled),
+/// or nothing when echo cancellation is off.
+pub fn make_echo_canceller(cfg: &CoordinatorConfig) -> Box<dyn EchoCanceller> {
+    if cfg.use_webrtc_aec {
+        match WebRtcAec::new(cfg.noise_suppression) {
+            Ok(a) => return Box::new(a),
+            Err(e) => log::error!("webrtc aec unavailable, echo will pass: {e}"),
+        }
+    }
+    Box::new(PassthroughAec)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MicStatus {
     pub peer: PeerId,
@@ -135,16 +147,6 @@ impl CoordinatorPipeline {
         self.cfg.arbitration = a;
     }
 
-    fn make_aec(&self) -> Box<dyn EchoCanceller> {
-        if self.cfg.use_webrtc_aec {
-            match WebRtcAec::new(self.cfg.noise_suppression) {
-                Ok(a) => return Box::new(a),
-                Err(e) => log::error!("webrtc aec unavailable, echo will pass: {e}"),
-            }
-        }
-        Box::new(PassthroughAec)
-    }
-
     pub fn set_enabled_mics(&mut self, mics: &[PeerId]) {
         self.mics.retain(|p, _| mics.contains(p));
         for &p in mics {
@@ -161,7 +163,7 @@ impl CoordinatorPipeline {
                     StreamReceiver::new().ok()
                 },
                 local: is_local.then(|| TimelineReader::new(SAMPLE_RATE, 3.0)),
-                aec: self.make_aec(),
+                aec: make_echo_canceller(&self.cfg),
                 vad,
                 scorer: MicScorer::new(),
                 env: EnvelopeTracker::new(50),

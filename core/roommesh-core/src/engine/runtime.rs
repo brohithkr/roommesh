@@ -6,6 +6,10 @@
 //! mic frames on a host-time 10 ms grid into the mic ring → (speaker) keep the physical output
 //! queue topped up → metrics every 250 ms.
 //!
+//! While the Settings UI asks for it, a mic meter ([`MeterChain`]) also runs on every captured
+//! frame and publishes a [`MicMeter`] reading in [`RuntimeShared::mic_meter`]; with the meter on,
+//! the mic is captured even outside a room (as long as audio is enabled).
+//!
 //! The DSP thread never waits on device opens (they are requested and polled), never blocks on
 //! the metrics book (`try_lock`), and only takes the short-held sessions read lock.
 //!
@@ -25,7 +29,9 @@ use crate::audio::frames::{FRAME_NS, NS_PER_SAMPLE, SAMPLE_RATE};
 use crate::audio::shared_layout::SHM_NAME;
 use crate::audio::virtual_device::{MicWriter, SharedRegion, SpeakerReader, VirtualDeviceError};
 use crate::dsp::arbitration::Selection;
+use crate::dsp::vad::DEFAULT_NOISE_BASELINE_DB;
 use crate::engine::coordinator::{CoordinatorConfig, CoordinatorPipeline};
+use crate::engine::meter::{MeterChain, MicMeter};
 use crate::engine::metrics::{stream_jitter_ms, stream_loss_pct, MetricsBook};
 use crate::engine::speaker::SpeakerPipeline;
 use crate::engine::uplink::{FrameAssembler, MicUplink};
@@ -113,6 +119,9 @@ pub struct AudioSettings {
     pub output: DeviceSelector,
     pub coordinator: CoordinatorConfig,
     pub mic_bitrate_bps: i32,
+    /// This Mac's mic noise baseline, used by the local mic meter (the coordinator gets every
+    /// mic's baseline from the room manifest instead).
+    pub noise_baseline_db: Option<f32>,
 }
 impl Default for AudioSettings {
     fn default() -> Self {
@@ -121,6 +130,7 @@ impl Default for AudioSettings {
             output: DeviceSelector::Default,
             coordinator: CoordinatorConfig::default(),
             mic_bitrate_bps: 48_000,
+            noise_baseline_db: DEFAULT_NOISE_BASELINE_DB,
         }
     }
 }
@@ -224,6 +234,8 @@ pub enum RuntimeMsg {
     Settings(AudioSettings),
     Mute(bool),
     SetEnabled(bool),
+    /// Runs the local mic meter (see [`RuntimeShared::mic_meter`]).
+    SetMeter(bool),
     Packet {
         header: RtHeader,
         payload: Vec<u8>,
@@ -290,6 +302,9 @@ pub struct RuntimeShared {
     pub local_report: Mutex<Option<PeerReport>>,
     /// The driver region is mapped and its heartbeat is fresh (maintained on every Mac).
     pub virtual_device_ok: AtomicBool,
+    /// The local mic meter's latest reading, updated every captured frame while the meter is
+    /// on; `None` while it is off or before the first frame.
+    pub mic_meter: Mutex<Option<MicMeter>>,
 }
 
 pub struct AudioRuntime {
@@ -678,6 +693,8 @@ struct Dsp {
     uplink: Option<MicUplink>,
     speaker: Option<SpeakerPipeline>,
     coord: Option<CoordState>,
+    /// The local mic meter, while it is on.
+    meter: Option<MeterChain>,
     last_metrics_ns: u64,
     last_aec: bool,
     /// Peers whose mic metrics this runtime wrote into the book last round.
@@ -732,6 +749,7 @@ impl Dsp {
             uplink,
             speaker,
             coord: None,
+            meter: None,
             last_metrics_ns: 0,
             last_aec: false,
             mic_metric_peers: BTreeSet::new(),
@@ -745,6 +763,11 @@ impl Dsp {
 
     fn active(&self) -> bool {
         self.enabled && self.roles.room_id.is_some()
+    }
+
+    /// The mic meter runs (it needs audio enabled, but not a room).
+    fn metering(&self) -> bool {
+        self.enabled && self.meter.is_some()
     }
 
     /// `control`: lossless control queue, always drained before `packets` (realtime traffic).
@@ -802,6 +825,15 @@ impl Dsp {
             RuntimeMsg::Roles(r) => self.apply_roles(r),
             RuntimeMsg::Settings(s) => self.apply_settings(s),
             RuntimeMsg::Mute(m) => self.muted = m,
+            RuntimeMsg::SetMeter(on) => {
+                if on != self.meter.is_some() {
+                    self.meter = on.then(|| self.new_meter());
+                    if !on {
+                        *self.shared.mic_meter.lock() = None;
+                    }
+                    self.reconcile(now_ns());
+                }
+            }
             RuntimeMsg::SetEnabled(e) => {
                 if e != self.enabled {
                     self.enabled = e;
@@ -858,8 +890,15 @@ impl Dsp {
         }
     }
 
+    fn new_meter(&self) -> MeterChain {
+        MeterChain::new(&self.settings.coordinator, self.settings.noise_baseline_db)
+    }
+
     fn apply_settings(&mut self, s: AudioSettings) {
         let devices_changed = s.input != self.settings.input || s.output != self.settings.output;
+        let meter_changed = devices_changed
+            || s.coordinator.use_webrtc_aec != self.settings.coordinator.use_webrtc_aec
+            || s.coordinator.noise_suppression != self.settings.coordinator.noise_suppression;
         // Anything but arbitration needs a fresh pipeline (AEC instances, latencies, encoder).
         let pipeline_changed = CoordinatorConfig {
             arbitration: self.settings.coordinator.arbitration.clone(),
@@ -886,6 +925,13 @@ impl Dsp {
             }
         }
         self.settings = s;
+        if let Some(m) = self.meter.as_mut() {
+            if meter_changed {
+                *m = MeterChain::new(&self.settings.coordinator, self.settings.noise_baseline_db);
+            } else {
+                m.set_baseline(self.settings.noise_baseline_db);
+            }
+        }
         if devices_changed {
             self.stop_devices();
         }
@@ -910,6 +956,7 @@ impl Dsp {
     fn stop_all(&mut self) {
         self.stop_devices();
         self.drop_coord();
+        *self.shared.mic_meter.lock() = None;
     }
 
     /// Coordinator teardown: the mic writer's drop silences RoomMesh Microphone at once.
@@ -992,7 +1039,7 @@ impl Dsp {
     }
 
     fn reconcile_capture(&mut self, now: u64) {
-        let want = self.active() && self.roles.mic_enabled;
+        let want = (self.active() && self.roles.mic_enabled) || self.metering();
         let slot = &mut self.capture;
         if !want {
             if slot.clear() {
@@ -1181,12 +1228,20 @@ impl Dsp {
             .virtual_device_ok
             .store(self.vdev.ok(now), Ordering::Relaxed);
         if !active {
+            if self.metering() {
+                // Outside a room: only the meter's capture.
+                self.device_errors(now);
+                self.reconcile_devices(now);
+                self.capture_step(now);
+                self.clear_stale_meter();
+            }
             return;
         }
         self.device_errors(now);
         self.reconcile_devices(now);
         self.clock_sync(now);
         self.capture_step(now);
+        self.clear_stale_meter();
         self.coordinator_step(now);
         self.speaker_step(now);
         if now.saturating_sub(self.last_metrics_ns) >= METRICS_INTERVAL_NS {
@@ -1233,6 +1288,15 @@ impl Dsp {
             };
     }
 
+    /// No capture (closed, or reopening): the last reading no longer describes the mic.
+    fn clear_stale_meter(&mut self) {
+        if self.meter.is_some() && self.capture.running.is_none() {
+            if let Some(mut m) = self.shared.mic_meter.try_lock() {
+                *m = None;
+            }
+        }
+    }
+
     fn capture_step(&mut self, now: u64) {
         let Some(cap) = self.capture.running.as_mut() else {
             return;
@@ -1264,7 +1328,18 @@ impl Dsp {
         while let Some(frame) = cap.fa.pop_frame() {
             let stale = frame.timestamp_ns < oldest;
             newest_stale = Some(stale);
-            if self.muted || stale {
+            if stale {
+                continue;
+            }
+            // The meter is local only, so it reads the mic while muted too.
+            if let Some(m) = self.meter.as_mut() {
+                let reading = m.process(&frame.samples);
+                // Skip this frame's reading rather than wait if a reader holds the lock.
+                if let Some(mut slot) = self.shared.mic_meter.try_lock() {
+                    *slot = Some(reading);
+                }
+            }
+            if self.muted {
                 continue;
             }
             if let Some(cs) = self.coord.as_mut() {
@@ -2052,6 +2127,18 @@ mod tests {
             };
             let _ = self.mic.lock().as_mut().expect("mic open").push(b);
         }
+        /// Queues one 10 ms capture block of `samples` (480 of them).
+        fn mic_block_with(&self, index: u64, capture_ns: u64, samples: &[f32]) {
+            use crate::audio::device_io::{CaptureBlock, BLOCK_FRAMES};
+            let mut b = CaptureBlock {
+                first_frame: index,
+                capture_ns,
+                len: samples.len() as u16,
+                samples: [0.0; BLOCK_FRAMES],
+            };
+            b.samples[..samples.len()].copy_from_slice(samples);
+            let _ = self.mic.lock().as_mut().expect("mic open").push(b);
+        }
         fn report(&self) {
             let r = crate::audio::device_io::PlaybackReport::default();
             let _ = self.reports.lock().as_mut().expect("speaker open").push(r);
@@ -2092,6 +2179,127 @@ mod tests {
         fn open_virtual_device(&mut self) -> Result<Arc<SharedRegion>, VirtualDeviceError> {
             Err(VirtualDeviceError::NotFound(libc::ENOENT))
         }
+    }
+
+    /// A 10 ms frame at `db` dBFS RMS.
+    fn tone(db: f32) -> Vec<f32> {
+        let a = 10f32.powf(db / 20.0);
+        (0..480).map(|i| if i % 2 == 0 { a } else { -a }).collect()
+    }
+    /// Feeds `frames` 10 ms frames at `db` from `*t` on, stepping after each.
+    fn feed(d: &mut Dsp, fake: &FakeDevices, idx: &mut u64, t: &mut u64, db: f32, frames: u64) {
+        for _ in 0..frames {
+            fake.mic_block_with(*idx, *t, &tone(db));
+            *idx += 480;
+            *t += 10 * MS;
+            d.step(*t);
+        }
+    }
+    fn meter(d: &Dsp) -> Option<crate::engine::meter::MicMeter> {
+        *d.shared.mic_meter.lock()
+    }
+
+    #[test]
+    fn meter_reports_the_local_level_outside_a_room() {
+        let fake = FakeDevices::default();
+        let (mut d, _ev) = dsp(2, Box::new(fake.clone()));
+        d.handle(RuntimeMsg::SetEnabled(true)); // not in a room: no capture
+        assert_eq!(fake.opens().0, 0);
+        d.handle(RuntimeMsg::SetMeter(true));
+        assert_eq!(fake.opens().0, 1, "the meter opens the mic");
+        assert_eq!(meter(&d), None, "no capture yet");
+        let (mut idx, mut t) = (0, now_ns());
+        feed(&mut d, &fake, &mut idx, &mut t, -45.0, 50);
+        let m = meter(&d).expect("a reading");
+        assert!((m.level_db + 45.0).abs() < 0.5, "{m:?}");
+        assert_eq!(m.floor_db, m.auto_floor_db);
+        assert_eq!(m.perceived_db, (m.level_db - m.floor_db).max(0.0));
+        assert!(m.peak_db >= m.level_db);
+        // Louder: the reading follows (within the assembler's lookahead).
+        feed(&mut d, &fake, &mut idx, &mut t, -25.0, 3);
+        let m = meter(&d).unwrap();
+        assert!((m.level_db + 25.0).abs() < 0.5, "{m:?}");
+        assert!(m.perceived_db > 15.0, "{m:?}");
+    }
+
+    #[test]
+    fn disabling_the_meter_stops_updates_and_closes_an_unneeded_mic() {
+        let fake = FakeDevices::default();
+        let (mut d, _ev) = dsp(2, Box::new(fake.clone()));
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::SetMeter(true));
+        let (mut idx, mut t) = (0, now_ns());
+        feed(&mut d, &fake, &mut idx, &mut t, -45.0, 10);
+        assert!(meter(&d).is_some());
+        d.handle(RuntimeMsg::SetMeter(false));
+        assert_eq!(meter(&d), None);
+        assert!(d.capture.running.is_none(), "not in a room: the mic closes");
+        assert!(d.meter.is_none(), "no extra processing while disabled");
+        for _ in 0..10 {
+            t += 10 * MS;
+            d.step(t);
+        }
+        assert_eq!(meter(&d), None);
+        // In a room with the mic on, capture stays open for the uplink.
+        d.handle(RuntimeMsg::Roles(roles(1, 1, 2)));
+        d.handle(RuntimeMsg::SetMeter(true));
+        assert_eq!(fake.opens().0, 2);
+        feed(&mut d, &fake, &mut idx, &mut t, -45.0, 5);
+        assert!(meter(&d).is_some());
+        d.handle(RuntimeMsg::SetMeter(false));
+        assert!(d.capture.running.is_some());
+        feed(&mut d, &fake, &mut idx, &mut t, -45.0, 5);
+        assert_eq!(meter(&d), None);
+    }
+
+    #[test]
+    fn the_meter_is_off_while_audio_is_disabled() {
+        let fake = FakeDevices::default();
+        let (mut d, _ev) = dsp(2, Box::new(fake.clone()));
+        d.handle(RuntimeMsg::SetMeter(true));
+        assert_eq!(
+            fake.opens().0,
+            0,
+            "audio engine stopped: nothing opens the mic"
+        );
+        d.handle(RuntimeMsg::SetEnabled(true));
+        assert_eq!(fake.opens().0, 1);
+    }
+
+    #[test]
+    fn a_baseline_from_the_settings_shows_up_in_the_meter_floor() {
+        let fake = FakeDevices::default();
+        let (mut d, _ev) = dsp(2, Box::new(fake.clone()));
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::SetMeter(true));
+        let (mut idx, mut t) = (0, now_ns());
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 20);
+        let auto = meter(&d).unwrap().auto_floor_db;
+        d.handle(RuntimeMsg::Settings(AudioSettings {
+            noise_baseline_db: Some(-40.0),
+            ..d.settings.clone()
+        }));
+        assert_eq!(
+            fake.opens().0,
+            1,
+            "a baseline change doesn't reopen the mic"
+        );
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 3);
+        let m = meter(&d).unwrap();
+        assert_eq!(m.floor_db, -40.0);
+        assert_eq!(m.perceived_db, 0.0);
+        assert!(!m.is_speech);
+        assert!((m.auto_floor_db - auto).abs() < 1.0, "{m:?}");
+        // The meter keeps its state across a baseline change.
+        d.handle(RuntimeMsg::Settings(AudioSettings {
+            noise_baseline_db: None,
+            ..d.settings.clone()
+        }));
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 1);
+        assert_eq!(
+            meter(&d).unwrap().floor_db,
+            meter(&d).unwrap().auto_floor_db
+        );
     }
 
     #[test]

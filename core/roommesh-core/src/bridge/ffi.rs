@@ -1,6 +1,8 @@
 //! UniFFI surface for the Swift app. Ids cross the boundary as 16-char lowercase hex strings.
 use crate::audio::device_io::{list_devices, DeviceSelector};
+use crate::dsp::vad::sanitize_baseline;
 use crate::engine::facade::{Core, CoreConfig, EventSink};
+use crate::engine::meter::MicMeter;
 use crate::engine::metrics::PeerMetrics;
 use crate::engine::runtime::{AudioSettings, SystemAudio};
 use crate::ids::{PeerId, RoomId};
@@ -152,6 +154,35 @@ pub struct FfiSettings {
     /// This Mac's mic noise baseline in dBFS (after processing); anything at or below it is
     /// never speech. `None` = Automatic (the VAD's own floor).
     pub noise_baseline_db: Option<f32>,
+}
+
+/// A live reading of this Mac's mic as the room judges it (see `get_mic_meter`). dBFS.
+#[derive(uniffi::Record, Clone, Copy, Debug, PartialEq)]
+pub struct FfiMicMeter {
+    /// Level after the room's processing (echo cancellation, noise suppression).
+    pub level_db: f32,
+    /// The effective noise floor: the automatic floor, raised to the baseline when one is set.
+    pub floor_db: f32,
+    /// `max(0, level_db - floor_db)`.
+    pub perceived_db: f32,
+    pub is_speech: bool,
+    /// Recent peak level (decays at 20 dB/s).
+    pub peak_db: f32,
+    /// The floor Automatic would use.
+    pub auto_floor_db: f32,
+}
+
+impl From<MicMeter> for FfiMicMeter {
+    fn from(m: MicMeter) -> Self {
+        Self {
+            level_db: m.level_db,
+            floor_db: m.floor_db,
+            perceived_db: m.perceived_db,
+            is_speech: m.is_speech,
+            peak_db: m.peak_db,
+            auto_floor_db: m.auto_floor_db,
+        }
+    }
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
@@ -351,6 +382,7 @@ pub fn audio_settings(s: &FfiSettings) -> AudioSettings {
     let mut a = AudioSettings {
         input: selector(&s.input_device),
         output: selector(&s.output_device),
+        noise_baseline_db: sanitize_baseline(s.noise_baseline_db),
         ..Default::default()
     };
     a.coordinator.arbitration.allow_multi = s.allow_simultaneous_talkers;
@@ -579,6 +611,16 @@ impl RoomMeshCore {
         );
         self.core.set_noise_baseline(settings.noise_baseline_db);
     }
+    /// Runs the live mic meter for the Settings UI; turn it off when the UI goes away (it costs
+    /// an extra echo canceller). While on, the mic is captured even outside a room.
+    pub fn set_mic_meter_enabled(&self, enabled: bool) {
+        self.core.set_mic_meter_enabled(enabled);
+    }
+    /// The meter's latest reading (updated every 10 ms): `None` while the meter is off or
+    /// before the mic delivers audio.
+    pub fn get_mic_meter(&self) -> Option<FfiMicMeter> {
+        self.core.mic_meter().map(FfiMicMeter::from)
+    }
     pub fn set_local_info(&self, name: String, driver_installed: bool) {
         self.core
             .set_local_info(name, capabilities(driver_installed));
@@ -660,6 +702,7 @@ mod tests {
         assert_eq!(a.output, DeviceSelector::Default);
         assert!(a.coordinator.arbitration.allow_multi);
         assert!(!a.coordinator.use_webrtc_aec);
+        assert_eq!(a.noise_baseline_db, None);
         assert_eq!(a.coordinator.mic_latency_ns, 70_000_000);
         assert_eq!(a.coordinator.playout_delay_ns, 90_000_000);
     }
@@ -710,6 +753,12 @@ mod tests {
         assert_eq!(a.coordinator.mic_latency_ns, 30_000_000);
         assert_eq!(a.coordinator.playout_delay_ns, 300_000_000);
         assert!(!a.coordinator.noise_suppression);
+        assert_eq!(a.noise_baseline_db, Some(-55.0));
+        let nan = FfiSettings {
+            noise_baseline_db: Some(f32::NAN),
+            ..s.clone()
+        };
+        assert_eq!(audio_settings(&nan).noise_baseline_db, None);
         assert!(matches!(
             FfiError::from(RoomError::NotMember),
             FfiError::NotMember

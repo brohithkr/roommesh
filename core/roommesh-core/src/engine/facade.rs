@@ -21,6 +21,7 @@
 //! has outstanding with the same t1 (once). Pings themselves pass a per-sender replay window
 //! (scoped to the session key and epoch; older epochs are rejected) before they are answered.
 use crate::dsp::vad::{sanitize_baseline, DEFAULT_NOISE_BASELINE_DB};
+use crate::engine::meter::MicMeter;
 use crate::engine::metrics::{merge_local_report, PeerMetrics};
 use crate::engine::runtime::{
     AudioBackend, AudioRuntime, AudioSettings, RuntimeEvent, RuntimeMsg, RuntimeSender,
@@ -148,6 +149,7 @@ pub struct Core {
     runtime_shared: Arc<RuntimeShared>,
     cache: Arc<Cache>,
     muted: AtomicBool,
+    meter_enabled: AtomicBool,
     /// Sequence numbers of the clock pongs we seal (see module docs).
     pong_seq: AtomicU32,
 }
@@ -319,6 +321,7 @@ impl Core {
             runtime_shared,
             cache,
             muted: AtomicBool::new(false),
+            meter_enabled: AtomicBool::new(false),
             pong_seq: AtomicU32::new(0),
         }
     }
@@ -502,6 +505,19 @@ impl Core {
     }
     pub fn stop_audio(&self) {
         self.runtime.send(RuntimeMsg::SetEnabled(false));
+    }
+    /// Runs the local mic meter (only while enabled: it costs an extra echo canceller). With
+    /// audio started it captures the mic even outside a room.
+    pub fn set_mic_meter_enabled(&self, enabled: bool) {
+        self.meter_enabled.store(enabled, Ordering::Relaxed);
+        self.runtime.send(RuntimeMsg::SetMeter(enabled));
+    }
+    /// The meter's latest reading: `None` while it is disabled or before the mic delivers.
+    pub fn mic_meter(&self) -> Option<MicMeter> {
+        if !self.meter_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        *self.runtime_shared.mic_meter.lock()
     }
     pub fn update_audio_settings(&self, s: AudioSettings) {
         self.runtime.send(RuntimeMsg::Settings(s));
@@ -1041,6 +1057,31 @@ mod tests {
         wait("the baseline cleared", 5, || {
             host.core.roles().mic_baselines.is_empty()
         });
+    }
+
+    #[test]
+    fn the_mic_meter_reads_nothing_while_disabled() {
+        let net = LoopbackNetwork::new();
+        let n = node(&net, 1, Box::new(NullAudio));
+        let reading = MicMeter {
+            level_db: -50.0,
+            floor_db: -55.0,
+            perceived_db: 5.0,
+            is_speech: false,
+            peak_db: -48.0,
+            auto_floor_db: -55.0,
+        };
+        // A reading left behind (the DSP clears it asynchronously) is never served.
+        *n.core.runtime_shared.mic_meter.lock() = Some(reading);
+        assert_eq!(n.core.mic_meter(), None);
+        n.core.start_audio();
+        n.core.set_mic_meter_enabled(true);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(n.core.mic_meter(), None, "NullAudio never delivers a frame");
+        *n.core.runtime_shared.mic_meter.lock() = Some(reading);
+        assert_eq!(n.core.mic_meter(), Some(reading));
+        n.core.set_mic_meter_enabled(false);
+        assert_eq!(n.core.mic_meter(), None);
     }
 
     #[test]
