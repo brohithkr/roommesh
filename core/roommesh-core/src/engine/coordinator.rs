@@ -607,4 +607,62 @@ mod tests {
         assert_eq!(b.header.sample_index, a.header.sample_index + 480);
         assert_eq!(a.local.timestamp_ns, a.header.timestamp_ns);
     }
+
+    #[test]
+    fn silent_room_with_echo_cancellation_selects_no_talker() {
+        // Every mic hears only steady room noise (about -45 dBFS, a typical laptop mic in a
+        // quiet office). With the real processing chain (WebRTC AEC + noise suppression) no mic
+        // may be judged to be speaking, so the active mic must not move.
+        let cfg = CoordinatorConfig {
+            use_webrtc_aec: true,
+            ..Default::default()
+        };
+        let mut pipe = CoordinatorPipeline::new(PeerId(1), Epoch(1), cfg).unwrap();
+        pipe.set_enabled_mics(&[PeerId(1), PeerId(2), PeerId(3)]);
+        let mut up2 = MicUplink::new(PeerId(2), 64_000).unwrap();
+        let mut up3 = MicUplink::new(PeerId(3), 64_000).unwrap();
+        let room = |n0: u64, gain: f32, salt: u64| -> Vec<f32> {
+            (0..480u64).map(|k| gain * hash((n0 + k) ^ salt)).collect()
+        };
+        let (mut speaking, mut changes, mut last) = (0usize, 0usize, None);
+        let mut t = T0;
+        while t - T0 < 20_000_000_000 {
+            let n0 = idx(t);
+            pipe.push_local_mic(&AudioFrame {
+                sample_index: n0,
+                timestamp_ns: t,
+                samples: room(n0, 0.010, 1 << 40),
+            });
+            for (up, gain, salt) in [(&mut up2, 0.008, 2u64 << 40), (&mut up3, 0.013, 3u64 << 40)] {
+                let f = AudioFrame {
+                    sample_index: n0,
+                    timestamp_ns: t,
+                    samples: room(n0, gain, salt),
+                };
+                let (h, p) = up.packetize(&f, Epoch(1), t).unwrap();
+                pipe.push_remote_mic(h, p, t + 5_000_000);
+            }
+            let out = pipe.produce(t, t);
+            if t - T0 > 1_000_000_000 {
+                speaking += pipe
+                    .statuses()
+                    .iter()
+                    .filter(|s| s.speech_prob > 0.6)
+                    .count();
+                if last.is_some() && out.selection.primary != last {
+                    changes += 1;
+                }
+            }
+            last = out.selection.primary;
+            t += FRAME_NS;
+        }
+        assert_eq!(
+            speaking, 0,
+            "room noise judged to be speech in {speaking} mic-frames"
+        );
+        assert_eq!(
+            changes, 0,
+            "active mic changed {changes} times in a silent room"
+        );
+    }
 }

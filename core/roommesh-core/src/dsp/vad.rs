@@ -3,9 +3,17 @@
 use crate::dsp::level::measure;
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 const FFT_LEN: usize = 512;
+/// Frames quieter than this are digital silence (a processing warm-up, a muted source), not room
+/// noise: they never seed or move the noise floor.
+const DIGITAL_SILENCE_DB: f32 = -90.0;
+/// The noise floor is never below this percentile of the last `FLOOR_WINDOW` frames' levels, so
+/// a dip shorter than about 100 ms can't drag it down and leave steady noise looking like speech.
+const FLOOR_WINDOW: usize = 200;
+const FLOOR_PERCENTILE: f32 = 0.05;
 const BIN_HZ: f32 = 48_000.0 / FFT_LEN as f32;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -24,6 +32,9 @@ pub struct Vad {
     spectrum: Vec<Complex<f32>>,
     /// Reusable scratch buffer for per-bin power, sized to `spectrum` and refilled each call.
     power: Vec<f32>,
+    /// Levels of the last `FLOOR_WINDOW` non-silent frames, and a scratch copy for the percentile.
+    recent_levels: VecDeque<f32>,
+    level_scratch: Vec<f32>,
     noise_floor_db: f32,
     prob: f32,
     hangover: u32,
@@ -52,12 +63,26 @@ impl Vad {
             input,
             spectrum,
             power,
+            recent_levels: VecDeque::with_capacity(FLOOR_WINDOW),
+            level_scratch: Vec::with_capacity(FLOOR_WINDOW),
             noise_floor_db: -60.0,
             prob: 0.0,
             hangover: 0,
             frames: 0,
             speech: false,
         }
+    }
+
+    /// `FLOOR_PERCENTILE` of the recent frame levels: the level room noise alone reaches.
+    fn recent_level_percentile(&mut self) -> f32 {
+        self.level_scratch.clear();
+        self.level_scratch
+            .extend(self.recent_levels.iter().copied());
+        let k = ((self.level_scratch.len() - 1) as f32 * FLOOR_PERCENTILE) as usize;
+        let (_, v, _) = self
+            .level_scratch
+            .select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+        *v
     }
 
     pub fn process(&mut self, frame: &[f32]) -> VadResult {
@@ -111,13 +136,20 @@ impl Vad {
         let total: f32 = power[1..].iter().sum();
         let band_ratio = power[lo..=voice_hi].iter().sum::<f32>() / total;
 
-        if self.frames == 0 {
-            self.noise_floor_db = level_db;
-        } else if level_db < self.noise_floor_db {
-            self.noise_floor_db += 0.2 * (level_db - self.noise_floor_db);
-        } else {
-            let rise: f32 = if self.speech { 0.005 } else { 0.05 };
-            self.noise_floor_db += rise.min(level_db - self.noise_floor_db);
+        if level_db >= DIGITAL_SILENCE_DB {
+            if self.recent_levels.is_empty() {
+                self.noise_floor_db = level_db;
+            } else if level_db < self.noise_floor_db {
+                self.noise_floor_db += 0.2 * (level_db - self.noise_floor_db);
+            } else {
+                let rise: f32 = if self.speech { 0.005 } else { 0.05 };
+                self.noise_floor_db += rise.min(level_db - self.noise_floor_db);
+            }
+            if self.recent_levels.len() == FLOOR_WINDOW {
+                self.recent_levels.pop_front();
+            }
+            self.recent_levels.push_back(level_db);
+            self.noise_floor_db = self.noise_floor_db.max(self.recent_level_percentile());
         }
         self.noise_floor_db = self.noise_floor_db.max(-100.0);
         let snr_db = level_db - self.noise_floor_db;
@@ -217,6 +249,41 @@ mod tests {
             .map(|_| v.process(&noise(&mut rng, -50.0)))
             .collect();
         assert!(after[70..].iter().all(|r| !r.is_speech));
+    }
+    #[test]
+    fn near_silent_first_frame_does_not_seed_the_noise_floor() {
+        // WebRTC's echo canceller emits a near-silent first frame (about -98 dB). Seeding the
+        // floor from it made steady room noise look like 30 dB SNR speech for about a minute.
+        let mut v = Vad::new();
+        let mut rng = Rng(5);
+        v.process(&noise(&mut rng, -98.0));
+        let res: Vec<VadResult> = (0..300)
+            .map(|_| v.process(&noise(&mut rng, -50.0)))
+            .collect();
+        let speech = res[50..].iter().filter(|r| r.is_speech).count();
+        assert_eq!(
+            speech, 0,
+            "steady noise reported as speech in {speech} frames"
+        );
+    }
+    #[test]
+    fn brief_quiet_dip_does_not_make_noise_look_like_speech() {
+        let mut v = Vad::new();
+        let mut rng = Rng(9);
+        for _ in 0..200 {
+            v.process(&noise(&mut rng, -50.0));
+        }
+        for _ in 0..5 {
+            v.process(&noise(&mut rng, -85.0)); // 50 ms dip (processing glitch, AEC mute)
+        }
+        let res: Vec<VadResult> = (0..300)
+            .map(|_| v.process(&noise(&mut rng, -50.0)))
+            .collect();
+        let speech = res.iter().filter(|r| r.is_speech).count();
+        assert_eq!(
+            speech, 0,
+            "steady noise reported as speech in {speech} frames"
+        );
     }
     #[test]
     fn non_finite_frame_is_handled_without_corrupting_state() {
