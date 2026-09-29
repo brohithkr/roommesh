@@ -4,6 +4,12 @@
 //!
 //! Sample slots are accessed as `AtomicU32` (f32 bits, `Relaxed`); ordering between the sample
 //! data and the ring positions comes from the `Release` store / `Acquire` load of `write_pos`.
+//!
+//! Trust: the driver (running inside coreaudiod as `_coreaudiod`) creates the region with mode
+//! 0666, so any local process can map it, read the room audio and write into either ring. We
+//! only open a region owned by `_coreaudiod` (so another user can't create the name first and
+//! feed us their own region), and treat every sample read from it as untrusted: non-finite
+//! samples become silence and the rest are clamped to [-1, 1].
 use crate::audio::shared_layout::*;
 use std::ffi::CString;
 use std::ptr::addr_of_mut;
@@ -20,6 +26,42 @@ pub enum VirtualDeviceError {
     NotReady,
     #[error("system call failed: {0}")]
     Os(i32),
+    #[error("RoomMesh driver shared memory is owned by uid {0}, not _coreaudiod; refusing it")]
+    UntrustedOwner(u32),
+}
+
+/// The uid of the `_coreaudiod` user the driver runs as (202 on current macOS).
+pub fn coreaudiod_uid() -> u32 {
+    const FALLBACK: u32 = 202;
+    // SAFETY: getpwnam returns null or a pointer to a static passwd entry, read immediately.
+    // Only called when (re)opening the region, never from a realtime thread.
+    unsafe {
+        let pw = libc::getpwnam(c"_coreaudiod".as_ptr());
+        if pw.is_null() {
+            FALLBACK
+        } else {
+            (*pw).pw_uid
+        }
+    }
+}
+
+/// Owners we accept for the driver's region: `_coreaudiod`, plus (in this crate's unit tests
+/// only) ourselves, so regions from `create_for_test` can be reopened.
+fn trusted_owners() -> Vec<u32> {
+    #[allow(unused_mut)]
+    let mut v = vec![coreaudiod_uid()];
+    #[cfg(test)]
+    v.push(unsafe { libc::geteuid() });
+    v
+}
+
+/// Replaces NaN/Inf with silence and clamps to [-1, 1].
+fn scrub(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 pub struct SharedRegion {
@@ -57,7 +99,13 @@ unsafe fn store_sample(ring: *mut Ring, pos: u64, v: f32) {
 }
 
 impl SharedRegion {
+    /// Opens the driver's region `name`, refusing one not owned by `_coreaudiod`.
     pub fn open(name: &str) -> Result<Self, VirtualDeviceError> {
+        Self::open_owned_by(name, &trusted_owners())
+    }
+
+    /// [`open`](Self::open), accepting only a region whose owner is one of `owners`.
+    pub fn open_owned_by(name: &str, owners: &[u32]) -> Result<Self, VirtualDeviceError> {
         let c = CString::new(name).map_err(|_| VirtualDeviceError::Incompatible)?;
         unsafe {
             let fd = libc::shm_open(c.as_ptr(), libc::O_RDWR, 0 as libc::c_uint);
@@ -69,6 +117,10 @@ impl SharedRegion {
                 let e = errno();
                 libc::close(fd);
                 return Err(VirtualDeviceError::Os(e));
+            }
+            if !owners.contains(&st.st_uid) {
+                libc::close(fd);
+                return Err(VirtualDeviceError::UntrustedOwner(st.st_uid));
             }
             // Created but not sized yet: the driver is still setting the region up.
             if st.st_size == 0 {
@@ -405,7 +457,7 @@ impl SpeakerReader {
         }
         let first = *cur;
         let samples = (0..n as u64)
-            .map(|i| unsafe { load_sample(ring, first + i) })
+            .map(|i| scrub(unsafe { load_sample(ring, first + i) }))
             .collect();
         *cur += n as u64;
         h.read_pos.store(*cur, Ordering::Release);
@@ -555,9 +607,60 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_a_region_not_owned_by_coreaudiod() {
+        // A region any local user could have created first ("squatting" the driver's name):
+        // only the `_coreaudiod` user's region is trusted outside of tests.
+        let region = SharedRegion::create_for_test().unwrap();
+        let me = unsafe { libc::geteuid() };
+        assert_ne!(me, coreaudiod_uid(), "tests don't run as _coreaudiod");
+        assert!(matches!(
+            SharedRegion::open_owned_by(region.name(), &[coreaudiod_uid()]),
+            Err(VirtualDeviceError::UntrustedOwner(uid)) if uid == me
+        ));
+        assert!(SharedRegion::open_owned_by(region.name(), &[coreaudiod_uid(), me]).is_ok());
+        // `open` itself trusts our own uid only in this crate's unit tests.
+        assert!(SharedRegion::open(region.name()).is_ok());
+    }
+    #[test]
+    fn coreaudiod_uid_is_looked_up_by_name() {
+        let pw = unsafe { libc::getpwnam(c"_coreaudiod".as_ptr()) };
+        let expected = if pw.is_null() {
+            202
+        } else {
+            unsafe { (*pw).pw_uid }
+        };
+        assert_eq!(coreaudiod_uid(), expected);
+    }
+    #[test]
+    fn speaker_reader_scrubs_non_finite_and_out_of_range_samples() {
+        // The ring is writable by any local process (the driver creates it 0666), so what we
+        // read is untrusted input to the DSP and codec.
+        let region = Arc::new(SharedRegion::create_for_test().unwrap());
+        let mut spk = SpeakerReader::new(region.clone());
+        region.test_driver_write_speaker(&[0.0; 4], 1);
+        assert!(spk.read(4096).is_none());
+        region.test_driver_write_speaker(
+            &[
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                3.0,
+                -7.5,
+                0.25,
+                -1.0,
+            ],
+            2,
+        );
+        let c = spk.read(4096).unwrap();
+        assert_eq!(c.samples, vec![0.0, 0.0, 0.0, 1.0, -1.0, 0.25, -1.0]);
+    }
+
+    #[test]
     #[ignore = "requires the RoomMesh HAL driver installed and coreaudiod running"]
     fn opens_live_driver_region() {
-        let region = SharedRegion::open(SHM_NAME).expect("driver shared memory not found");
+        // Strictly `_coreaudiod`-owned (plain `open` also trusts our own uid in unit tests).
+        let region = SharedRegion::open_owned_by(SHM_NAME, &[coreaudiod_uid()])
+            .expect("driver shared memory not found or not owned by _coreaudiod");
         let h = region.header();
         assert_eq!(h.magic, SHM_MAGIC);
         assert_eq!(h.version, SHM_VERSION);
