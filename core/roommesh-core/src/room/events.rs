@@ -32,6 +32,8 @@ pub struct RoomSnapshot {
     pub revision: u32,
     pub coordinator: PeerId,
     pub speaker: Option<PeerId>,
+    /// The room's noise baseline (`None` = Automatic).
+    pub noise_baseline_db: Option<f32>,
     pub active_primary: Option<PeerId>,
     pub active_secondary: Option<PeerId>,
     pub members: Vec<MemberSnapshot>,
@@ -111,8 +113,9 @@ pub struct LocalRoles {
     pub is_speaker: bool,
     pub mic_enabled: bool,
     pub enabled_mics: Vec<PeerId>,
-    /// Noise baselines of the enabled mics that have one (see `MemberInfo::noise_baseline_db`).
-    pub mic_baselines: Vec<(PeerId, f32)>,
+    /// The room's noise baseline (see `RoomManifest::noise_baseline_db`); `None` = Automatic,
+    /// and always `None` outside a room.
+    pub noise_baseline_db: Option<f32>,
     pub members: Vec<PeerId>,
 }
 
@@ -127,7 +130,7 @@ impl LocalRoles {
             is_speaker: false,
             mic_enabled: false,
             enabled_mics: vec![],
-            mic_baselines: vec![],
+            noise_baseline_db: None,
             members: vec![],
         }
     }

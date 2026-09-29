@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 /// Version 3: commit-then-reveal handshake (`COMMIT` frame; `reply_to` names a commitment);
 /// keys and SAS derived from a transcript hash of both Hellos.
 /// Version 4: `MemberInfo` gained `noise_baseline_db`.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version 5: the noise baseline moved from `MemberInfo` to the room (`RoomManifest` gained
+/// `noise_baseline_db`, `ChangeRequest` gained `SetNoiseBaseline`).
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The furthest a manifest may move the epoch forward in one step. Legitimate jumps are a few
 /// epochs at most (one per coordinator change, including both sides of a healed split brain);
@@ -40,10 +42,6 @@ pub struct MemberInfo {
     pub name: String,
     pub mic_enabled: bool,
     pub capabilities: Capabilities,
-    /// The member's own noise baseline for its mic (dBFS after processing), applied to that
-    /// mic's VAD on the coordinator. `None`: the automatic floor. Mic gains differ, so each
-    /// member sets its own; like the name, only the member itself may change it.
-    pub noise_baseline_db: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +57,10 @@ pub struct RoomManifest {
     pub members: Vec<MemberInfo>,
     pub coordinator: PeerId,
     pub speaker: Option<PeerId>,
+    /// The room's noise baseline (dBFS after processing), applied to every mic's VAD on the
+    /// coordinator: anything at or below it is never speech. `None`: Automatic (each VAD's own
+    /// floor). A room control, like the speaker: any member may set it.
+    pub noise_baseline_db: Option<f32>,
 }
 
 impl RoomManifest {
@@ -73,6 +75,7 @@ impl RoomManifest {
             members: vec![creator],
             coordinator: id,
             speaker: Some(id),
+            noise_baseline_db: None,
         }
     }
     pub fn version(&self) -> (Epoch, u32) {
@@ -108,14 +111,6 @@ impl RoomManifest {
     }
     pub fn member_ids(&self) -> Vec<PeerId> {
         self.members.iter().map(|m| m.id).collect()
-    }
-    /// The noise baseline of every enabled mic that has one, sorted by id.
-    pub fn mic_baselines(&self) -> Vec<(PeerId, f32)> {
-        self.members
-            .iter()
-            .filter(|m| m.mic_enabled && m.capabilities.has_mic)
-            .filter_map(|m| m.noise_baseline_db.map(|b| (m.id, b)))
-            .collect()
     }
 }
 
@@ -202,7 +197,6 @@ mod tests {
             name: format!("Mac {id}"),
             mic_enabled: true,
             capabilities: Capabilities::full(),
-            noise_baseline_db: None,
         }
     }
     fn room() -> RoomManifest {
@@ -235,28 +229,12 @@ mod tests {
         assert_eq!(m.speaker, None);
     }
     #[test]
-    fn mic_baselines_lists_enabled_mics_with_a_baseline() {
+    fn new_room_starts_automatic_and_the_baseline_round_trips() {
         let mut m = room();
-        m.upsert_member(MemberInfo {
-            noise_baseline_db: Some(-48.0),
-            ..member(2)
-        });
-        m.upsert_member(MemberInfo {
-            noise_baseline_db: Some(-40.0),
-            mic_enabled: false,
-            ..member(3)
-        });
-        m.upsert_member(member(4));
-        assert_eq!(m.mic_baselines(), vec![(PeerId(2), -48.0)]);
-    }
-    #[test]
-    fn member_info_round_trips_with_its_baseline() {
-        let info = MemberInfo {
-            noise_baseline_db: Some(-51.5),
-            ..member(2)
-        };
-        let bytes = postcard::to_allocvec(&info).unwrap();
-        assert_eq!(postcard::from_bytes::<MemberInfo>(&bytes).unwrap(), info);
+        assert_eq!(m.noise_baseline_db, None);
+        m.noise_baseline_db = Some(-51.5);
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        assert_eq!(postcard::from_bytes::<RoomManifest>(&bytes).unwrap(), m);
     }
     #[test]
     fn stale_epoch_rejected() {

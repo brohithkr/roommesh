@@ -97,6 +97,9 @@ pub struct FfiRoomState {
     pub epoch: u32,
     pub coordinator: String,
     pub speaker: Option<String>,
+    /// The room's noise baseline in dBFS (after processing), applied to every Mac's mic:
+    /// anything at or below it is never speech. `None` = Automatic.
+    pub noise_baseline_db: Option<f32>,
     pub active_primary: Option<String>,
     pub active_secondary: Option<String>,
     pub members: Vec<FfiMember>,
@@ -151,8 +154,9 @@ pub struct FfiSettings {
     pub playout_delay_ms: u32,
     pub auto_elect_coordinator: bool,
     pub fallback_speaker_to_coordinator: bool,
-    /// This Mac's mic noise baseline in dBFS (after processing); anything at or below it is
-    /// never speech. `None` = Automatic (the VAD's own floor).
+    /// This Mac's noise baseline preference in dBFS (after processing; `None` = Automatic):
+    /// the baseline a room this Mac creates starts with, and the one the mic meter uses
+    /// outside a room. In a room, the room's baseline applies (`set_room_noise_baseline`).
     pub noise_baseline_db: Option<f32>,
 }
 
@@ -270,6 +274,7 @@ fn room(s: RoomSnapshot) -> FfiRoomState {
         epoch: s.epoch.0,
         coordinator: hex(s.coordinator),
         speaker: ohex(s.speaker),
+        noise_baseline_db: s.noise_baseline_db,
         active_primary: ohex(s.active_primary),
         active_secondary: ohex(s.active_secondary),
         members: s
@@ -589,6 +594,11 @@ impl RoomMeshCore {
     pub fn rename_room(&self, name: String) -> Result<(), FfiError> {
         Ok(self.core.command(Command::Rename(name))?)
     }
+    /// Sets the room's noise baseline for every Mac in it (`None` = Automatic). Any member may.
+    /// Clamped to -100..=0 dBFS; a non-finite value is ignored.
+    pub fn set_room_noise_baseline(&self, baseline_db: Option<f32>) -> Result<(), FfiError> {
+        Ok(self.core.command(Command::SetNoiseBaseline(baseline_db))?)
+    }
 
     // ---- local controls ----
     pub fn set_local_mute(&self, muted: bool) {
@@ -801,10 +811,12 @@ mod tests {
             revision: 0,
             coordinator: PeerId(1),
             speaker: None,
+            noise_baseline_db: Some(-44.5),
             active_primary: None,
             active_secondary: None,
             members: vec![member(1, true), member(2, false)],
         });
+        assert_eq!(r.noise_baseline_db, Some(-44.5));
         assert_eq!(
             r.members
                 .iter()

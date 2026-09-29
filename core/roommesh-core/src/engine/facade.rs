@@ -82,7 +82,8 @@ pub struct CoreConfig {
     pub local_id: PeerId,
     pub name: String,
     pub capabilities: Capabilities,
-    /// This Mac's mic noise baseline (see `MemberInfo::noise_baseline_db`).
+    /// This Mac's noise baseline preference: the baseline a room it creates starts with (see
+    /// `RoomManifest::noise_baseline_db`); the meter's outside a room is `audio`'s.
     pub noise_baseline_db: Option<f32>,
     pub audio: AudioSettings,
     pub auto_elect: bool,
@@ -264,12 +265,12 @@ impl Core {
             engine: RoomEngine::new(RoomConfig {
                 auto_elect: cfg.auto_elect,
                 fallback_speaker_to_coordinator: cfg.fallback_speaker,
+                noise_baseline_db: sanitize_baseline(cfg.noise_baseline_db),
                 ..RoomConfig::new(MemberInfo {
                     id: cfg.local_id,
                     name: cfg.name.clone(),
                     mic_enabled: true,
                     capabilities: cfg.capabilities,
-                    noise_baseline_db: sanitize_baseline(cfg.noise_baseline_db),
                 })
             }),
             control,
@@ -532,8 +533,9 @@ impl Core {
         *self.name.lock() = name.clone();
         let _ = self.tx.send(CoreMsg::LocalInfo { name, capabilities });
     }
-    /// Sets this Mac's mic noise baseline (`None`: automatic). In a room it travels to the
-    /// coordinator like the name does (see [`RoomEngine::set_local_info`]).
+    /// Sets this Mac's noise baseline preference (`None`: Automatic), which the next room it
+    /// creates starts with. The current room's baseline is a room control instead:
+    /// [`Command::SetNoiseBaseline`].
     pub fn set_noise_baseline(&self, baseline_db: Option<f32>) {
         let _ = self
             .tx
@@ -642,16 +644,9 @@ impl ControlLoop {
                     name,
                     mic_enabled: true, // the engine keeps the room's value
                     capabilities,
-                    noise_baseline_db: self.engine.local_info().noise_baseline_db,
                 });
             }
-            CoreMsg::NoiseBaseline(b) => {
-                let info = MemberInfo {
-                    noise_baseline_db: b,
-                    ..self.engine.local_info().clone()
-                };
-                self.engine.set_local_info(info);
-            }
+            CoreMsg::NoiseBaseline(b) => self.engine.set_default_noise_baseline(b),
             CoreMsg::Shutdown => {}
         }
     }
@@ -956,9 +951,17 @@ mod tests {
         backend: Box<dyn AudioBackend>,
         sink: Arc<dyn EventSink>,
     ) -> Arc<Core> {
-        let (tx, rx) = unbounded();
-        let transport = net.transport(PeerId(id), tx);
         let cfg = CoreConfig::new(PeerId(id), format!("Mac {id}"));
+        spawn_core_with(net, cfg, backend, sink)
+    }
+    fn spawn_core_with(
+        net: &Arc<LoopbackNetwork>,
+        cfg: CoreConfig,
+        backend: Box<dyn AudioBackend>,
+        sink: Arc<dyn EventSink>,
+    ) -> Arc<Core> {
+        let (tx, rx) = unbounded();
+        let transport = net.transport(cfg.local_id, tx);
         let core = Arc::new(Core::new(cfg, transport, sink, backend));
         let weak = Arc::downgrade(&core);
         std::thread::spawn(move || {
@@ -1031,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn a_members_noise_baseline_reaches_the_coordinators_roles() {
+    fn a_members_room_baseline_reaches_the_coordinators_roles_and_every_snapshot() {
         let net = LoopbackNetwork::new();
         let host = node(&net, 1, Box::new(NullAudio));
         let guest = node(&net, 2, Box::new(NullAudio));
@@ -1039,24 +1042,63 @@ mod tests {
             .command(Command::CreateRoom { name: "R".into() })
             .unwrap();
         join(&host, &guest, 2);
-        guest.core.set_noise_baseline(Some(-47.0));
-        wait("the guest's baseline on the coordinator", 5, || {
-            host.core.roles().mic_baselines == vec![(PeerId(2), -47.0)]
+        wait("2 members", 5, || {
+            guest
+                .core
+                .room_snapshot()
+                .is_some_and(|s| s.members.len() == 2)
         });
-        // A later name/driver change keeps the baseline.
         guest
             .core
-            .set_local_info("Renamed".into(), Capabilities::full());
-        wait("the rename", 5, || {
-            host.core
+            .command(Command::SetNoiseBaseline(Some(-47.0)))
+            .unwrap();
+        wait("the room baseline on the coordinator", 5, || {
+            host.core.roles().noise_baseline_db == Some(-47.0)
+        });
+        wait("the room baseline on the guest", 5, || {
+            guest
+                .core
                 .room_snapshot()
-                .is_some_and(|s| s.members.iter().any(|m| m.name == "Renamed"))
+                .is_some_and(|s| s.noise_baseline_db == Some(-47.0))
         });
-        assert_eq!(host.core.roles().mic_baselines, vec![(PeerId(2), -47.0)]);
-        guest.core.set_noise_baseline(None);
-        wait("the baseline cleared", 5, || {
-            host.core.roles().mic_baselines.is_empty()
+        // This Mac's own preference is not the room's.
+        host.core.set_noise_baseline(Some(-60.0));
+        guest.core.set_noise_baseline(Some(-61.0));
+        host.core.command(Command::SetNoiseBaseline(None)).unwrap();
+        wait("the room baseline cleared", 5, || {
+            guest.core.roles().noise_baseline_db.is_none()
         });
+        assert_eq!(host.core.roles().noise_baseline_db, None);
+    }
+
+    #[test]
+    fn a_room_this_mac_creates_starts_with_its_saved_baseline() {
+        let net = LoopbackNetwork::new();
+        let mut cfg = CoreConfig::new(PeerId(1), "Mac 1".into());
+        cfg.noise_baseline_db = Some(-55.0);
+        let events = Arc::new(Collector::default());
+        let a = Node {
+            core: spawn_core_with(&net, cfg, Box::new(NullAudio), events.clone()),
+            events,
+        };
+        a.core
+            .command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        assert_eq!(
+            a.core.room_snapshot().unwrap().noise_baseline_db,
+            Some(-55.0)
+        );
+        assert_eq!(a.core.roles().noise_baseline_db, Some(-55.0));
+        a.core.command(Command::Leave).unwrap();
+        // A later preference change (the Settings UI) applies to the next room.
+        a.core.set_noise_baseline(Some(-42.0));
+        a.core
+            .command(Command::CreateRoom { name: "S".into() })
+            .unwrap();
+        assert_eq!(
+            a.core.room_snapshot().unwrap().noise_baseline_db,
+            Some(-42.0)
+        );
     }
 
     #[test]

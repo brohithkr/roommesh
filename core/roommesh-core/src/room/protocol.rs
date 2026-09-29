@@ -13,6 +13,8 @@ pub enum ChangeRequest {
     },
     RemoveMember(PeerId),
     Rename(String),
+    /// Sets the room's noise baseline (`None` = Automatic). A room control: any member may.
+    SetNoiseBaseline(Option<f32>),
     /// A member refreshing its own name/capabilities; the coordinator keeps `mic_enabled` as
     /// the manifest has it.
     UpdateMember(MemberInfo),
@@ -106,7 +108,6 @@ mod tests {
                 name: "A".into(),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
-                noise_baseline_db: None,
             },
         );
         let msgs = vec![
@@ -129,6 +130,11 @@ mod tests {
                 change: ChangeRequest::SetSpeaker(Some(PeerId(2))),
             },
             ControlMessage::Leave { room_id: RoomId(1) },
+            ControlMessage::Request {
+                room_id: RoomId(1),
+                epoch: Epoch(1),
+                change: ChangeRequest::SetNoiseBaseline(Some(-47.5)),
+            },
             ControlMessage::Request {
                 room_id: RoomId(1),
                 epoch: Epoch(1),

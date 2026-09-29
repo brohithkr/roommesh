@@ -26,10 +26,10 @@
 //! `RoomId` alone therefore gets nobody in.
 //!
 //! Trust model: every member is trusted with the room's roles. Any member may invite, remove
-//! members, pick the coordinator or the speaker, and rename the room. Changes that speak for a
-//! particular member (its name, capabilities and mic noise baseline) are accepted only from that
-//! member itself, and
-//! only directly (a relayed one would be indistinguishable from a forged one).
+//! members, pick the coordinator or the speaker, set the room's noise baseline, and rename the
+//! room. Changes that speak for a particular member (its name and capabilities) are accepted
+//! only from that member itself, and only directly (a relayed one would be indistinguishable
+//! from a forged one).
 use crate::dsp::vad::sanitize_baseline;
 use crate::ids::{PeerId, RoomId};
 use crate::room::election::{elect_coordinator, speaker_candidates};
@@ -52,6 +52,8 @@ pub struct RoomConfig {
     pub join_timeout_ms: u64,
     pub auto_elect: bool,
     pub fallback_speaker_to_coordinator: bool,
+    /// The noise baseline a room this Mac creates starts with (`None` = Automatic).
+    pub noise_baseline_db: Option<f32>,
 }
 impl RoomConfig {
     pub fn new(local: MemberInfo) -> Self {
@@ -63,10 +65,13 @@ impl RoomConfig {
             join_timeout_ms: 10_000,
             auto_elect: true,
             fallback_speaker_to_coordinator: false,
+            noise_baseline_db: None,
         }
     }
 }
 
+/// User commands. `SetNoiseBaseline` sets the room's noise baseline (`None` = Automatic); a
+/// non-finite value is ignored.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     CreateRoom { name: String },
@@ -78,6 +83,7 @@ pub enum Command {
     SetMicEnabled { peer: PeerId, enabled: bool },
     RemoveMember(PeerId),
     Rename(String),
+    SetNoiseBaseline(Option<f32>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -90,8 +96,8 @@ pub enum RoomError {
     NoSuchInvite,
     #[error("peer is not a room member")]
     NotMember,
-    /// The change speaks for another member (its name, capabilities or noise baseline), which
-    /// only that member may do.
+    /// The change speaks for another member (its name or capabilities), which only that member
+    /// may do.
     #[error("only that member may make this change")]
     NotPermitted,
     /// The core's control thread did not take the command in time (busy, or called
@@ -143,9 +149,7 @@ fn speaks_for_a_member(change: &ChangeRequest) -> bool {
 
 /// The parts of a member's info that only it may change (`UpdateMember`) differ.
 fn differs(current: &MemberInfo, update: &MemberInfo) -> bool {
-    current.name != update.name
-        || current.capabilities != update.capabilities
-        || current.noise_baseline_db != update.noise_baseline_db
+    current.name != update.name || current.capabilities != update.capabilities
 }
 
 /// Whether member `from` may make `change` (see the trust model in the module docs).
@@ -157,6 +161,7 @@ fn permitted(change: &ChangeRequest, from: PeerId) -> bool {
         ChangeRequest::SetMicEnabled { .. }
         | ChangeRequest::SetCoordinator(_)
         | ChangeRequest::SetSpeaker(_)
+        | ChangeRequest::SetNoiseBaseline(_)
         | ChangeRequest::RemoveMember(_)
         | ChangeRequest::Rename(_) => true,
     }
@@ -246,16 +251,18 @@ impl RoomEngine {
     pub fn set_fallback_speaker(&mut self, v: bool) {
         self.cfg.fallback_speaker_to_coordinator = v;
     }
-    /// Updates the local member info; when in a room and the name, capabilities or noise
-    /// baseline differ from the manifest, the change is propagated through the coordinator
-    /// (`mic_enabled` stays as the room has it).
+    /// The noise baseline the next room this Mac creates starts with (the current room keeps
+    /// its own; change that with [`Command::SetNoiseBaseline`]).
+    pub fn set_default_noise_baseline(&mut self, baseline_db: Option<f32>) {
+        self.cfg.noise_baseline_db = sanitize_baseline(baseline_db);
+    }
+    /// Updates the local member info; when in a room and the name or capabilities differ from
+    /// the manifest, the change is propagated through the coordinator (`mic_enabled` stays as
+    /// the room has it).
     pub fn set_local_info(&mut self, info: MemberInfo) {
         self.cfg.local = info;
         let now = self.now;
         self.sync_local_info(now, true);
-    }
-    pub fn local_info(&self) -> &MemberInfo {
-        &self.cfg.local
     }
     pub fn is_coordinator(&self) -> bool {
         self.manifest
@@ -315,7 +322,7 @@ impl RoomEngine {
             is_speaker: m.speaker == Some(local),
             mic_enabled: m.member(local).is_some_and(|x| x.mic_enabled),
             enabled_mics: m.enabled_mics(),
-            mic_baselines: m.mic_baselines(),
+            noise_baseline_db: sanitize_baseline(m.noise_baseline_db),
             members: m.member_ids(),
         }
     }
@@ -330,6 +337,7 @@ impl RoomEngine {
             revision: m.revision,
             coordinator: m.coordinator,
             speaker: m.speaker,
+            noise_baseline_db: sanitize_baseline(m.noise_baseline_db),
             active_primary: self.active.0,
             active_secondary: self.active.1,
             members: m
@@ -529,7 +537,8 @@ impl RoomEngine {
                 if self.manifest.is_some() {
                     return Err(RoomError::AlreadyInRoom);
                 }
-                let m = RoomManifest::new(RoomId::random(), name, self.cfg.local.clone());
+                let mut m = RoomManifest::new(RoomId::random(), name, self.cfg.local.clone());
+                m.noise_baseline_db = sanitize_baseline(self.cfg.noise_baseline_db);
                 self.install(now, m);
                 Ok(())
             }
@@ -591,6 +600,7 @@ impl RoomEngine {
             }
             Command::RemoveMember(p) => self.change(now, ChangeRequest::RemoveMember(p)),
             Command::Rename(n) => self.change(now, ChangeRequest::Rename(n)),
+            Command::SetNoiseBaseline(b) => self.change(now, ChangeRequest::SetNoiseBaseline(b)),
         }
     }
 
@@ -601,7 +611,7 @@ impl RoomEngine {
             ChangeRequest::SetSpeaker(p) => *p,
             ChangeRequest::SetMicEnabled { peer, .. } => Some(*peer),
             ChangeRequest::UpdateMember(info) => Some(info.id),
-            ChangeRequest::Rename(_) => None,
+            ChangeRequest::Rename(_) | ChangeRequest::SetNoiseBaseline(_) => None,
         };
         if target.is_some_and(|p| !m.is_member(p)) {
             return Err(RoomError::NotMember);
@@ -636,7 +646,7 @@ impl RoomEngine {
         Ok(())
     }
 
-    /// Pushes our name/capabilities/noise baseline into the manifest if they differ from it. `queue` = may
+    /// Pushes our name/capabilities into the manifest if they differ from it. `queue` = may
     /// queue the request when no session is up (periodic retries only send over live sessions).
     fn sync_local_info(&mut self, now: u64, queue: bool) {
         let Some(m) = self.manifest.clone() else {
@@ -720,13 +730,24 @@ impl RoomEngine {
                 m.name = n;
                 m.revision += 1;
             }
-            ChangeRequest::UpdateMember(mut info) => {
-                info.noise_baseline_db = sanitize_baseline(info.noise_baseline_db);
+            ChangeRequest::SetNoiseBaseline(b) => {
+                // A non-finite value is dropped rather than read as Automatic: it must not
+                // reset a room's baseline.
+                if b.is_some_and(|b| !b.is_finite()) {
+                    return;
+                }
+                let b = sanitize_baseline(b);
+                if m.noise_baseline_db == b {
+                    return;
+                }
+                m.noise_baseline_db = b;
+                m.revision += 1;
+            }
+            ChangeRequest::UpdateMember(info) => {
                 match m.member_mut(info.id) {
                     Some(x) if differs(x, &info) => {
                         x.name = info.name;
                         x.capabilities = info.capabilities;
-                        x.noise_baseline_db = info.noise_baseline_db;
                     }
                     _ => return,
                 }
@@ -1331,7 +1352,6 @@ mod tests {
                         name: format!("Mac {i}"),
                         mic_enabled: true,
                         capabilities: Capabilities::full(),
-                        noise_baseline_db: None,
                     };
                     (PeerId(i), RoomEngine::new(RoomConfig::new(info)))
                 })
@@ -1552,6 +1572,98 @@ mod tests {
         assert_eq!(m.speaker, Some(PeerId(2)));
         assert_eq!(m.enabled_mics(), vec![PeerId(1), PeerId(2)]);
         assert!(n.engines[&PeerId(2)].roles().is_speaker);
+    }
+    #[test]
+    fn any_member_sets_the_room_noise_baseline_and_it_converges() {
+        let mut n = room(&[1, 2, 3]);
+        let before = n.converged(&[1, 2, 3]);
+        assert_eq!(before.noise_baseline_db, None);
+        n.cmd(3, Command::SetNoiseBaseline(Some(-44.0)));
+        let m = n.converged(&[1, 2, 3]);
+        assert_eq!(m.noise_baseline_db, Some(-44.0));
+        assert_eq!(m.revision, before.revision + 1);
+        for id in [1, 2, 3] {
+            let e = &n.engines[&PeerId(id)];
+            assert_eq!(e.roles().noise_baseline_db, Some(-44.0), "Mac {id}");
+            assert_eq!(e.snapshot().unwrap().noise_baseline_db, Some(-44.0));
+        }
+        // Setting the same value again is not a change.
+        n.cmd(2, Command::SetNoiseBaseline(Some(-44.0)));
+        assert_eq!(n.converged(&[1, 2, 3]).revision, m.revision);
+        // Clamped like any baseline, and back to Automatic.
+        n.cmd(2, Command::SetNoiseBaseline(Some(20.0)));
+        assert_eq!(n.converged(&[1, 2, 3]).noise_baseline_db, Some(0.0));
+        n.cmd(1, Command::SetNoiseBaseline(None));
+        assert_eq!(n.converged(&[1, 2, 3]).noise_baseline_db, None);
+        assert_eq!(n.engines[&PeerId(3)].roles().noise_baseline_db, None);
+    }
+    #[test]
+    fn a_non_finite_room_noise_baseline_is_ignored() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(2, Command::SetNoiseBaseline(Some(-44.0)));
+        let cur = n.converged(&[1, 2, 3]);
+        n.cmd(1, Command::SetNoiseBaseline(Some(f32::NAN)));
+        n.cmd(3, Command::SetNoiseBaseline(Some(f32::INFINITY)));
+        assert_eq!(
+            n.converged(&[1, 2, 3]),
+            cur,
+            "neither resets nor changes it"
+        );
+        // A manifest carrying one (a misbehaving coordinator) reads as Automatic.
+        let mut bad = cur.clone();
+        bad.revision += 1;
+        bad.noise_baseline_db = Some(f32::NAN);
+        let now = n.now;
+        let e2 = n.engines.get_mut(&PeerId(2)).unwrap();
+        e2.on_message(now, PeerId(1), ControlMessage::Manifest(bad));
+        assert_eq!(e2.roles().noise_baseline_db, None);
+        assert_eq!(e2.snapshot().unwrap().noise_baseline_db, None);
+    }
+    #[test]
+    fn the_room_noise_baseline_survives_coordinator_handovers() {
+        let mut n = room(&[1, 2, 3]);
+        n.cmd(2, Command::SetNoiseBaseline(Some(-47.0)));
+        n.cmd(2, Command::SetCoordinator(PeerId(3)));
+        let m = n.converged(&[1, 2, 3]);
+        assert_eq!(
+            (m.coordinator, m.noise_baseline_db),
+            (PeerId(3), Some(-47.0))
+        );
+        let r = n.engines[&PeerId(3)].roles();
+        assert!(r.is_coordinator);
+        assert_eq!(r.noise_baseline_db, Some(-47.0));
+        // The coordinator leaves: its successor carries the baseline on.
+        n.cmd(3, Command::Leave);
+        n.advance(300);
+        let m = n.converged(&[1, 2]);
+        assert_ne!(m.coordinator, PeerId(3));
+        assert_eq!(m.noise_baseline_db, Some(-47.0));
+        assert_eq!(
+            n.engines[&m.coordinator].roles().noise_baseline_db,
+            Some(-47.0)
+        );
+    }
+    #[test]
+    fn a_new_room_starts_with_the_creators_default_baseline() {
+        let mut n = Net::new(&[1, 2]);
+        n.engines
+            .get_mut(&PeerId(1))
+            .unwrap()
+            .set_default_noise_baseline(Some(-52.0));
+        n.cmd(1, Command::CreateRoom { name: "R".into() });
+        assert_eq!(n.manifest(1).unwrap().noise_baseline_db, Some(-52.0));
+        assert_eq!(n.engines[&PeerId(1)].roles().noise_baseline_db, Some(-52.0));
+        // Changing the default later leaves the current room alone.
+        n.engines
+            .get_mut(&PeerId(1))
+            .unwrap()
+            .set_default_noise_baseline(None);
+        assert_eq!(n.manifest(1).unwrap().noise_baseline_db, Some(-52.0));
+        // A non-finite default counts as Automatic.
+        let e2 = n.engines.get_mut(&PeerId(2)).unwrap();
+        e2.set_default_noise_baseline(Some(f32::NAN));
+        n.cmd(2, Command::CreateRoom { name: "S".into() });
+        assert_eq!(n.manifest(2).unwrap().noise_baseline_db, None);
     }
     #[test]
     fn coordinator_change_bumps_epoch() {
@@ -1973,7 +2085,6 @@ mod tests {
                     driver_installed: false,
                     ..Capabilities::full()
                 },
-                noise_baseline_db: None,
             });
         n.pump();
         let m = n.converged(&[1, 2, 3]);
@@ -1990,7 +2101,6 @@ mod tests {
                 name: "Host".into(),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
-                noise_baseline_db: None,
             });
         n.pump();
         assert_eq!(
@@ -2003,39 +2113,6 @@ mod tests {
         n.engines.get_mut(&PeerId(2)).unwrap().set_local_info(info);
         n.advance(2_000);
         assert_eq!(n.converged(&[1, 2, 3]).version(), v);
-    }
-
-    #[test]
-    fn noise_baseline_propagates_to_the_coordinators_roles() {
-        let mut n = room(&[1, 2, 3]);
-        let set = |n: &mut Net, id: u64, b: Option<f32>| {
-            let e = n.engines.get_mut(&PeerId(id)).unwrap();
-            let info = MemberInfo {
-                noise_baseline_db: b,
-                ..e.local_info().clone()
-            };
-            e.set_local_info(info);
-            n.pump();
-        };
-        set(&mut n, 2, Some(-44.0));
-        let m = n.converged(&[1, 2, 3]);
-        assert_eq!(m.member(PeerId(2)).unwrap().noise_baseline_db, Some(-44.0));
-        assert_eq!(
-            n.engines[&PeerId(1)].roles().mic_baselines,
-            vec![(PeerId(2), -44.0)]
-        );
-        // The coordinator's own baseline applies directly; clearing one removes it.
-        set(&mut n, 1, Some(-50.0));
-        set(&mut n, 2, None);
-        n.converged(&[1, 2, 3]);
-        assert_eq!(
-            n.engines[&PeerId(1)].roles().mic_baselines,
-            vec![(PeerId(1), -50.0)]
-        );
-        // A non-finite baseline never reaches the manifest.
-        set(&mut n, 3, Some(f32::NAN));
-        let m = n.converged(&[1, 2, 3]);
-        assert_eq!(m.member(PeerId(3)).unwrap().noise_baseline_db, None);
     }
 
     #[test]
@@ -2052,7 +2129,6 @@ mod tests {
                     driver_installed: false,
                     ..Capabilities::full()
                 },
-                noise_baseline_db: None,
             });
         n.pump();
         let snap = n.engines[&PeerId(1)].snapshot().unwrap();
@@ -2079,7 +2155,6 @@ mod tests {
                 name: "Renamed".into(),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
-                noise_baseline_db: None,
             });
         n.pump();
         n.cut.clear();
@@ -2349,7 +2424,6 @@ mod tests {
                 name: format!("Mac {id}"),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
-                noise_baseline_db: None,
             },
         }
     }
@@ -2514,33 +2588,6 @@ mod tests {
             },
         );
         assert_eq!(e1.manifest(), Some(&cur));
-    }
-
-    #[test]
-    fn members_may_not_set_another_members_noise_baseline() {
-        let mut n = room(&[1, 2, 3]);
-        let cur = n.converged(&[1, 2, 3]);
-        let now = n.now;
-        let mut forged = cur.member(PeerId(3)).unwrap().clone();
-        forged.noise_baseline_db = Some(-10.0); // would mute Mac 3's mic
-        let e1 = coordinator(&mut n);
-        e1.on_message(
-            now,
-            PeerId(2),
-            ControlMessage::Request {
-                room_id: cur.room_id,
-                epoch: cur.epoch,
-                change: ChangeRequest::UpdateMember(forged.clone()),
-            },
-        );
-        assert_eq!(e1.manifest(), Some(&cur));
-        assert!(e1.roles().mic_baselines.is_empty());
-        // Nor may a member ask for it locally.
-        let e2 = n.engines.get_mut(&PeerId(2)).unwrap();
-        assert_eq!(
-            e2.change(now, ChangeRequest::UpdateMember(forged)),
-            Err(RoomError::NotPermitted)
-        );
     }
 
     #[test]

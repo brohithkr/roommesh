@@ -1,7 +1,7 @@
 //! The local mic meter behind Settings → Audio: this Mac's capture through the same processing
 //! the coordinator applies to every mic (echo canceller + noise suppression, fed a silent
-//! far-end reference, then the VAD with this Mac's noise baseline), so the user sees the level
-//! the room actually judges.
+//! far-end reference, then the VAD with the noise baseline: the room's while in a room, this
+//! Mac's own preference otherwise), so the user sees the level the room actually judges.
 use crate::audio::frames::FRAME_SAMPLES;
 use crate::dsp::aec::EchoCanceller;
 use crate::dsp::vad::Vad;

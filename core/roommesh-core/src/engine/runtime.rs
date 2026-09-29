@@ -119,8 +119,8 @@ pub struct AudioSettings {
     pub output: DeviceSelector,
     pub coordinator: CoordinatorConfig,
     pub mic_bitrate_bps: i32,
-    /// This Mac's mic noise baseline, used by the local mic meter (the coordinator gets every
-    /// mic's baseline from the room manifest instead).
+    /// This Mac's own noise baseline preference: the local mic meter uses it outside a room
+    /// (in a room, the meter and the coordinator use the room's, from [`LocalRoles`]).
     pub noise_baseline_db: Option<f32>,
 }
 impl Default for AudioSettings {
@@ -132,6 +132,16 @@ impl Default for AudioSettings {
             mic_bitrate_bps: 48_000,
             noise_baseline_db: DEFAULT_NOISE_BASELINE_DB,
         }
+    }
+}
+
+/// The baseline the local mic meter judges against: the room's while in a room, this Mac's own
+/// preference otherwise.
+fn meter_baseline(settings: &AudioSettings, roles: &LocalRoles) -> Option<f32> {
+    if roles.room_id.is_some() {
+        roles.noise_baseline_db
+    } else {
+        settings.noise_baseline_db
     }
 }
 
@@ -891,7 +901,10 @@ impl Dsp {
     }
 
     fn new_meter(&self) -> MeterChain {
-        MeterChain::new(&self.settings.coordinator, self.settings.noise_baseline_db)
+        MeterChain::new(
+            &self.settings.coordinator,
+            meter_baseline(&self.settings, &self.roles),
+        )
     }
 
     fn apply_settings(&mut self, s: AudioSettings) {
@@ -926,10 +939,11 @@ impl Dsp {
         }
         self.settings = s;
         if let Some(m) = self.meter.as_mut() {
+            let baseline = meter_baseline(&self.settings, &self.roles);
             if meter_changed {
-                *m = MeterChain::new(&self.settings.coordinator, self.settings.noise_baseline_db);
+                *m = MeterChain::new(&self.settings.coordinator, baseline);
             } else {
-                m.set_baseline(self.settings.noise_baseline_db);
+                m.set_baseline(baseline);
             }
         }
         if devices_changed {
@@ -989,7 +1003,10 @@ impl Dsp {
         if let Some(cs) = self.coord.as_mut() {
             cs.pipe.set_epoch(self.roles.epoch);
             cs.pipe.set_enabled_mics(&self.roles.enabled_mics);
-            cs.pipe.set_mic_baselines(&self.roles.mic_baselines);
+            cs.pipe.set_noise_baseline(self.roles.noise_baseline_db);
+        }
+        if let Some(m) = self.meter.as_mut() {
+            m.set_baseline(meter_baseline(&self.settings, &self.roles));
         }
         self.reconcile(now_ns());
     }
@@ -1010,7 +1027,7 @@ impl Dsp {
                 ) {
                     Ok(mut pipe) => {
                         pipe.set_enabled_mics(&self.roles.enabled_mics);
-                        pipe.set_mic_baselines(&self.roles.mic_baselines);
+                        pipe.set_noise_baseline(self.roles.noise_baseline_db);
                         self.coord = Some(CoordState {
                             pipe,
                             vdev: None,
@@ -1598,7 +1615,7 @@ mod tests {
             is_speaker: speaker == local,
             mic_enabled: true,
             enabled_mics: vec![PeerId(1), PeerId(2)],
-            mic_baselines: vec![],
+            noise_baseline_db: None,
             members: vec![PeerId(1), PeerId(2)],
         }
     }
@@ -1732,14 +1749,14 @@ mod tests {
     }
 
     #[test]
-    fn mic_baselines_from_the_roles_reach_the_coordinators_vads() {
+    fn the_rooms_baseline_from_the_roles_reaches_every_coordinator_vad() {
         let (mut d, _ev) = dsp(1, Box::new(NullAudio));
         d.handle(RuntimeMsg::SetEnabled(true));
-        let with = |b: Vec<(PeerId, f32)>| LocalRoles {
-            mic_baselines: b,
+        let with = |b: Option<f32>| LocalRoles {
+            noise_baseline_db: b,
             ..roles(1, 1, 1)
         };
-        d.handle(RuntimeMsg::Roles(with(vec![(PeerId(2), -45.0)])));
+        d.handle(RuntimeMsg::Roles(with(Some(-45.0))));
         let pipe = |d: &Dsp| {
             let cs = d.coord.as_ref().expect("coordinating");
             (
@@ -1747,10 +1764,17 @@ mod tests {
                 cs.pipe.mic_baseline(PeerId(2)),
             )
         };
-        assert_eq!(pipe(&d), (None, Some(-45.0)));
-        // A manifest change (Mac 2 cleared its baseline, Mac 1 set one) updates them.
-        d.handle(RuntimeMsg::Roles(with(vec![(PeerId(1), -52.0)])));
-        assert_eq!(pipe(&d), (Some(-52.0), None));
+        assert_eq!(pipe(&d), (Some(-45.0), Some(-45.0)));
+        // A manifest change (the room went back to Automatic) updates them.
+        d.handle(RuntimeMsg::Roles(with(None)));
+        assert_eq!(pipe(&d), (None, None));
+        d.handle(RuntimeMsg::Roles(with(Some(-52.0))));
+        assert_eq!(pipe(&d), (Some(-52.0), Some(-52.0)));
+        // A fresh pipeline (a settings change rebuilds it) starts with the room's baseline.
+        let mut s = d.settings.clone();
+        s.coordinator.mic_latency_ns += 10 * MS;
+        d.handle(RuntimeMsg::Settings(s));
+        assert_eq!(pipe(&d), (Some(-52.0), Some(-52.0)));
     }
 
     #[test]
@@ -2300,6 +2324,45 @@ mod tests {
             meter(&d).unwrap().floor_db,
             meter(&d).unwrap().auto_floor_db
         );
+    }
+
+    #[test]
+    fn in_a_room_the_meter_uses_the_rooms_baseline_and_this_macs_outside() {
+        let fake = FakeDevices::default();
+        let (mut d, _ev) = dsp(2, Box::new(fake.clone()));
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Settings(AudioSettings {
+            noise_baseline_db: Some(-40.0),
+            ..d.settings.clone()
+        }));
+        d.handle(RuntimeMsg::SetMeter(true));
+        let (mut idx, mut t) = (0, now_ns());
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 5);
+        assert_eq!(meter(&d).unwrap().floor_db, -40.0, "outside a room: ours");
+        // Joining a room whose baseline is -30 dB: the meter follows the room.
+        let room = |b: Option<f32>| LocalRoles {
+            noise_baseline_db: b,
+            ..roles(1, 1, 2)
+        };
+        d.handle(RuntimeMsg::Roles(room(Some(-30.0))));
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 3);
+        assert_eq!(meter(&d).unwrap().floor_db, -30.0);
+        // Our own preference changing doesn't matter in the room.
+        d.handle(RuntimeMsg::Settings(AudioSettings {
+            noise_baseline_db: Some(-35.0),
+            ..d.settings.clone()
+        }));
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 3);
+        assert_eq!(meter(&d).unwrap().floor_db, -30.0);
+        // An Automatic room: the automatic floor, not our preference.
+        d.handle(RuntimeMsg::Roles(room(None)));
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 3);
+        let m = meter(&d).unwrap();
+        assert_eq!(m.floor_db, m.auto_floor_db);
+        // Leaving: back to ours.
+        d.handle(RuntimeMsg::Roles(LocalRoles::none()));
+        feed(&mut d, &fake, &mut idx, &mut t, -50.0, 3);
+        assert_eq!(meter(&d).unwrap().floor_db, -35.0);
     }
 
     #[test]
