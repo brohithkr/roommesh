@@ -942,6 +942,7 @@ impl Dsp {
         if let Some(cs) = self.coord.as_mut() {
             cs.pipe.set_epoch(self.roles.epoch);
             cs.pipe.set_enabled_mics(&self.roles.enabled_mics);
+            cs.pipe.set_mic_baselines(&self.roles.mic_baselines);
         }
         self.reconcile(now_ns());
     }
@@ -962,6 +963,7 @@ impl Dsp {
                 ) {
                     Ok(mut pipe) => {
                         pipe.set_enabled_mics(&self.roles.enabled_mics);
+                        pipe.set_mic_baselines(&self.roles.mic_baselines);
                         self.coord = Some(CoordState {
                             pipe,
                             vdev: None,
@@ -1521,6 +1523,7 @@ mod tests {
             is_speaker: speaker == local,
             mic_enabled: true,
             enabled_mics: vec![PeerId(1), PeerId(2)],
+            mic_baselines: vec![],
             members: vec![PeerId(1), PeerId(2)],
         }
     }
@@ -1651,6 +1654,28 @@ mod tests {
         let age = now_ns().saturating_sub(hb);
         assert!(age < 100_000_000, "app heartbeat is stale ({age} ns)");
         rt.shutdown();
+    }
+
+    #[test]
+    fn mic_baselines_from_the_roles_reach_the_coordinators_vads() {
+        let (mut d, _ev) = dsp(1, Box::new(NullAudio));
+        d.handle(RuntimeMsg::SetEnabled(true));
+        let with = |b: Vec<(PeerId, f32)>| LocalRoles {
+            mic_baselines: b,
+            ..roles(1, 1, 1)
+        };
+        d.handle(RuntimeMsg::Roles(with(vec![(PeerId(2), -45.0)])));
+        let pipe = |d: &Dsp| {
+            let cs = d.coord.as_ref().expect("coordinating");
+            (
+                cs.pipe.mic_baseline(PeerId(1)),
+                cs.pipe.mic_baseline(PeerId(2)),
+            )
+        };
+        assert_eq!(pipe(&d), (None, Some(-45.0)));
+        // A manifest change (Mac 2 cleared its baseline, Mac 1 set one) updates them.
+        d.handle(RuntimeMsg::Roles(with(vec![(PeerId(1), -52.0)])));
+        assert_eq!(pipe(&d), (Some(-52.0), None));
     }
 
     #[test]

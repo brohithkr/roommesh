@@ -149,6 +149,9 @@ pub struct FfiSettings {
     pub playout_delay_ms: u32,
     pub auto_elect_coordinator: bool,
     pub fallback_speaker_to_coordinator: bool,
+    /// This Mac's mic noise baseline in dBFS (after processing); anything at or below it is
+    /// never speech. `None` = Automatic (the VAD's own floor).
+    pub noise_baseline_db: Option<f32>,
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
@@ -457,6 +460,7 @@ impl RoomMeshCore {
         cfg.audio = audio_settings(&settings);
         cfg.auto_elect = settings.auto_elect_coordinator;
         cfg.fallback_speaker = settings.fallback_speaker_to_coordinator;
+        cfg.noise_baseline_db = settings.noise_baseline_db;
         let core = Core::new(
             cfg,
             Arc::new(TransportAdapter(transport)),
@@ -573,6 +577,7 @@ impl RoomMeshCore {
             settings.auto_elect_coordinator,
             settings.fallback_speaker_to_coordinator,
         );
+        self.core.set_noise_baseline(settings.noise_baseline_db);
     }
     pub fn set_local_info(&self, name: String, driver_installed: bool) {
         self.core
@@ -645,6 +650,7 @@ mod tests {
             playout_delay_ms: 90,
             auto_elect_coordinator: false,
             fallback_speaker_to_coordinator: true,
+            noise_baseline_db: None,
         };
         let a = audio_settings(&s);
         assert_eq!(
@@ -696,6 +702,7 @@ mod tests {
             playout_delay_ms: 10_000,
             auto_elect_coordinator: true,
             fallback_speaker_to_coordinator: false,
+            noise_baseline_db: Some(-55.0),
         };
         let a = audio_settings(&s);
         assert_eq!(a.input, DeviceSelector::Default);

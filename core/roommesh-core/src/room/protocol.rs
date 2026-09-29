@@ -106,6 +106,7 @@ mod tests {
                 name: "A".into(),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
+                noise_baseline_db: None,
             },
         );
         let msgs = vec![

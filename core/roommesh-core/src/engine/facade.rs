@@ -20,6 +20,7 @@
 //! `[t1, t2, t3, ping_sequence]`, and the pinging DSP accepts a pong only for a ping it still
 //! has outstanding with the same t1 (once). Pings themselves pass a per-sender replay window
 //! (scoped to the session key and epoch; older epochs are rejected) before they are answered.
+use crate::dsp::vad::{sanitize_baseline, DEFAULT_NOISE_BASELINE_DB};
 use crate::engine::metrics::{merge_local_report, PeerMetrics};
 use crate::engine::runtime::{
     AudioBackend, AudioRuntime, AudioSettings, RuntimeEvent, RuntimeMsg, RuntimeSender,
@@ -80,6 +81,8 @@ pub struct CoreConfig {
     pub local_id: PeerId,
     pub name: String,
     pub capabilities: Capabilities,
+    /// This Mac's mic noise baseline (see `MemberInfo::noise_baseline_db`).
+    pub noise_baseline_db: Option<f32>,
     pub audio: AudioSettings,
     pub auto_elect: bool,
     pub fallback_speaker: bool,
@@ -90,6 +93,7 @@ impl CoreConfig {
             local_id,
             name,
             capabilities: Capabilities::full(),
+            noise_baseline_db: DEFAULT_NOISE_BASELINE_DB,
             audio: AudioSettings::default(),
             auto_elect: true,
             fallback_speaker: false,
@@ -111,6 +115,7 @@ enum CoreMsg {
         name: String,
         capabilities: Capabilities,
     },
+    NoiseBaseline(Option<f32>),
     Shutdown,
 }
 
@@ -262,6 +267,7 @@ impl Core {
                     name: cfg.name.clone(),
                     mic_enabled: true,
                     capabilities: cfg.capabilities,
+                    noise_baseline_db: sanitize_baseline(cfg.noise_baseline_db),
                 })
             }),
             control,
@@ -510,6 +516,13 @@ impl Core {
         *self.name.lock() = name.clone();
         let _ = self.tx.send(CoreMsg::LocalInfo { name, capabilities });
     }
+    /// Sets this Mac's mic noise baseline (`None`: automatic). In a room it travels to the
+    /// coordinator like the name does (see [`RoomEngine::set_local_info`]).
+    pub fn set_noise_baseline(&self, baseline_db: Option<f32>) {
+        let _ = self
+            .tx
+            .send(CoreMsg::NoiseBaseline(sanitize_baseline(baseline_db)));
+    }
 }
 
 impl Drop for Core {
@@ -613,7 +626,15 @@ impl ControlLoop {
                     name,
                     mic_enabled: true, // the engine keeps the room's value
                     capabilities,
+                    noise_baseline_db: self.engine.local_info().noise_baseline_db,
                 });
+            }
+            CoreMsg::NoiseBaseline(b) => {
+                let info = MemberInfo {
+                    noise_baseline_db: b,
+                    ..self.engine.local_info().clone()
+                };
+                self.engine.set_local_info(info);
             }
             CoreMsg::Shutdown => {}
         }
@@ -991,6 +1012,35 @@ mod tests {
         let core = spawn_core(net, id, Box::new(NullAudio), sink.clone());
         let _ = sink.core.set(Arc::downgrade(&core));
         (core, sink)
+    }
+
+    #[test]
+    fn a_members_noise_baseline_reaches_the_coordinators_roles() {
+        let net = LoopbackNetwork::new();
+        let host = node(&net, 1, Box::new(NullAudio));
+        let guest = node(&net, 2, Box::new(NullAudio));
+        host.core
+            .command(Command::CreateRoom { name: "R".into() })
+            .unwrap();
+        join(&host, &guest, 2);
+        guest.core.set_noise_baseline(Some(-47.0));
+        wait("the guest's baseline on the coordinator", 5, || {
+            host.core.roles().mic_baselines == vec![(PeerId(2), -47.0)]
+        });
+        // A later name/driver change keeps the baseline.
+        guest
+            .core
+            .set_local_info("Renamed".into(), Capabilities::full());
+        wait("the rename", 5, || {
+            host.core
+                .room_snapshot()
+                .is_some_and(|s| s.members.iter().any(|m| m.name == "Renamed"))
+        });
+        assert_eq!(host.core.roles().mic_baselines, vec![(PeerId(2), -47.0)]);
+        guest.core.set_noise_baseline(None);
+        wait("the baseline cleared", 5, || {
+            host.core.roles().mic_baselines.is_empty()
+        });
     }
 
     #[test]

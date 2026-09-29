@@ -27,8 +27,10 @@
 //!
 //! Trust model: every member is trusted with the room's roles. Any member may invite, remove
 //! members, pick the coordinator or the speaker, and rename the room. Changes that speak for a
-//! particular member (its name and capabilities) are accepted only from that member itself, and
+//! particular member (its name, capabilities and mic noise baseline) are accepted only from that
+//! member itself, and
 //! only directly (a relayed one would be indistinguishable from a forged one).
+use crate::dsp::vad::sanitize_baseline;
 use crate::ids::{PeerId, RoomId};
 use crate::room::election::{elect_coordinator, speaker_candidates};
 use crate::room::events::*;
@@ -88,8 +90,8 @@ pub enum RoomError {
     NoSuchInvite,
     #[error("peer is not a room member")]
     NotMember,
-    /// The change speaks for another member (its name or capabilities), which only that member
-    /// may do.
+    /// The change speaks for another member (its name, capabilities or noise baseline), which
+    /// only that member may do.
     #[error("only that member may make this change")]
     NotPermitted,
     /// The core's control thread did not take the command in time (busy, or called
@@ -137,6 +139,13 @@ fn message_room(msg: &ControlMessage) -> Option<RoomId> {
 /// A change that speaks for one particular member: accepted only from that member.
 fn speaks_for_a_member(change: &ChangeRequest) -> bool {
     matches!(change, ChangeRequest::UpdateMember(_))
+}
+
+/// The parts of a member's info that only it may change (`UpdateMember`) differ.
+fn differs(current: &MemberInfo, update: &MemberInfo) -> bool {
+    current.name != update.name
+        || current.capabilities != update.capabilities
+        || current.noise_baseline_db != update.noise_baseline_db
 }
 
 /// Whether member `from` may make `change` (see the trust model in the module docs).
@@ -237,13 +246,16 @@ impl RoomEngine {
     pub fn set_fallback_speaker(&mut self, v: bool) {
         self.cfg.fallback_speaker_to_coordinator = v;
     }
-    /// Updates the local member info; when in a room and the name or capabilities differ from
-    /// the manifest, the change is propagated through the coordinator (`mic_enabled` stays as
-    /// the room has it).
+    /// Updates the local member info; when in a room and the name, capabilities or noise
+    /// baseline differ from the manifest, the change is propagated through the coordinator
+    /// (`mic_enabled` stays as the room has it).
     pub fn set_local_info(&mut self, info: MemberInfo) {
         self.cfg.local = info;
         let now = self.now;
         self.sync_local_info(now, true);
+    }
+    pub fn local_info(&self) -> &MemberInfo {
+        &self.cfg.local
     }
     pub fn is_coordinator(&self) -> bool {
         self.manifest
@@ -303,6 +315,7 @@ impl RoomEngine {
             is_speaker: m.speaker == Some(local),
             mic_enabled: m.member(local).is_some_and(|x| x.mic_enabled),
             enabled_mics: m.enabled_mics(),
+            mic_baselines: m.mic_baselines(),
             members: m.member_ids(),
         }
     }
@@ -623,7 +636,7 @@ impl RoomEngine {
         Ok(())
     }
 
-    /// Pushes our name/capabilities into the manifest if they differ from it. `queue` = may
+    /// Pushes our name/capabilities/noise baseline into the manifest if they differ from it. `queue` = may
     /// queue the request when no session is up (periodic retries only send over live sessions).
     fn sync_local_info(&mut self, now: u64, queue: bool) {
         let Some(m) = self.manifest.clone() else {
@@ -633,7 +646,7 @@ impl RoomEngine {
         let Some(me) = m.member(info.id) else {
             return;
         };
-        if me.name == info.name && me.capabilities == info.capabilities {
+        if !differs(me, &info) {
             return;
         }
         if m.coordinator == info.id {
@@ -707,11 +720,13 @@ impl RoomEngine {
                 m.name = n;
                 m.revision += 1;
             }
-            ChangeRequest::UpdateMember(info) => {
+            ChangeRequest::UpdateMember(mut info) => {
+                info.noise_baseline_db = sanitize_baseline(info.noise_baseline_db);
                 match m.member_mut(info.id) {
-                    Some(x) if x.name != info.name || x.capabilities != info.capabilities => {
+                    Some(x) if differs(x, &info) => {
                         x.name = info.name;
                         x.capabilities = info.capabilities;
+                        x.noise_baseline_db = info.noise_baseline_db;
                     }
                     _ => return,
                 }
@@ -1316,6 +1331,7 @@ mod tests {
                         name: format!("Mac {i}"),
                         mic_enabled: true,
                         capabilities: Capabilities::full(),
+                        noise_baseline_db: None,
                     };
                     (PeerId(i), RoomEngine::new(RoomConfig::new(info)))
                 })
@@ -1957,6 +1973,7 @@ mod tests {
                     driver_installed: false,
                     ..Capabilities::full()
                 },
+                noise_baseline_db: None,
             });
         n.pump();
         let m = n.converged(&[1, 2, 3]);
@@ -1973,6 +1990,7 @@ mod tests {
                 name: "Host".into(),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
+                noise_baseline_db: None,
             });
         n.pump();
         assert_eq!(
@@ -1985,6 +2003,39 @@ mod tests {
         n.engines.get_mut(&PeerId(2)).unwrap().set_local_info(info);
         n.advance(2_000);
         assert_eq!(n.converged(&[1, 2, 3]).version(), v);
+    }
+
+    #[test]
+    fn noise_baseline_propagates_to_the_coordinators_roles() {
+        let mut n = room(&[1, 2, 3]);
+        let set = |n: &mut Net, id: u64, b: Option<f32>| {
+            let e = n.engines.get_mut(&PeerId(id)).unwrap();
+            let info = MemberInfo {
+                noise_baseline_db: b,
+                ..e.local_info().clone()
+            };
+            e.set_local_info(info);
+            n.pump();
+        };
+        set(&mut n, 2, Some(-44.0));
+        let m = n.converged(&[1, 2, 3]);
+        assert_eq!(m.member(PeerId(2)).unwrap().noise_baseline_db, Some(-44.0));
+        assert_eq!(
+            n.engines[&PeerId(1)].roles().mic_baselines,
+            vec![(PeerId(2), -44.0)]
+        );
+        // The coordinator's own baseline applies directly; clearing one removes it.
+        set(&mut n, 1, Some(-50.0));
+        set(&mut n, 2, None);
+        n.converged(&[1, 2, 3]);
+        assert_eq!(
+            n.engines[&PeerId(1)].roles().mic_baselines,
+            vec![(PeerId(1), -50.0)]
+        );
+        // A non-finite baseline never reaches the manifest.
+        set(&mut n, 3, Some(f32::NAN));
+        let m = n.converged(&[1, 2, 3]);
+        assert_eq!(m.member(PeerId(3)).unwrap().noise_baseline_db, None);
     }
 
     #[test]
@@ -2001,6 +2052,7 @@ mod tests {
                     driver_installed: false,
                     ..Capabilities::full()
                 },
+                noise_baseline_db: None,
             });
         n.pump();
         let snap = n.engines[&PeerId(1)].snapshot().unwrap();
@@ -2027,6 +2079,7 @@ mod tests {
                 name: "Renamed".into(),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
+                noise_baseline_db: None,
             });
         n.pump();
         n.cut.clear();
@@ -2296,6 +2349,7 @@ mod tests {
                 name: format!("Mac {id}"),
                 mic_enabled: true,
                 capabilities: Capabilities::full(),
+                noise_baseline_db: None,
             },
         }
     }
@@ -2460,6 +2514,33 @@ mod tests {
             },
         );
         assert_eq!(e1.manifest(), Some(&cur));
+    }
+
+    #[test]
+    fn members_may_not_set_another_members_noise_baseline() {
+        let mut n = room(&[1, 2, 3]);
+        let cur = n.converged(&[1, 2, 3]);
+        let now = n.now;
+        let mut forged = cur.member(PeerId(3)).unwrap().clone();
+        forged.noise_baseline_db = Some(-10.0); // would mute Mac 3's mic
+        let e1 = coordinator(&mut n);
+        e1.on_message(
+            now,
+            PeerId(2),
+            ControlMessage::Request {
+                room_id: cur.room_id,
+                epoch: cur.epoch,
+                change: ChangeRequest::UpdateMember(forged.clone()),
+            },
+        );
+        assert_eq!(e1.manifest(), Some(&cur));
+        assert!(e1.roles().mic_baselines.is_empty());
+        // Nor may a member ask for it locally.
+        let e2 = n.engines.get_mut(&PeerId(2)).unwrap();
+        assert_eq!(
+            e2.change(now, ChangeRequest::UpdateMember(forged)),
+            Err(RoomError::NotPermitted)
+        );
     }
 
     #[test]

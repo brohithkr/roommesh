@@ -33,6 +33,7 @@ mod tests {
                 driver_installed: drv,
                 ..Capabilities::full()
             },
+            noise_baseline_db: None,
         };
         let mut r = RoomManifest::new(RoomId(1), "R".into(), mk(5, true));
         r.upsert_member(mk(2, false));

@@ -16,6 +16,18 @@ const FLOOR_WINDOW: usize = 200;
 const FLOOR_PERCENTILE: f32 = 0.05;
 const BIN_HZ: f32 = 48_000.0 / FFT_LEN as f32;
 
+/// The noise baseline a Mac uses until its user sets one: `None` = the automatic floor.
+/// (The Swift app keeps its own default in `SettingsStore`; change both together.)
+pub const DEFAULT_NOISE_BASELINE_DB: Option<f32> = None;
+
+/// A usable noise baseline: non-finite values count as `None`, others are clamped to
+/// -100..=0 dBFS.
+pub fn sanitize_baseline(baseline_db: Option<f32>) -> Option<f32> {
+    baseline_db
+        .filter(|b| b.is_finite())
+        .map(|b| b.clamp(-100.0, 0.0))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VadResult {
     pub speech_prob: f32,
@@ -85,9 +97,7 @@ impl Vad {
     /// at or below the baseline is never speech. The automatic floor keeps being tracked
     /// either way. A non-finite value counts as `None`; others are clamped to -100..=0 dB.
     pub fn set_baseline(&mut self, baseline_db: Option<f32>) {
-        self.baseline_db = baseline_db
-            .filter(|b| b.is_finite())
-            .map(|b| b.clamp(-100.0, 0.0));
+        self.baseline_db = sanitize_baseline(baseline_db);
     }
     pub fn baseline(&self) -> Option<f32> {
         self.baseline_db

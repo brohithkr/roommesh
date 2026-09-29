@@ -111,6 +111,8 @@ pub struct LocalRoles {
     pub is_speaker: bool,
     pub mic_enabled: bool,
     pub enabled_mics: Vec<PeerId>,
+    /// Noise baselines of the enabled mics that have one (see `MemberInfo::noise_baseline_db`).
+    pub mic_baselines: Vec<(PeerId, f32)>,
     pub members: Vec<PeerId>,
 }
 
@@ -125,6 +127,7 @@ impl LocalRoles {
             is_speaker: false,
             mic_enabled: false,
             enabled_mics: vec![],
+            mic_baselines: vec![],
             members: vec![],
         }
     }

@@ -94,6 +94,8 @@ pub struct CoordinatorPipeline {
     local: PeerId,
     epoch: Epoch,
     mics: BTreeMap<PeerId, MicChannel>,
+    /// Per-mic noise baselines (each member's own setting), applied to that mic's VAD.
+    baselines: BTreeMap<PeerId, f32>,
     reference: TimelineReader,
     ref_env: EnvelopeTracker,
     farend_enc: VoiceEncoder,
@@ -113,6 +115,7 @@ impl CoordinatorPipeline {
             local,
             epoch,
             mics: BTreeMap::new(),
+            baselines: BTreeMap::new(),
             reference: TimelineReader::new(SAMPLE_RATE, 3.0),
             ref_env: EnvelopeTracker::new(50),
             farend_seq: 0,
@@ -149,6 +152,8 @@ impl CoordinatorPipeline {
                 continue;
             }
             let is_local = p == self.local;
+            let mut vad = Vad::new();
+            vad.set_baseline(self.baselines.get(&p).copied());
             let ch = MicChannel {
                 rx: if is_local {
                     None
@@ -157,7 +162,7 @@ impl CoordinatorPipeline {
                 },
                 local: is_local.then(|| TimelineReader::new(SAMPLE_RATE, 3.0)),
                 aec: self.make_aec(),
-                vad: Vad::new(),
+                vad,
                 scorer: MicScorer::new(),
                 env: EnvelopeTracker::new(50),
                 last_level_db: -90.0,
@@ -175,6 +180,19 @@ impl CoordinatorPipeline {
             };
             self.mics.insert(p, ch);
         }
+    }
+
+    /// Sets each mic's noise baseline (a mic not listed has none: automatic floor). Applies to
+    /// the enabled mics now and to mics enabled later.
+    pub fn set_mic_baselines(&mut self, baselines: &[(PeerId, f32)]) {
+        self.baselines = baselines.iter().copied().collect();
+        for (p, ch) in self.mics.iter_mut() {
+            ch.vad.set_baseline(self.baselines.get(p).copied());
+        }
+    }
+    /// The noise baseline `peer`'s VAD is using (None: automatic, or the mic isn't enabled).
+    pub fn mic_baseline(&self, peer: PeerId) -> Option<f32> {
+        self.mics.get(&peer).and_then(|c| c.vad.baseline())
     }
 
     pub fn push_local_mic(&mut self, frame: &AudioFrame) {
@@ -514,6 +532,44 @@ mod tests {
             t += FRAME_NS;
         }
         assert!(energy > 0.01, "mixed output energy {energy}");
+    }
+    #[test]
+    fn a_mics_noise_baseline_reaches_its_vad() {
+        let mut sim = Sim::new(false);
+        let mut t = T0;
+        let mut run = |sim: &mut Sim, secs: u64| {
+            let mut last = Selection::default();
+            for _ in 0..secs * 100 {
+                last = sim.step(t, [0.05, 0.5, 0.08], 0.0, false).selection;
+                t += FRAME_NS;
+            }
+            last
+        };
+        assert_eq!(run(&mut sim, 2).primary, Some(PeerId(2)));
+        // Mac 2 sets a baseline above everything its mic hears: it is never speech any more,
+        // so the next-best mic takes over.
+        sim.pipe.set_mic_baselines(&[(PeerId(2), 0.0)]);
+        assert_eq!(sim.pipe.mic_baseline(PeerId(2)), Some(0.0));
+        assert_eq!(sim.pipe.mic_baseline(PeerId(3)), None);
+        assert_eq!(run(&mut sim, 3).primary, Some(PeerId(3)));
+        let st = sim.pipe.statuses();
+        let mic2 = st.iter().find(|s| s.peer == PeerId(2)).unwrap();
+        assert!(mic2.speech_prob < 0.1, "{mic2:?}");
+        // Cleared: automatic again.
+        sim.pipe.set_mic_baselines(&[]);
+        assert_eq!(sim.pipe.mic_baseline(PeerId(2)), None);
+        assert_eq!(run(&mut sim, 3).primary, Some(PeerId(2)));
+    }
+    #[test]
+    fn baselines_apply_to_mics_enabled_later() {
+        let mut pipe =
+            CoordinatorPipeline::new(PeerId(1), Epoch(1), CoordinatorConfig::default()).unwrap();
+        pipe.set_enabled_mics(&[PeerId(1)]);
+        pipe.set_mic_baselines(&[(PeerId(1), -50.0), (PeerId(2), -42.0)]);
+        assert_eq!(pipe.mic_baseline(PeerId(1)), Some(-50.0));
+        assert_eq!(pipe.mic_baseline(PeerId(2)), None, "not enabled yet");
+        pipe.set_enabled_mics(&[PeerId(1), PeerId(2)]);
+        assert_eq!(pipe.mic_baseline(PeerId(2)), Some(-42.0));
     }
     /// A remote stream whose packet grid is offset from the output grid by any phase must fully
     /// cover every output frame: the receive timeline is shifted back by the codec delay, so the
