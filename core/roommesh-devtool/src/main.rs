@@ -25,6 +25,9 @@ commands:
 
 options:
   --force           run a loopback even while the RoomMesh app looks live
+  --talk            noise-probe: skip the quiet part and measure talking only (start right away)
+  --quiet           noise-probe: measure the quiet part only
+  --seconds N       noise-probe: length of each measured part (default: 15 quiet, 10 talking)
   -h, --help        show this help
 
 The loopbacks drive the shared memory directly, so quit RoomMesh first; they refuse to run
@@ -337,16 +340,30 @@ impl PhaseStats {
 /// Captures the default microphone and runs it through the same chain the coordinator uses
 /// for every mic (WebRTC AEC with noise suppression, fed silence as the far-end reference, then
 /// the VAD), reporting levels for a quiet phase and a talking phase.
-fn cmd_noise_probe() -> Outcome {
+#[derive(Clone, Copy, PartialEq)]
+enum ProbeMode {
+    Both,
+    QuietOnly,
+    TalkOnly,
+}
+
+fn cmd_noise_probe(mode: ProbeMode, seconds: Option<f32>) -> Outcome {
     use roommesh_core::audio::device_io::{DeviceHost, DeviceSelector};
     use roommesh_core::dsp::aec::{EchoCanceller, WebRtcAec};
     use roommesh_core::dsp::level::measure;
     use roommesh_core::dsp::vad::Vad;
     use roommesh_core::engine::uplink::FrameAssembler;
 
-    const WARMUP_S: f32 = 2.0;
-    const QUIET_S: f32 = 15.0;
-    const TALK_S: f32 = 10.0;
+    // The first second only warms up the echo canceller and the VAD; it isn't measured.
+    const WARMUP_S: f32 = 1.0;
+    let quiet_s = match mode {
+        ProbeMode::TalkOnly => 0.0,
+        _ => seconds.unwrap_or(15.0),
+    };
+    let talk_s = match mode {
+        ProbeMode::QuietOnly => 0.0,
+        _ => seconds.unwrap_or(10.0),
+    };
     let host = DeviceHost::spawn();
     let mut cap = host
         .start_capture(DeviceSelector::Default)
@@ -359,13 +376,21 @@ fn cmd_noise_probe() -> Outcome {
     let (mut quiet, mut talk) = (PhaseStats::default(), PhaseStats::default());
     let mut first_frames = Vec::new();
     let (mut frames, mut all_zero) = (0usize, true);
-    println!(
-        "Stay QUIET for {:.0} s (normal room noise is fine)...",
-        WARMUP_S + QUIET_S
+    let talk_prompt = format!(
+        "TALK normally for {:.0} s (from where you'd sit in a meeting)...",
+        WARMUP_S + talk_s
     );
-    let mut prompted_talk = false;
+    if quiet_s > 0.0 {
+        println!(
+            "Stay QUIET for {:.0} s: don't type or touch the Mac (normal room noise is fine)...",
+            WARMUP_S + quiet_s
+        );
+    } else {
+        println!("Start talking now. {talk_prompt}");
+    }
+    let mut prompted_talk = quiet_s == 0.0;
     let start = Instant::now();
-    while start.elapsed().as_secs_f32() < WARMUP_S + QUIET_S + TALK_S {
+    while start.elapsed().as_secs_f32() < WARMUP_S + quiet_s + talk_s {
         while let Ok(b) = cap.blocks.pop() {
             assembler.push(b.first_frame, b.capture_ns, &b.samples[..b.len as usize]);
         }
@@ -383,7 +408,7 @@ fn cmd_noise_probe() -> Outcome {
             }
             let phase = if t < WARMUP_S {
                 continue;
-            } else if t < WARMUP_S + QUIET_S {
+            } else if t < WARMUP_S + quiet_s {
                 &mut quiet
             } else {
                 &mut talk
@@ -395,9 +420,9 @@ fn cmd_noise_probe() -> Outcome {
             phase.snr_db.push(r.snr_db);
             phase.speech_frames += r.is_speech as usize;
         }
-        if !prompted_talk && start.elapsed().as_secs_f32() >= WARMUP_S + QUIET_S {
+        if !prompted_talk && talk_s > 0.0 && start.elapsed().as_secs_f32() >= WARMUP_S + quiet_s {
             prompted_talk = true;
-            println!("Now TALK normally for {TALK_S:.0} s (from where you'd sit in a meeting)...");
+            println!("Now {talk_prompt}");
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -420,8 +445,12 @@ fn cmd_noise_probe() -> Outcome {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    quiet.report("QUIET");
-    talk.report("TALKING");
+    if quiet_s > 0.0 {
+        quiet.report("QUIET");
+    }
+    if talk_s > 0.0 {
+        talk.report("TALKING");
+    }
     Ok(true)
 }
 
@@ -432,14 +461,23 @@ fn usage_error(msg: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let mut force = false;
+    let mut mode = ProbeMode::Both;
+    let mut seconds: Option<f32> = None;
     let mut cmd: Option<String> = None;
-    for a in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
             "--force" => force = true,
+            "--talk" => mode = ProbeMode::TalkOnly,
+            "--quiet" => mode = ProbeMode::QuietOnly,
+            "--seconds" => match args.next().and_then(|v| v.parse::<f32>().ok()) {
+                Some(v) if v > 0.0 && v <= 600.0 => seconds = Some(v),
+                _ => return usage_error("--seconds needs a number of seconds (1-600)"),
+            },
             s if s.starts_with('-') => return usage_error(&format!("unknown option '{s}'")),
             s if cmd.is_none() => cmd = Some(s.to_string()),
             s => return usage_error(&format!("unexpected argument '{s}'")),
@@ -454,7 +492,7 @@ fn main() -> ExitCode {
         "shm-selftest" => cmd_shm_selftest(),
         "mic-loopback" => cmd_mic_loopback(force),
         "speaker-loopback" => cmd_speaker_loopback(force),
-        "noise-probe" => cmd_noise_probe(),
+        "noise-probe" => cmd_noise_probe(mode, seconds),
         other => return usage_error(&format!("unknown command '{other}'")),
     };
     match outcome {
