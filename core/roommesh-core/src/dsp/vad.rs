@@ -21,7 +21,11 @@ pub struct VadResult {
     pub speech_prob: f32,
     pub is_speech: bool,
     pub level_db: f32,
+    /// The effective noise floor: the tracked floor, raised to the baseline when one is set.
     pub noise_floor_db: f32,
+    /// The automatically tracked floor alone (what the VAD would use without a baseline).
+    pub auto_floor_db: f32,
+    /// `level_db - noise_floor_db`.
     pub snr_db: f32,
 }
 
@@ -36,6 +40,8 @@ pub struct Vad {
     recent_levels: VecDeque<f32>,
     level_scratch: Vec<f32>,
     noise_floor_db: f32,
+    /// User-set noise baseline (see [`Vad::set_baseline`]).
+    baseline_db: Option<f32>,
     prob: f32,
     hangover: u32,
     frames: u64,
@@ -66,10 +72,30 @@ impl Vad {
             recent_levels: VecDeque::with_capacity(FLOOR_WINDOW),
             level_scratch: Vec::with_capacity(FLOOR_WINDOW),
             noise_floor_db: -60.0,
+            baseline_db: None,
             prob: 0.0,
             hangover: 0,
             frames: 0,
             speech: false,
+        }
+    }
+
+    /// Sets a noise baseline (dBFS of the processed signal), or `None` for the automatic floor
+    /// alone. With a baseline the effective floor is `max(auto_floor, baseline)`, and a frame
+    /// at or below the baseline is never speech. The automatic floor keeps being tracked
+    /// either way. A non-finite value counts as `None`; others are clamped to -100..=0 dB.
+    pub fn set_baseline(&mut self, baseline_db: Option<f32>) {
+        self.baseline_db = baseline_db
+            .filter(|b| b.is_finite())
+            .map(|b| b.clamp(-100.0, 0.0));
+    }
+    pub fn baseline(&self) -> Option<f32> {
+        self.baseline_db
+    }
+    fn effective_floor(&self) -> f32 {
+        match self.baseline_db {
+            Some(b) => self.noise_floor_db.max(b),
+            None => self.noise_floor_db,
         }
     }
 
@@ -110,7 +136,8 @@ impl Vad {
                 speech_prob: self.prob,
                 is_speech: self.speech,
                 level_db: -120.0,
-                noise_floor_db: self.noise_floor_db,
+                noise_floor_db: self.effective_floor(),
+                auto_floor_db: self.noise_floor_db,
                 snr_db: 0.0,
             };
         }
@@ -152,10 +179,11 @@ impl Vad {
             self.noise_floor_db = self.noise_floor_db.max(self.recent_level_percentile());
         }
         self.noise_floor_db = self.noise_floor_db.max(-100.0);
-        let snr_db = level_db - self.noise_floor_db;
+        let floor_db = self.effective_floor();
+        let snr_db = level_db - floor_db;
 
         let mut logit = 0.4 * (snr_db - 8.0) + 6.0 * (0.35 - flatness) + 3.0 * (band_ratio - 0.5);
-        if level_db < -75.0 {
+        if level_db < -75.0 || self.baseline_db.is_some_and(|b| level_db <= b) {
             logit = -10.0;
         }
         let inst = 1.0 / (1.0 + (-logit).exp());
@@ -178,7 +206,8 @@ impl Vad {
             speech_prob: self.prob,
             is_speech: self.speech,
             level_db,
-            noise_floor_db: self.noise_floor_db,
+            noise_floor_db: floor_db,
+            auto_floor_db: self.noise_floor_db,
             snr_db,
         }
     }
@@ -203,6 +232,10 @@ mod tests {
         (0..480).map(|_| rng.uni() * amp(db)).collect()
     }
     fn voiced(frame: usize, rng: &mut Rng, noise_db: f32) -> Vec<f32> {
+        voiced_with_gain(frame, rng, 0.08, noise_db)
+    }
+    /// A voiced-speech-like signal; `gain` 0.08 is about -28 dB (a close talker).
+    fn voiced_with_gain(frame: usize, rng: &mut Rng, gain: f32, noise_db: f32) -> Vec<f32> {
         (0..480)
             .map(|k| {
                 let t = (frame * 480 + k) as f32 / 48_000.0;
@@ -210,7 +243,7 @@ mod tests {
                 let v: f32 = (1..=10)
                     .map(|h| (2.0 * std::f32::consts::PI * 140.0 * h as f32 * t).sin() / h as f32)
                     .sum();
-                0.08 * env * v + rng.uni() * amp(noise_db)
+                gain * env * v + rng.uni() * amp(noise_db)
             })
             .collect()
     }
@@ -339,5 +372,75 @@ mod tests {
             !r.is_speech,
             "a broken source must not be reported as speaking forever"
         );
+    }
+    #[test]
+    fn a_baseline_above_the_room_noise_keeps_it_from_ever_being_speech() {
+        // Distant chatter (a TV next door): speech-like, but quiet. The automatic floor alone
+        // takes it for speech; a baseline above its level never does.
+        let distant = |v: &mut Vad| {
+            let mut rng = Rng(11);
+            for _ in 0..100 {
+                v.process(&noise(&mut rng, -70.0));
+            }
+            (0..300)
+                .map(|f| v.process(&voiced_with_gain(f, &mut rng, 0.004, -70.0)))
+                .collect::<Vec<_>>()
+        };
+        let auto = distant(&mut Vad::new());
+        assert!(
+            auto.iter().filter(|r| r.is_speech).count() > 100,
+            "the automatic floor should take distant chatter for speech"
+        );
+        let peak = auto.iter().map(|r| r.level_db).fold(f32::MIN, f32::max);
+        let mut v = Vad::new();
+        v.set_baseline(Some(peak + 1.0));
+        let res = distant(&mut v);
+        let speech = res.iter().filter(|r| r.is_speech).count();
+        assert_eq!(
+            speech, 0,
+            "noise under the baseline was speech in {speech} frames"
+        );
+        for r in &res {
+            assert_eq!(r.noise_floor_db, r.auto_floor_db.max(peak + 1.0));
+            assert!(
+                r.auto_floor_db < peak,
+                "the automatic floor is still tracked"
+            );
+            assert_eq!(r.snr_db, r.level_db - r.noise_floor_db);
+        }
+    }
+    #[test]
+    fn speech_well_above_the_baseline_is_still_detected() {
+        let mut v = Vad::new();
+        v.set_baseline(Some(-45.0));
+        let mut rng = Rng(7);
+        for _ in 0..100 {
+            let r = v.process(&noise(&mut rng, -50.0));
+            assert!(!r.is_speech);
+            assert_eq!(
+                r.noise_floor_db, -45.0,
+                "the baseline is above the room floor"
+            );
+        }
+        let speech: Vec<VadResult> = (0..100)
+            .map(|f| v.process(&voiced(f, &mut rng, -50.0)))
+            .collect();
+        let frac = speech[10..].iter().filter(|r| r.is_speech).count() as f32 / 90.0;
+        assert!(frac > 0.8, "speech fraction {frac}");
+    }
+    #[test]
+    fn the_baseline_can_be_cleared_and_ignores_nonsense() {
+        let mut v = Vad::new();
+        let mut rng = Rng(3);
+        v.set_baseline(Some(-30.0));
+        let r = v.process(&noise(&mut rng, -50.0));
+        assert_eq!(r.noise_floor_db, -30.0);
+        v.set_baseline(None);
+        let r = v.process(&noise(&mut rng, -50.0));
+        assert_eq!(r.noise_floor_db, r.auto_floor_db);
+        v.set_baseline(Some(f32::NAN));
+        assert_eq!(v.baseline(), None);
+        v.set_baseline(Some(40.0));
+        assert_eq!(v.baseline(), Some(0.0));
     }
 }
