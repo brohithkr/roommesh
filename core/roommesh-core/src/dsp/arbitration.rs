@@ -1,4 +1,6 @@
 //! Active-microphone arbitration: confidence margin + confirmation period + minimum hold.
+//! There is no primary until a mic hears speech; after that the last talker's mic is held
+//! through silence.
 //! Optionally admits one simultaneous, *different* talker (low envelope correlation).
 use crate::ids::PeerId;
 use std::cmp::Ordering;
@@ -115,11 +117,15 @@ impl Arbiter {
             return self.selection();
         }
         match self.primary {
+            // No active mic until someone actually speaks: picking the best score in a silent
+            // room would make the quietest mic the default. Once chosen, a primary is held
+            // through silence (the last talker's mic stays selected).
             None => {
-                let best = obs.iter().max_by(by_score).unwrap();
-                self.primary = Some(best.peer);
-                self.primary_since = now_ms;
                 self.candidate = None;
+                if let Some(best) = obs.iter().filter(|o| o.speaking).max_by(by_score) {
+                    self.primary = Some(best.peer);
+                    self.primary_since = now_ms;
+                }
             }
             Some(p) => {
                 let cur = find(p).unwrap();
@@ -236,6 +242,46 @@ mod tests {
             no_corr,
         );
         assert_eq!(s.primary, Some(B));
+    }
+    #[test]
+    fn silent_room_has_no_primary() {
+        let mut arb = Arbiter::new(ArbitrationConfig::default());
+        // Nobody speaks: the quietest (best-scoring) mic must not become the default.
+        let quiet = [o(A, 0.05), o(B, 0.2), o(C, 0.1)];
+        assert_eq!(run(&mut arb, 0, 3000, &quiet), Selection::default());
+        let quiet_but_high = [
+            MicObservation {
+                peer: A,
+                score: 0.9,
+                speaking: false,
+            },
+            o(B, 0.1),
+        ];
+        assert_eq!(
+            run(&mut arb, 3010, 4000, &quiet_but_high),
+            Selection::default(),
+            "a high score without speech picks nothing"
+        );
+    }
+    #[test]
+    fn first_speaker_becomes_primary_and_is_held_through_silence() {
+        let mut arb = Arbiter::new(ArbitrationConfig::default());
+        run(&mut arb, 0, 1000, &[o(A, 0.05), o(B, 0.1), o(C, 0.2)]);
+        assert_eq!(arb.selection().primary, None);
+        // C starts talking (another mic scores higher but isn't speech).
+        let talk = [
+            MicObservation {
+                peer: A,
+                score: 0.95,
+                speaking: false,
+            },
+            o(B, 0.1),
+            o(C, 0.7),
+        ];
+        assert_eq!(arb.update(1010, &talk, no_corr).primary, Some(C));
+        // C stops: the room goes quiet, and C's mic stays selected.
+        let quiet = [o(A, 0.05), o(B, 0.2), o(C, 0.1)];
+        assert_eq!(run(&mut arb, 1020, 5000, &quiet).primary, Some(C));
     }
     #[test]
     fn small_margin_keeps_current() {

@@ -536,6 +536,33 @@ mod tests {
         assert!(energy > 0.01, "mixed output energy {energy}");
     }
     #[test]
+    fn no_active_mic_until_someone_speaks_then_the_last_talker_is_held() {
+        let mut sim = Sim::new(false);
+        let mut t = T0;
+        let mut run = |sim: &mut Sim, secs: f64, gains: [f32; 3]| {
+            let mut last = Selection::default();
+            let mut energy = 0.0f32;
+            for _ in 0..(secs * 100.0) as u64 {
+                let out = sim.step(t, gains, 0.0, false);
+                last = out.selection;
+                energy += out.samples.iter().map(|v| v * v).sum::<f32>();
+                t += FRAME_NS;
+            }
+            (last, energy)
+        };
+        // A silent room (each mic hears only its own faint noise): no active mic, silence out.
+        let (sel, energy) = run(&mut sim, 3.0, [0.0; 3]);
+        assert_eq!(sel, Selection::default());
+        assert_eq!(energy, 0.0);
+        // Someone talks near mic 3: it becomes the active mic.
+        assert_eq!(
+            run(&mut sim, 1.0, [0.02, 0.03, 0.5]).0.primary,
+            Some(PeerId(3))
+        );
+        // They stop: mic 3 stays selected through the silence.
+        assert_eq!(run(&mut sim, 3.0, [0.0; 3]).0.primary, Some(PeerId(3)));
+    }
+    #[test]
     fn a_mics_noise_baseline_reaches_its_vad() {
         let mut sim = Sim::new(false);
         let mut t = T0;
