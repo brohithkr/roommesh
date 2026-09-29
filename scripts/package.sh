@@ -15,12 +15,15 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$ROOT/app/RoomMesh/Resources/Info.plist")
-APP="$ROOT/app/build/Build/Products/Release/RoomMesh.app"
+APP="$ROOT/app/build.noindex/Build/Products/Release/RoomMesh.app"
 DRIVER="$ROOT/driver/build/RoomMesh.driver"
 INSTALLER="$ROOT/installer"
 MIN_OS=14.2
 DIST="$ROOT/dist"
-WORK="$DIST/build"
+# Staging (which holds a full copy of RoomMesh.app) lives in a temporary directory, never in the
+# repo: a leftover copy is indexed by Spotlight and shows up as another "RoomMesh" in Launchpad.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/roommesh-package.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
 PKG="$DIST/RoomMesh-$VERSION.pkg"
 APP_ID=io.github.brohithkr.RoomMesh.app.pkg
 DRIVER_ID=io.github.brohithkr.RoomMesh.driver.pkg
@@ -56,7 +59,7 @@ check_archs() {
 check_archs "$APP/Contents/MacOS/RoomMesh" "$APP_ARCHS"
 check_archs "$DRIVER/Contents/MacOS/RoomMesh" "$DRIVER_ARCHS"
 
-rm -rf "$DIST"
+rm -rf "$DIST" && mkdir -p "$DIST"
 APP_ROOT="$WORK/app-root"
 DRIVER_ROOT="$WORK/driver-root"
 COMPONENTS="$WORK/components"

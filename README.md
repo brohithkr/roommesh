@@ -34,7 +34,7 @@ in [`docs/security.md`](docs/security.md).
 ```sh
 make bootstrap    # one-time: installs toolchains (rustup, cmake, ninja, xcodegen, ...)
 make test         # cargo test + clippy, driver ctest, Xcode unit tests
-make app          # builds app/build/Build/Products/Release/RoomMesh.app
+make app          # builds app/build.noindex/Build/Products/Release/RoomMesh.app
 ```
 
 `make` targets build incrementally in order: `core` (Rust static lib + generated Swift
@@ -179,8 +179,8 @@ invite/join, coordinator/speaker election) with two app instances on one Mac. Ea
 needs its own identity, so the second one runs under a separate `UserDefaults` profile:
 
 ```sh
-open app/build/Build/Products/Release/RoomMesh.app
-ROOMMESH_PROFILE=b open -n app/build/Build/Products/Release/RoomMesh.app
+open app/build.noindex/Build/Products/Release/RoomMesh.app
+ROOMMESH_PROFILE=b open -n app/build.noindex/Build/Products/Release/RoomMesh.app
 ```
 
 The two instances should discover each other under "Nearby Macs" within a few seconds; from

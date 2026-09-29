@@ -9,7 +9,8 @@ DIST="$ROOT/dist"
 PKG="$DIST/RoomMesh-$VERSION.pkg"
 DMG="$DIST/RoomMesh-$VERSION.dmg"
 UNINSTALLER="$ROOT/installer/Uninstall RoomMesh.command"
-STAGE="$DIST/build/dmg"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/roommesh-dmg.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
 
 die() { echo "error: $*" >&2; exit 1; }
 

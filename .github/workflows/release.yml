@@ -134,7 +134,7 @@ jobs:
 
       - name: Check the build
         run: |
-          app=app/build/Build/Products/Release/RoomMesh.app
+          app=app/build.noindex/Build/Products/Release/RoomMesh.app
           plist="$app/Contents/Info.plist"
           got_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
           got_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")

@@ -9,7 +9,7 @@ export MACOSX_DEPLOYMENT_TARGET := 14.2
 # to install on Intel Macs.
 UNIVERSAL ?= 0
 export UNIVERSAL
-XCB_BASE := xcodebuild -project app/RoomMesh.xcodeproj -scheme RoomMesh -derivedDataPath app/build
+XCB_BASE := xcodebuild -project app/RoomMesh.xcodeproj -scheme RoomMesh -derivedDataPath app/build.noindex
 # A bare 'platform=macOS' destination resolves to the generic "Any Mac" destination. For a Release
 # build ONLY_ACTIVE_ARCH is NO, so xcodebuild still targets ARCHS_STANDARD (arm64 + x86_64)
 # regardless of the destination's arch, and linking fails since the core xcframework is single-arch
@@ -55,4 +55,4 @@ package: dmg
 # ffi/ staging there too).
 clean:
 	cd core && cargo clean
-	rm -rf driver/build app/build app/build-* app/RoomMesh.xcodeproj app/Frameworks app/RoomMesh/RustBridge/Generated dist
+	rm -rf driver/build app/build.noindex app/*.noindex app/build app/build-* app/RoomMesh.xcodeproj app/Frameworks app/RoomMesh/RustBridge/Generated dist

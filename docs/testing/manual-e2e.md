@@ -19,8 +19,8 @@ Copy the results template at the end for each test run.
 Start two instances. The second one uses a separate profile, so it gets its own identity:
 
 ```sh
-open app/build/Build/Products/Release/RoomMesh.app
-ROOMMESH_PROFILE=b open -n app/build/Build/Products/Release/RoomMesh.app
+open app/build.noindex/Build/Products/Release/RoomMesh.app
+ROOMMESH_PROFILE=b open -n app/build.noindex/Build/Products/Release/RoomMesh.app
 ```
 
 | # | Check | Result (✓/✗) | Notes |
