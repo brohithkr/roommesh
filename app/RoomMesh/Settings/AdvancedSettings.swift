@@ -17,6 +17,7 @@ struct AdvancedSettings: View {
             }
             Text("AEC: \(model.aecConverged ? "converged" : "adapting")").font(.caption).foregroundStyle(.secondary)
             TimelineView(.periodic(from: .now, by: 1)) { _ in
+                AudioHealthSection(health: model.audioHealth(), name: { model.name(of: $0) }, reset: model.resetAudioHealth)
                 let rows = model.metrics()
                 Table(rows) {
                     TableColumn("Mac") { Text($0.name.isEmpty ? $0.peerId : $0.name).lineLimit(1) }.width(min: 90, ideal: 110)
@@ -39,3 +40,35 @@ struct AdvancedSettings: View {
 }
 
 extension FfiPeerMetrics: Identifiable { public var id: String { peerId } }
+
+/// Where this Mac's audio was lost over the last minute (see `AudioHealthText`).
+struct AudioHealthSection: View {
+    let health: FfiAudioHealth?
+    let name: (String) -> String?
+    let reset: () -> Void
+
+    var body: some View {
+        GroupBox {
+            if let health {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 3) {
+                    ForEach(AudioHealthText.rows(health, name: name)) { row in
+                        GridRow {
+                            Text(row.label).foregroundStyle(.secondary)
+                            Text(row.value).monospacedDigit()
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text("Audio isn't running.").foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } label: {
+            HStack {
+                Text("Audio health").font(.headline)
+                if let health { Text(AudioHealthText.span(health)).font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                Button("Reset counters", action: reset).controlSize(.small).disabled(health == nil)
+            }
+        }
+    }
+}
