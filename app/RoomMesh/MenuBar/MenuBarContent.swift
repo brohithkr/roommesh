@@ -28,7 +28,15 @@ struct MenuBarContent: View {
                         .disabled(!m.online)
                 }
             }
-            Text("Active Mic: \(model.activeMicName ?? "—")" + (model.secondaryMicName.map { " + \($0)" } ?? ""))
+            if let primary = model.activeMicName, let secondary = model.secondaryMicName {
+                // Two talkers: one row each, so the menu grows taller instead of wider.
+                Section("Active Mics") {
+                    Text(primary)
+                    Text(secondary)
+                }
+            } else {
+                Text("Active Mic: \(model.activeMicName ?? "—")")
+            }
             Divider()
             Toggle("Use This Mac's Microphone", isOn: Binding(get: { model.useMyMic }, set: { model.setUseMyMic($0) }))
             Button(model.isMuted ? "Unmute My Microphone" : "Mute My Microphone") { model.toggleMute() }

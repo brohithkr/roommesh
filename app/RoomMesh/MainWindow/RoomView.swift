@@ -39,8 +39,11 @@ struct RoomView: View {
                              requiresDriver: true) { model.setCoordinator($0) }
                 MemberPicker(title: "Room Speaker", selection: room.speaker, members: room.members.filter(\.online)) { model.setSpeaker($0) }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Active Microphone").font(.caption).foregroundStyle(.secondary)
+                    Text(model.secondaryMicName == nil ? "Active Microphone" : "Active Microphones").font(.caption).foregroundStyle(.secondary)
                     Label(model.activeMicName ?? "—", systemImage: "waveform").foregroundStyle(model.activeMicName == nil ? .secondary : .primary)
+                    if let secondary = model.secondaryMicName {
+                        Label(secondary, systemImage: "waveform")
+                    }
                 }
                 Divider()
                 ForEach(room.members, id: \.id) { PeerRow(member: $0) }
