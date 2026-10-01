@@ -36,8 +36,12 @@ final class AppModel {
     let updates: UpdateChecker
     @ObservationIgnored private(set) var core: (any RoomMeshCoreProtocol)?
     private(set) var localPeerId = ""
+    /// Keeps App Nap off while this Mac carries audio (see `carryingAudio`).
+    @ObservationIgnored let audioActivity: AudioActivity
+    /// Settings' noise meter is running (it captures the mic even outside a room).
+    @ObservationIgnored private(set) var meterRunning = false
 
-    var room: FfiRoomState?
+    var room: FfiRoomState? { didSet { updateAudioActivity() } }
     var nearby: [FfiNearbyPeer] = []
     var incomingInvite: PendingInvite? { didSet { updateWindowFloating() } }
     var coordinatorLostCandidates: [String]? { didSet { updateWindowFloating() } }
@@ -96,12 +100,13 @@ final class AppModel {
     /// Id of the sheet SwiftUI last presented (see `sheetDidPresent`).
     @ObservationIgnored private(set) var presentedSheetID: String?
 
-    /// `nil` → the app's persisted settings / the live update checker. (A `SettingsStore(...)`
-    /// default argument would be evaluated outside the main actor.)
-    init(settings: SettingsStore? = nil, updates: UpdateChecker? = nil) {
+    /// `nil` → the app's persisted settings / the live update checker / the system's App Nap
+    /// activity. (A `SettingsStore(...)` default argument would be evaluated outside the main actor.)
+    init(settings: SettingsStore? = nil, updates: UpdateChecker? = nil, audioActivity: AudioActivity? = nil) {
         let settings = settings ?? SettingsStore(defaults: .roomMesh)
         self.settings = settings
         self.updates = updates ?? UpdateChecker.live(settings: settings)
+        self.audioActivity = audioActivity ?? AudioActivity()
     }
 
     func bootstrap(driverInstalled: Bool) {
@@ -146,10 +151,14 @@ final class AppModel {
         if inRoom { try? core?.leaveRoom() }
         core?.stopAudioEngine()
         core?.stop()
+        audioActivity.update(carryingAudio: false)
     }
 
     // MARK: derived state
     var inRoom: Bool { room != nil }
+    /// This Mac's audio is running: in a room, or the noise meter is on.
+    var carryingAudio: Bool { inRoom || meterRunning }
+    private func updateAudioActivity() { audioActivity.update(carryingAudio: carryingAudio) }
     func name(of id: String?) -> String? {
         guard let id else { return nil }
         return room?.members.first { $0.id == id }?.name ?? nearby.first { $0.id == id }?.name
@@ -276,8 +285,15 @@ final class AppModel {
         }
     }
     /// The live mic meter behind Settings › Audio (see `NoiseMeterModel`).
-    func setMicMeterEnabled(_ enabled: Bool) { core?.setMicMeterEnabled(enabled: enabled) }
+    func setMicMeterEnabled(_ enabled: Bool) {
+        meterRunning = enabled
+        core?.setMicMeterEnabled(enabled: enabled)
+        updateAudioActivity()
+    }
     func micMeter() -> FfiMicMeter? { core?.getMicMeter() }
+    /// Where audio was lost, for Settings › Advanced (`nil` before the core starts).
+    func audioHealth() -> FfiAudioHealth? { core?.getAudioHealth() }
+    func resetAudioHealth() { core?.resetAudioHealth() }
     /// Polled every 2 s and after driver changes; assigns only on change so views don't re-render needlessly.
     func refreshStatus() {
         let available = core?.virtualDeviceAvailable() ?? false

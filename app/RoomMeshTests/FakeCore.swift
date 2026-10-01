@@ -34,6 +34,9 @@ final class FakeCore: RoomMeshCoreProtocol, @unchecked Sendable {
     var meter: FfiMicMeter?
     func setMicMeterEnabled(enabled: Bool) { calls.append("meter:\(enabled)") }
     func getMicMeter() -> FfiMicMeter? { meter }
+    var health = emptyHealth()
+    func getAudioHealth() -> FfiAudioHealth { health }
+    func resetAudioHealth() { calls.append("resetHealth") }
     func setLocalInfo(name: String, driverInstalled: Bool) {}
     func getRoomState() -> FfiRoomState? { room }
     func getNearbyPeers() -> [FfiNearbyPeer] { [] }
@@ -55,4 +58,14 @@ func sampleRoom(noiseBaselineDb: Float? = nil) -> FfiRoomState {
                            member("000000000000000b", "Amaan's MacBook", active: true),
                            member("000000000000000c", "Meeting MacBook", speaker: true),
                            member("000000000000000d", "Puyan's MacBook", online: false)])
+}
+
+func healthCounts(wakes: UInt64 = 0, worst: Float = 0, p99: Float = 0, underruns: UInt64 = 0, underrunMs: Float = 0, gapMs: Float = 0,
+                  late: UInt64 = 0, restarts: UInt64 = 0, silenceMs: Float = 0, missing: [FfiMicMissing] = []) -> FfiHealthCounts {
+    FfiHealthCounts(wakes: wakes, wakeWorstMs: worst, wakeP99Ms: p99, speakerUnderruns: underruns, speakerUnderrunMs: underrunMs,
+                    speakerGapMs: gapMs, lateMeetingFrames: late, meetingRestarts: restarts, micSilenceMs: silenceMs, micMissing: missing)
+}
+func emptyHealth(_ status: FfiRealtimeStatus = .normalPriority, lastMinute: FfiHealthCounts = healthCounts(),
+                 demotions: UInt32 = 0, windowSecs: UInt32 = 60) -> FfiAudioHealth {
+    FfiAudioHealth(realtime: status, demotions: demotions, windowSecs: windowSecs, lastMinute: lastMinute, sinceStart: healthCounts())
 }
