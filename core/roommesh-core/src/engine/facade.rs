@@ -21,6 +21,7 @@
 //! has outstanding with the same t1 (once). Pings themselves pass a per-sender replay window
 //! (scoped to the session key and epoch; older epochs are rejected) before they are answered.
 use crate::dsp::vad::{sanitize_baseline, DEFAULT_NOISE_BASELINE_DB};
+use crate::engine::health::AudioHealth;
 use crate::engine::meter::MicMeter;
 use crate::engine::metrics::{merge_local_report, PeerMetrics};
 use crate::engine::runtime::{
@@ -519,6 +520,14 @@ impl Core {
             return None;
         }
         *self.runtime_shared.mic_meter.lock()
+    }
+    /// The audio health counters and the audio thread's scheduling (republished every second).
+    pub fn audio_health(&self) -> AudioHealth {
+        self.runtime_shared.health.lock().clone()
+    }
+    /// Clears the audio health counters.
+    pub fn reset_audio_health(&self) {
+        self.runtime.send(RuntimeMsg::ResetHealth);
     }
     pub fn update_audio_settings(&self, s: AudioSettings) {
         self.runtime.send(RuntimeMsg::Settings(s));
@@ -1124,6 +1133,36 @@ mod tests {
         assert_eq!(n.core.mic_meter(), Some(reading));
         n.core.set_mic_meter_enabled(false);
         assert_eq!(n.core.mic_meter(), None);
+    }
+
+    #[test]
+    fn audio_health_is_read_from_the_runtime_and_reset_through_it() {
+        use crate::engine::health::{AudioHealth, HealthCounts};
+        let net = LoopbackNetwork::new();
+        let n = node(&net, 1, Box::new(NullAudio));
+        n.core.start_audio();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            n.core.audio_health().window_secs >= 1,
+            "published by the DSP thread"
+        );
+        let stale = AudioHealth {
+            last_minute: HealthCounts {
+                farend_late_frames: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        *n.core.runtime_shared.health.lock() = stale.clone();
+        assert_eq!(n.core.audio_health(), stale);
+        n.core.reset_audio_health();
+        std::thread::sleep(Duration::from_millis(50));
+        let h = n.core.audio_health();
+        assert_eq!(
+            h.last_minute.farend_late_frames, 0,
+            "republished after the reset"
+        );
+        assert_eq!(h.window_secs, 1);
     }
 
     #[test]

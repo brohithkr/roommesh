@@ -2,8 +2,10 @@
 use crate::audio::device_io::{list_devices, DeviceSelector};
 use crate::dsp::vad::sanitize_baseline;
 use crate::engine::facade::{Core, CoreConfig, EventSink};
+use crate::engine::health::{AudioHealth, HealthCounts};
 use crate::engine::meter::MicMeter;
 use crate::engine::metrics::PeerMetrics;
+use crate::engine::realtime::RtStatus;
 use crate::engine::runtime::{AudioSettings, SystemAudio};
 use crate::ids::{PeerId, RoomId};
 use crate::network::transport::{LocalAdvertisement, PeerTransport, TransportEvent};
@@ -186,6 +188,100 @@ impl From<MicMeter> for FfiMicMeter {
             peak_db: m.peak_db,
             auto_floor_db: m.auto_floor_db,
         }
+    }
+}
+
+/// How the audio thread is scheduled.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiRealtimeStatus {
+    /// An ordinary thread: real-time scheduling was refused, or the system took it away.
+    NormalPriority,
+    /// Real-time (time-constraint) scheduling without an audio workgroup.
+    TimeConstraintOnly,
+    /// Real-time scheduling in an audio workgroup.
+    WorkgroupAndTimeConstraint,
+}
+
+/// Mic audio one Mac's mic could not supply when the room mic needed it.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FfiMicMissing {
+    pub peer_id: String,
+    pub missing_ms: f32,
+}
+
+/// Where audio was lost over some span (see [`FfiAudioHealth`]).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FfiHealthCounts {
+    /// Audio thread wakes counted.
+    pub wakes: u64,
+    /// How much later than asked the audio thread woke: the worst, and 99% of wakes within.
+    pub wake_worst_ms: f32,
+    pub wake_p99_ms: f32,
+    /// Times the room speaker's output ran dry and played silence, and how much in total.
+    pub speaker_underruns: u64,
+    pub speaker_underrun_ms: f32,
+    /// Meeting audio missing at its play time on the room speaker (gaps inside the stream).
+    pub speaker_gap_ms: f32,
+    /// Meeting audio frames (10 ms each) dropped because their play time had passed.
+    pub late_meeting_frames: u64,
+    /// Times the meeting audio stream from RoomMesh Speaker restarted (a discontinuity).
+    pub meeting_restarts: u64,
+    /// Room mic written as silence after the audio thread stalled.
+    pub mic_silence_ms: f32,
+    /// Per Mac, only those whose mic missed something (coordinator only).
+    pub mic_missing: Vec<FfiMicMissing>,
+}
+
+/// The audio health counters (`get_audio_health`).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FfiAudioHealth {
+    pub realtime: FfiRealtimeStatus,
+    /// Times the system took real-time scheduling away from the audio thread.
+    pub demotions: u32,
+    /// Seconds `last_minute` covers (less than 60 right after audio started or a reset).
+    pub window_secs: u32,
+    pub last_minute: FfiHealthCounts,
+    /// Since audio started or the counters were reset.
+    pub since_start: FfiHealthCounts,
+}
+
+fn ms(ns: u64) -> f32 {
+    (ns as f64 / 1e6) as f32
+}
+
+fn health_counts(c: HealthCounts) -> FfiHealthCounts {
+    FfiHealthCounts {
+        wakes: c.wakes,
+        wake_worst_ms: ms(c.wake_worst_ns),
+        wake_p99_ms: ms(c.wake_p99_ns),
+        speaker_underruns: c.speaker_underruns,
+        speaker_underrun_ms: ms(c.speaker_underrun_ns),
+        speaker_gap_ms: ms(c.speaker_missing_ns),
+        late_meeting_frames: c.farend_late_frames,
+        meeting_restarts: c.farend_resets,
+        mic_silence_ms: ms(c.mic_silence_slots * crate::audio::frames::FRAME_NS),
+        mic_missing: c
+            .mic_missing_ns
+            .into_iter()
+            .map(|(p, ns)| FfiMicMissing {
+                peer_id: hex(p),
+                missing_ms: ms(ns),
+            })
+            .collect(),
+    }
+}
+
+pub fn audio_health(h: AudioHealth) -> FfiAudioHealth {
+    FfiAudioHealth {
+        realtime: match h.realtime {
+            RtStatus::NormalPriority => FfiRealtimeStatus::NormalPriority,
+            RtStatus::TimeConstraintOnly => FfiRealtimeStatus::TimeConstraintOnly,
+            RtStatus::WorkgroupAndTimeConstraint => FfiRealtimeStatus::WorkgroupAndTimeConstraint,
+        },
+        demotions: h.demotions,
+        window_secs: h.window_secs,
+        last_minute: health_counts(h.last_minute),
+        since_start: health_counts(h.since_start),
     }
 }
 
@@ -631,6 +727,15 @@ impl RoomMeshCore {
     pub fn get_mic_meter(&self) -> Option<FfiMicMeter> {
         self.core.mic_meter().map(FfiMicMeter::from)
     }
+    /// Where audio was lost over the last minute and since audio started, and how the audio
+    /// thread is scheduled. Updated once a second.
+    pub fn get_audio_health(&self) -> FfiAudioHealth {
+        audio_health(self.core.audio_health())
+    }
+    /// Clears the audio health counters.
+    pub fn reset_audio_health(&self) {
+        self.core.reset_audio_health();
+    }
     pub fn set_local_info(&self, name: String, driver_installed: bool) {
         self.core
             .set_local_info(name, capabilities(driver_installed));
@@ -716,6 +821,61 @@ mod tests {
         assert_eq!(a.coordinator.mic_latency_ns, 70_000_000);
         assert_eq!(a.coordinator.playout_delay_ns, 90_000_000);
     }
+    #[test]
+    fn audio_health_maps_to_ms_and_hex_ids() {
+        let counts = HealthCounts {
+            wakes: 30_000,
+            wake_worst_ns: 1_800_000,
+            wake_p99_ns: 400_000,
+            speaker_underruns: 2,
+            speaker_underrun_ns: 12_500_000,
+            speaker_missing_ns: 20_000_000,
+            farend_late_frames: 3,
+            farend_resets: 1,
+            mic_silence_slots: 4,
+            mic_missing_ns: vec![(PeerId(0xab), 30_000_000)],
+        };
+        let h = audio_health(AudioHealth {
+            realtime: RtStatus::WorkgroupAndTimeConstraint,
+            demotions: 1,
+            window_secs: 60,
+            last_minute: counts.clone(),
+            since_start: HealthCounts::default(),
+        });
+        assert_eq!(h.realtime, FfiRealtimeStatus::WorkgroupAndTimeConstraint);
+        assert_eq!((h.demotions, h.window_secs), (1, 60));
+        let m = &h.last_minute;
+        assert_eq!(m.wakes, 30_000);
+        assert_eq!(m.wake_worst_ms, 1.8);
+        assert_eq!(m.wake_p99_ms, 0.4);
+        assert_eq!((m.speaker_underruns, m.speaker_underrun_ms), (2, 12.5));
+        assert_eq!(m.speaker_gap_ms, 20.0);
+        assert_eq!((m.late_meeting_frames, m.meeting_restarts), (3, 1));
+        assert_eq!(m.mic_silence_ms, 40.0);
+        assert_eq!(
+            m.mic_missing,
+            vec![FfiMicMissing {
+                peer_id: "00000000000000ab".into(),
+                missing_ms: 30.0
+            }]
+        );
+        assert_eq!(h.since_start.wakes, 0);
+        assert!(h.since_start.mic_missing.is_empty());
+        for (rt, ffi) in [
+            (RtStatus::NormalPriority, FfiRealtimeStatus::NormalPriority),
+            (
+                RtStatus::TimeConstraintOnly,
+                FfiRealtimeStatus::TimeConstraintOnly,
+            ),
+        ] {
+            let h = audio_health(AudioHealth {
+                realtime: rt,
+                ..Default::default()
+            });
+            assert_eq!(h.realtime, ffi);
+        }
+    }
+
     #[test]
     fn events_convert_with_hex_ids() {
         let e = to_ffi_event(RoomEvent::ActiveMicChanged {

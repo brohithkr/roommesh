@@ -1,10 +1,15 @@
 //! The audio runtime: owns devices and pipelines on one DSP thread and follows `LocalRoles`.
 //!
-//! One thread, woken every 2 ms or by a message. Per step: virtual-device monitor → device
-//! reconcile/watchdog → clock-sync pings (non-coordinators) → drain capture → uplink or local
-//! mic → (coordinator) far-end in from the speaker ring, schedule to the room speaker, produce
-//! mic frames on a host-time 10 ms grid into the mic ring → (speaker) keep the physical output
-//! queue topped up → metrics every 250 ms.
+//! One thread, woken every 2 ms or by a message, scheduled real-time on macOS (see
+//! [`crate::engine::realtime`]). Per wake, first the housekeeping, outside the measured
+//! real-time interval: control messages → virtual-device monitor → device reconcile/watchdog
+//! → metrics every 250 ms → health publishing every second. Then, inside the interval, the
+//! audio: realtime packets → clock-sync pings (non-coordinators) → drain capture → uplink or
+//! local mic → (coordinator) far-end in from the speaker ring, schedule to the room speaker,
+//! produce mic frames on a host-time 10 ms grid into the mic ring (a frame's mics spread over
+//! up to a few wakes) → (speaker) keep the physical output queue topped up.
+//!
+//! Where audio is lost is counted in [`Health`] and published in [`RuntimeShared::health`].
 //!
 //! While the Settings UI asks for it, a mic meter ([`MeterChain`]) also runs on every captured
 //! frame and publishes a [`MicMeter`] reading in [`RuntimeShared::mic_meter`]; with the meter on,
@@ -31,8 +36,12 @@ use crate::audio::virtual_device::{MicWriter, SharedRegion, SpeakerReader, Virtu
 use crate::dsp::arbitration::Selection;
 use crate::dsp::vad::DEFAULT_NOISE_BASELINE_DB;
 use crate::engine::coordinator::{CoordinatorConfig, CoordinatorPipeline};
+use crate::engine::health::{AudioHealth, GapCounter, Health, HealthEvent};
 use crate::engine::meter::{MeterChain, MicMeter};
 use crate::engine::metrics::{stream_jitter_ms, stream_loss_pct, MetricsBook};
+use crate::engine::realtime::{
+    budget, disabled_by_env, wake_cost_ns, RealtimeThread, RtStatus, MICS_PER_WAKE,
+};
 use crate::engine::speaker::SpeakerPipeline;
 use crate::engine::uplink::{FrameAssembler, MicUplink};
 use crate::ids::{Epoch, PeerId, StreamId};
@@ -45,13 +54,18 @@ use crate::room::protocol::PeerReport;
 use crate::time::now_ns;
 use crossbeam_channel::{bounded, unbounded, Receiver, Select, Sender, TryRecvError};
 use parking_lot::Mutex;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 const TICK: Duration = Duration::from_millis(2);
+const TICK_NS: u64 = 2_000_000;
 const METRICS_INTERVAL_NS: u64 = 250_000_000;
+/// How often the health counters are published, and the real-time state polled.
+const HEALTH_INTERVAL_NS: u64 = 1_000_000_000;
+/// Meeting audio silent at the speaker for longer than this has stopped rather than dropped out.
+const SPEAKER_MAX_GAP_NS: u64 = 500_000_000;
 /// How often the virtual-device monitor looks at the driver region.
 const VDEV_CHECK_NS: u64 = 1_000_000_000;
 /// Backoff between attempts to open a missing driver region.
@@ -246,6 +260,8 @@ pub enum RuntimeMsg {
     SetEnabled(bool),
     /// Runs the local mic meter (see [`RuntimeShared::mic_meter`]).
     SetMeter(bool),
+    /// Clears the health counters (see [`RuntimeShared::health`]).
+    ResetHealth,
     Packet {
         header: RtHeader,
         payload: Vec<u8>,
@@ -315,6 +331,8 @@ pub struct RuntimeShared {
     /// The local mic meter's latest reading, updated every captured frame while the meter is
     /// on; `None` while it is off or before the first frame.
     pub mic_meter: Mutex<Option<MicMeter>>,
+    /// The audio health counters and real-time status, republished every second.
+    pub health: Mutex<AudioHealth>,
 }
 
 pub struct AudioRuntime {
@@ -348,6 +366,7 @@ impl AudioRuntime {
         let join = std::thread::Builder::new()
             .name("roommesh-dsp".into())
             .spawn(move || {
+                // The fallback if real-time scheduling is refused (see `Dsp::run`).
                 raise_thread_qos();
                 let run = std::panic::AssertUnwindSafe(move || dsp.run(ctl_rx, pkt_rx));
                 if std::panic::catch_unwind(run).is_err() {
@@ -630,6 +649,8 @@ struct Playback {
     pushed: u64,
     last_output_frames: Option<u64>,
     callback_frames: u64,
+    /// Frames the output callback had zero-filled as of the last report, once audio flows.
+    underrun_base: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -710,6 +731,19 @@ struct Dsp {
     /// Peers whose mic metrics this runtime wrote into the book last round.
     mic_metric_peers: BTreeSet<PeerId>,
     play_buf: Vec<f32>,
+    /// At most this many mics of a room-mic frame per wake (see `engine::realtime`).
+    mics_per_wake: usize,
+    health: Health,
+    /// The DSP thread's scheduling as last seen, for the health snapshot.
+    rt_status: RtStatus,
+    rt_demotions: u32,
+    /// The last poll found the thread scheduled real-time (if it was promoted).
+    rt_scheduled: bool,
+    next_health_ns: u64,
+    /// Meeting audio missing at the room speaker (inside flowing audio).
+    speaker_gaps: GapCounter,
+    /// Each coordinator mic's `missing_samples` as last counted.
+    mic_missing_seen: BTreeMap<PeerId, u64>,
 }
 
 impl Dsp {
@@ -764,6 +798,14 @@ impl Dsp {
             last_aec: false,
             mic_metric_peers: BTreeSet::new(),
             play_buf: Vec::new(),
+            mics_per_wake: MICS_PER_WAKE,
+            health: Health::new(now_ns()),
+            rt_status: RtStatus::NormalPriority,
+            rt_demotions: 0,
+            rt_scheduled: true,
+            next_health_ns: 0,
+            speaker_gaps: GapCounter::new(SPEAKER_MAX_GAP_NS * SAMPLE_RATE as u64 / 1_000_000_000),
+            mic_missing_seen: BTreeMap::new(),
         }
     }
 
@@ -780,8 +822,31 @@ impl Dsp {
         self.enabled && self.meter.is_some()
     }
 
+    /// Audio is flowing: in a room, or the meter runs.
+    fn audio_running(&self) -> bool {
+        self.active() || self.metering()
+    }
+
+    /// The modelled cost of the heaviest wake now, for the real-time budget.
+    fn rt_wake_cost_ns(&self) -> u64 {
+        let mics = if self.coord.is_some() {
+            self.roles.enabled_mics.len()
+        } else {
+            0
+        };
+        wake_cost_ns(mics, self.meter.is_some())
+    }
+
     /// `control`: lossless control queue, always drained before `packets` (realtime traffic).
     fn run(mut self, control: Receiver<RuntimeMsg>, packets: Receiver<RuntimeMsg>) {
+        let mut rt = if disabled_by_env() {
+            log::info!("roommesh-dsp: real-time scheduling disabled (ROOMMESH_NO_REALTIME)");
+            RealtimeThread::normal()
+        } else {
+            RealtimeThread::promote_current(budget(TICK, self.rt_wake_cost_ns()))
+        };
+        self.rt_status = rt.status();
+        let mut asked_at = now_ns() + TICK_NS;
         'run: loop {
             // Wake on either queue or the tick; messages are then handled in priority order.
             {
@@ -790,12 +855,70 @@ impl Dsp {
                 sel.recv(&packets);
                 let _ = sel.ready_timeout(TICK);
             }
-            if !self.drain(&control, &packets) {
+            let woke = now_ns();
+            // Housekeeping first, outside the measured interval: control messages (which may
+            // build pipelines), device and driver-region opens, metrics, health.
+            if !self.drain_control(&control) {
                 break 'run;
             }
-            self.step(now_ns());
+            if self.audio_running() {
+                let late_ns = woke.saturating_sub(asked_at);
+                self.health.record(woke, HealthEvent::Wake { late_ns });
+            }
+            let now = now_ns();
+            self.rt_housekeeping(&mut rt, now);
+            self.housekeeping(now);
+            // The audio work, as one interval of the audio workgroup.
+            let measured = self.audio_running() && rt.start_interval();
+            let alive = self.drain(&control, &packets);
+            if alive {
+                self.audio_step(now_ns());
+            }
+            if measured {
+                rt.finish_interval();
+            }
+            if !alive {
+                break 'run;
+            }
+            asked_at = now_ns() + TICK_NS;
         }
         self.stop_all();
+        drop(rt); // leaves the workgroup on this thread
+    }
+
+    /// Joins the audio workgroup once it's ready, follows the mic count in the real-time
+    /// budget, and polls for demotion every second.
+    fn rt_housekeeping(&mut self, rt: &mut RealtimeThread, now: u64) {
+        if rt.status() == RtStatus::NormalPriority {
+            return;
+        }
+        rt.poll_workgroup();
+        rt.set_budget(budget(TICK, self.rt_wake_cost_ns()));
+        if now >= self.next_health_ns {
+            // Just before `housekeeping` publishes the health snapshot.
+            self.rt_scheduled = rt.poll_demotion();
+            self.rt_demotions = rt.demotions();
+        }
+        self.rt_status = if self.rt_scheduled {
+            rt.status()
+        } else {
+            RtStatus::NormalPriority // demoted right now
+        };
+    }
+
+    /// Handles every queued control message. Returns false on shutdown.
+    fn drain_control(&mut self, control: &Receiver<RuntimeMsg>) -> bool {
+        loop {
+            match control.try_recv() {
+                Ok(m) => {
+                    if !self.handle(m) {
+                        return false;
+                    }
+                }
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
     }
 
     /// Handles the queued messages. Control first, fully: a role/settings change queued behind
@@ -847,11 +970,19 @@ impl Dsp {
             RuntimeMsg::SetEnabled(e) => {
                 if e != self.enabled {
                     self.enabled = e;
-                    if !e {
+                    if e {
+                        // The totals count "since audio started".
+                        self.health.reset(now_ns());
+                        self.next_health_ns = 0;
+                    } else {
                         self.stop_all();
                     }
                     self.reconcile(now_ns());
                 }
+            }
+            RuntimeMsg::ResetHealth => {
+                self.health.reset(now_ns());
+                self.next_health_ns = 0; // published at the next wake
             }
             RuntimeMsg::Packet {
                 header,
@@ -978,6 +1109,7 @@ impl Dsp {
         if self.coord.take().is_some() {
             clear_mic_metrics(&mut self.shared.metrics.lock(), &self.roles);
             self.mic_metric_peers.clear();
+            self.mic_missing_seen.clear();
         }
         if std::mem::take(&mut self.last_aec) {
             let _ = self.events.try_send(RuntimeEvent::AecStatus(false));
@@ -1177,9 +1309,11 @@ impl Dsp {
                         pushed: 0,
                         last_output_frames: None,
                         callback_frames: 0,
+                        underrun_base: None,
                     },
                     now,
                 );
+                self.speaker_gaps.reset();
             }
             Ok(Err(e)) => {
                 slot.pending = None;
@@ -1231,7 +1365,17 @@ impl Dsp {
         }
     }
 
+    /// One whole iteration at `now`: [`housekeeping`](Self::housekeeping), then
+    /// [`audio_step`](Self::audio_step) (the run loop does them separately).
+    #[cfg(test)]
     fn step(&mut self, now: u64) {
+        self.housekeeping(now);
+        self.audio_step(now);
+    }
+
+    /// The occasional and possibly slow work, outside the measured real-time interval: the
+    /// driver region, physical devices, metrics and health publishing.
+    fn housekeeping(&mut self, now: u64) {
         let active = self.active();
         if let Some(ev) = self.vdev.tick(now, &mut *self.backend, active) {
             match ev {
@@ -1244,27 +1388,38 @@ impl Dsp {
         self.shared
             .virtual_device_ok
             .store(self.vdev.ok(now), Ordering::Relaxed);
-        if !active {
+        if active || self.metering() {
+            self.device_errors(now);
+            self.reconcile_devices(now);
+        }
+        if active && now.saturating_sub(self.last_metrics_ns) >= METRICS_INTERVAL_NS {
+            self.last_metrics_ns = now;
+            self.metrics_step(now);
+        }
+        if now >= self.next_health_ns {
+            self.next_health_ns = now + HEALTH_INTERVAL_NS;
+            // Skip this round rather than wait if a reader holds it.
+            if let Some(mut h) = self.shared.health.try_lock() {
+                *h = self.health.snapshot(now, self.rt_status, self.rt_demotions);
+            }
+        }
+    }
+
+    /// The audio itself: what has to happen on time every wake.
+    fn audio_step(&mut self, now: u64) {
+        if !self.active() {
             if self.metering() {
                 // Outside a room: only the meter's capture.
-                self.device_errors(now);
-                self.reconcile_devices(now);
                 self.capture_step(now);
                 self.clear_stale_meter();
             }
             return;
         }
-        self.device_errors(now);
-        self.reconcile_devices(now);
         self.clock_sync(now);
         self.capture_step(now);
         self.clear_stale_meter();
         self.coordinator_step(now);
         self.speaker_step(now);
-        if now.saturating_sub(self.last_metrics_ns) >= METRICS_INTERVAL_NS {
-            self.last_metrics_ns = now;
-            self.metrics_step();
-        }
     }
 
     fn clock_sync(&mut self, now: u64) {
@@ -1417,6 +1572,7 @@ impl Dsp {
                 if let Some((pos, t)) = cs.farend_expect {
                     if pos != chunk.first_pos || ts.abs_diff(t) > FAREND_JUMP_NS {
                         cs.farend.reset();
+                        self.health.record(now, HealthEvent::FarendReset);
                     }
                 }
                 let len = chunk.samples.len() as u64;
@@ -1431,6 +1587,7 @@ impl Dsp {
             // Always through the pipeline: it is also the AEC reference.
             let mut pb = cs.pipe.push_farend(&f);
             if pb.header.timestamp_ns < now {
+                self.health.record(now, HealthEvent::FarendLate);
                 continue; // would play in the past
             }
             match self.roles.speaker {
@@ -1457,6 +1614,8 @@ impl Dsp {
         let lag = now.saturating_sub(cs.next_out_ns);
         if lag > MAX_GRID_LAG_NS {
             let missed = lag / FRAME_NS;
+            self.health
+                .record(now, HealthEvent::MicSilence { slots: missed });
             if let Some(link) = cs.vdev.as_ref() {
                 for _ in 0..missed.min(MAX_ZERO_FILL_SLOTS) {
                     link.mic.write(&SILENT_FRAME, now);
@@ -1465,7 +1624,22 @@ impl Dsp {
             cs.next_out_ns += missed * FRAME_NS;
         }
         while cs.next_out_ns <= now + FRAME_NS {
-            let pf = cs.pipe.produce(cs.next_out_ns, now);
+            if cs.pipe.pending_frame() != Some(cs.next_out_ns) {
+                cs.pipe.begin_frame(cs.next_out_ns);
+            }
+            // A frame's mics are spread over consecutive wakes (see `engine::realtime`); a frame
+            // whose own time has come (a backlog) is finished at once.
+            let max = if cs.next_out_ns <= now {
+                usize::MAX
+            } else {
+                self.mics_per_wake
+            };
+            if !cs.pipe.process_mics(max, now) {
+                break; // the rest of this frame's mics next wake
+            }
+            let Some(pf) = cs.pipe.finish_frame() else {
+                break;
+            };
             if let Some(link) = cs.vdev.as_ref() {
                 link.mic.write(&pf.samples, now);
             }
@@ -1487,8 +1661,19 @@ impl Dsp {
         // Reports are drained even without a speaker pipeline: undrained ones count as device
         // activity (see `reconcile_playback`) and would hide a dead device.
         let mut got = false;
+        let rate = pb.h.sample_rate as f64;
         while let Ok(r) = pb.h.reports.pop() {
             got = true;
+            // Frames the callback played as zeros so far; it only counts once audio flows (the
+            // device may call back before the first samples are queued).
+            let zeroed = r.output_frames.saturating_sub(r.popped_frames);
+            if r.popped_frames > 0 {
+                if let Some(base) = pb.underrun_base.filter(|b| zeroed > *b) {
+                    let ns = ((zeroed - base) as f64 * 1e9 / rate) as u64;
+                    self.health.record(now, HealthEvent::SpeakerUnderrun { ns });
+                }
+                pb.underrun_base = Some(zeroed);
+            }
             if let Some(prev) = pb.last_output_frames {
                 let d = r.output_frames.saturating_sub(prev);
                 if d > 0 {
@@ -1518,7 +1703,12 @@ impl Dsp {
         while pb.pushed.saturating_sub(pb.clock.popped()) < target {
             match pb.clock.play_time_of(pb.pushed) {
                 Some(t) => {
-                    sp.render(t, 1e9 / rate, buf, now, to_local, to_coord);
+                    let st = sp.render(t, 1e9 / rate, buf, now, to_local, to_coord);
+                    let missing = self.speaker_gaps.observe(st.filled, st.missing);
+                    if missing > 0 {
+                        let ns = (missing as f64 * 1e9 / rate) as u64;
+                        self.health.record(now, HealthEvent::SpeakerMissing { ns });
+                    }
                 }
                 None => buf.fill(0.0), // no timing yet: prime with silence
             }
@@ -1536,11 +1726,21 @@ impl Dsp {
         }
     }
 
-    fn metrics_step(&mut self) {
+    fn metrics_step(&mut self, now: u64) {
         if let Some(cs) = self.coord.as_ref() {
+            let statuses = cs.pipe.statuses();
+            for s in &statuses {
+                let last = self.mic_missing_seen.insert(s.peer, s.missing_samples);
+                // A recreated pipeline counts from zero again.
+                let new = s.missing_samples - last.filter(|l| *l <= s.missing_samples).unwrap_or(0);
+                if new > 0 {
+                    let ns = (new as f64 * NS_PER_SAMPLE) as u64;
+                    self.health
+                        .record(now, HealthEvent::MicMissing { peer: s.peer, ns });
+                }
+            }
             // Skip this round rather than wait if a reader holds the book.
             if let Some(mut book) = self.shared.metrics.try_lock() {
-                let statuses = cs.pipe.statuses();
                 let mut seen = BTreeSet::new();
                 for s in &statuses {
                     let active =
@@ -1565,7 +1765,10 @@ impl Dsp {
         if !self.roles.is_coordinator {
             if !self.clock.is_synced() {
                 // No RTT/offset yet: an all-zero report would show as a perfect link.
-                *self.shared.local_report.lock() = None;
+                // (Skipped if a reader holds it: the next round clears it.)
+                if let Some(mut r) = self.shared.local_report.try_lock() {
+                    *r = None;
+                }
                 return;
             }
             let jitter = self
@@ -1590,7 +1793,9 @@ impl Dsp {
                 drift_ppm: self.clock.drift_ppm().unwrap_or(0.0) as f32,
                 transport: self.transport.description(),
             };
-            *self.shared.local_report.lock() = Some(r.clone());
+            if let Some(mut slot) = self.shared.local_report.try_lock() {
+                *slot = Some(r.clone());
+            }
             let _ = self.events.try_send(RuntimeEvent::Report(r));
         }
     }
@@ -2138,6 +2343,8 @@ mod tests {
         reports: Arc<Mutex<Option<rtrb::Producer<crate::audio::device_io::PlaybackReport>>>>,
         /// Keeps the consumer end of the output ring alive.
         output: Arc<Mutex<Option<rtrb::Consumer<f32>>>>,
+        /// The driver region handed out by `open_virtual_device` (none: not installed).
+        vdev: Option<Arc<SharedRegion>>,
     }
     impl FakeDevices {
         /// Queues one 10 ms capture block stamped `capture_ns`.
@@ -2201,7 +2408,9 @@ mod tests {
         }
         fn stop_playback(&mut self) {}
         fn open_virtual_device(&mut self) -> Result<Arc<SharedRegion>, VirtualDeviceError> {
-            Err(VirtualDeviceError::NotFound(libc::ENOENT))
+            self.vdev
+                .clone()
+                .ok_or(VirtualDeviceError::NotFound(libc::ENOENT))
         }
     }
 
@@ -2603,5 +2812,354 @@ mod tests {
         assert_eq!(pkt_rx.len(), 1_000 - 2 * MAX_PACKETS_PER_WAKE);
         ctl_tx.send(RuntimeMsg::Shutdown).unwrap();
         assert!(!d.drain(&ctl_rx, &pkt_rx));
+    }
+
+    /// A coordinator on a test driver region with mics 1..=`mics` enabled (no AEC).
+    fn coordinator_with(mics: u64) -> (Dsp, Arc<SharedRegion>, u64) {
+        let t0 = now_ns();
+        let region = Arc::new(SharedRegion::create_for_test_with(1, t0 + 60_000 * MS).unwrap());
+        let (mut d, _ev) = dsp(1, VdevOnly::new(&[&region]));
+        let peers: Vec<PeerId> = (1..=mics).map(PeerId).collect();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(LocalRoles {
+            enabled_mics: peers.clone(),
+            members: peers,
+            ..roles(1, 1, 1)
+        }));
+        (d, region, t0)
+    }
+
+    #[test]
+    fn a_frames_mics_are_spread_over_wakes() {
+        let (mut d, region, t0) = coordinator_with(8);
+        let pos = || region.test_mic_write_pos() / 480;
+        let wakes = 8u64.div_ceil(MICS_PER_WAKE as u64);
+        assert!(wakes > 1);
+        let late = (wakes - 1) * 2 * MS; // finished this long after it became due
+                                         // The first frame is already at its time: produced at once. The next one is due a
+                                         // frame ahead, and its 8 mics take `wakes` wakes, 2 ms apart.
+        d.step(t0);
+        assert_eq!(pos(), 1);
+        assert_eq!(
+            d.coord.as_ref().unwrap().pipe.pending_frame(),
+            Some(t0 + FRAME_NS)
+        );
+        for k in 1..wakes {
+            d.step(t0 + k * 2 * MS);
+            let expected = if k + 1 == wakes { 2 } else { 1 };
+            assert_eq!(pos(), expected, "after wake {k}");
+        }
+        // From then on one frame per 10 ms, each at most `late` after it became due.
+        let mut t = t0 + late;
+        for _ in 0..50 {
+            t += 2 * MS;
+            d.step(t);
+            let due = (t - t0) / FRAME_NS + 2; // frames due by t (one ahead)
+            let in_progress = (t - t0) % FRAME_NS < late;
+            assert!(
+                pos() == due || (in_progress && pos() + 1 == due),
+                "{} at {t}",
+                pos()
+            );
+        }
+        // With few mics a frame takes one wake, as before.
+        let (mut d, region, t0) = coordinator_with(MICS_PER_WAKE as u64);
+        d.step(t0);
+        assert_eq!(region.test_mic_write_pos() / 480, 2);
+    }
+
+    #[test]
+    fn a_stall_is_counted_as_room_mic_silence() {
+        let (mut d, _region, t0) = coordinator_with(2);
+        let mut t = t0;
+        for _ in 0..10 {
+            d.step(t);
+            t += 2 * MS;
+        }
+        assert_eq!(d.health.last_minute(t).mic_silence_slots, 0);
+        t += 100 * MS; // the DSP thread stalls
+        d.step(t);
+        let m = d.health.last_minute(t);
+        assert!((8..=11).contains(&m.mic_silence_slots), "{m:?}");
+        assert_eq!(
+            d.health.since_start().mic_silence_slots,
+            m.mic_silence_slots
+        );
+    }
+
+    #[test]
+    fn late_meeting_audio_is_counted_when_dropped() {
+        let (mut d, region, t0) = coordinator_with(1);
+        d.step(t0); // the speaker reader starts at the live edge
+                    // Meeting audio stamped 300 ms ago plays at +80 ms: already in the past.
+        for i in 0..5u64 {
+            region.test_driver_write_speaker(&[0.1; 480], t0 - 300 * MS + i * FRAME_NS);
+        }
+        d.step(t0);
+        let m = d.health.last_minute(t0);
+        assert!(m.farend_late_frames >= 4, "{m:?}");
+        // A discontinuity (the stream jumps 1 s) restarts the far-end assembler.
+        region.test_driver_write_speaker(&[0.1; 480], t0 + 1_000 * MS);
+        d.step(t0 + 2 * MS);
+        assert!(d.health.last_minute(t0 + 2 * MS).farend_resets >= 1);
+    }
+
+    #[test]
+    fn speaker_underruns_are_counted_once_audio_flows() {
+        use crate::audio::device_io::PlaybackReport;
+        let fake = FakeDevices::default();
+        let (mut d, _ev) = dsp(2, Box::new(fake.clone()));
+        let t0 = now_ns();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(roles(1, 2, 2))); // member, room speaker
+        let report = |output_frames: u64, popped_frames: u64| {
+            let r = PlaybackReport {
+                output_frames,
+                popped_frames,
+                play_ns: t0 + 50 * MS,
+            };
+            fake.reports.lock().as_mut().unwrap().push(r).unwrap();
+        };
+        let underruns = |d: &Dsp| {
+            let m = d.health.last_minute(t0 + 10 * MS);
+            (m.speaker_underruns, m.speaker_underrun_ns)
+        };
+        // Before the first queued sample plays, zeros are the device starting up.
+        report(0, 0);
+        report(480, 0);
+        d.step(t0);
+        assert_eq!(underruns(&d), (0, 0));
+        report(960, 480);
+        report(1_440, 960);
+        d.step(t0 + 2 * MS);
+        assert_eq!(underruns(&d), (0, 0));
+        // 240 more frames played as zeros: a 5 ms underrun.
+        report(1_920, 1_200);
+        report(2_400, 1_680);
+        d.step(t0 + 4 * MS);
+        assert_eq!(underruns(&d), (1, 5 * MS));
+    }
+
+    #[test]
+    fn health_is_published_and_reset() {
+        let (mut d, _region, t0) = coordinator_with(1);
+        d.health.record(t0, HealthEvent::FarendLate);
+        d.step(t0);
+        assert_eq!(d.shared.health.lock().last_minute.farend_late_frames, 1);
+        d.health.record(t0, HealthEvent::FarendLate);
+        d.step(t0 + 2 * MS);
+        assert_eq!(
+            d.shared.health.lock().last_minute.farend_late_frames,
+            1,
+            "republished once a second"
+        );
+        d.handle(RuntimeMsg::ResetHealth);
+        let t = now_ns();
+        d.step(t);
+        let h = d.shared.health.lock().clone();
+        assert_eq!(
+            h.last_minute,
+            crate::engine::health::HealthCounts::default()
+        );
+        assert_eq!(h.since_start.farend_late_frames, 0);
+        assert_eq!(h.window_secs, 1);
+    }
+
+    #[test]
+    fn the_running_dsp_thread_reports_its_wakes_and_scheduling() {
+        let region =
+            Arc::new(SharedRegion::create_for_test_with(1, now_ns() + 60_000 * MS).unwrap());
+        let (rt, _ev) = spawn_with(1, VdevOnly::new(&[&region]), no_aec());
+        rt.send(RuntimeMsg::SetEnabled(true));
+        rt.send(RuntimeMsg::Roles(roles(1, 1, 1)));
+        std::thread::sleep(std::time::Duration::from_millis(1_300));
+        let h = rt.shared().health.lock().clone();
+        assert!(h.last_minute.wakes > 200, "{h:?}");
+        assert!(h.since_start.wakes >= h.last_minute.wakes);
+        #[cfg(target_os = "macos")]
+        if !disabled_by_env() {
+            assert_eq!(h.realtime, RtStatus::WorkgroupAndTimeConstraint, "{h:?}");
+            assert_eq!(h.demotions, 0);
+        }
+        rt.shutdown();
+    }
+
+    /// `p`th percentile (0..=100) of `v` (sorts it), in ns.
+    fn percentile(v: &mut [u64], p: f64) -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[((v.len() - 1) as f64 * p / 100.0).round() as usize]
+    }
+
+    /// Wall-clock cost of `Dsp` iterations (packet handling + `step`) on a coordinator that is
+    /// also the room speaker, with `mics` enabled mics (its own plus `mics - 1` remote ones),
+    /// the default processing (WebRTC AEC + noise suppression), meeting audio playing and every
+    /// mic carrying sound. Synthetic time advances 2 ms per iteration, like the real loop.
+    /// `mics_per_wake`: how far a frame's mics are spread (`usize::MAX`: all in one wake).
+    /// Returns (iterations that did room-mic work, all other iterations), in ns.
+    fn iteration_costs(mics: u64, seconds: u64, mics_per_wake: usize) -> (Vec<u64>, Vec<u64>) {
+        use crate::audio::device_io::PlaybackReport;
+        use crate::audio::frames::AudioFrame;
+        let t0 = now_ns();
+        let region = Arc::new(SharedRegion::create_for_test_with(1, t0 + 3_600_000 * MS).unwrap());
+        let fake = FakeDevices {
+            vdev: Some(region.clone()),
+            ..Default::default()
+        };
+        let (ev_tx, _ev_rx) = unbounded();
+        let mut d = Dsp::new(
+            PeerId(1),
+            Box::new(fake.clone()),
+            transport(1),
+            Default::default(),
+            ev_tx,
+            AudioSettings::default(),
+            Arc::default(),
+        );
+        d.mics_per_wake = mics_per_wake;
+        let peers: Vec<PeerId> = (1..=mics).map(PeerId).collect();
+        d.handle(RuntimeMsg::SetEnabled(true));
+        d.handle(RuntimeMsg::Roles(LocalRoles {
+            enabled_mics: peers.clone(),
+            members: peers,
+            ..roles(1, 1, 1)
+        }));
+        let mut ups: Vec<MicUplink> = (2..=mics)
+            .map(|p| MicUplink::new(PeerId(p), 48_000).unwrap())
+            .collect();
+        let sound = |n: u64, salt: u64| -> Vec<f32> {
+            (n..n + 480)
+                .map(|k| {
+                    let t = k as f32 / 48_000.0;
+                    let f = 180.0 + 37.0 * salt as f32;
+                    0.1 * (2.0 * std::f32::consts::PI * f * t).sin()
+                        + 0.01
+                            * (((k ^ salt).wrapping_mul(2_654_435_761) >> 8) as u8 as f32 / 128.0
+                                - 1.0)
+                })
+                .collect()
+        };
+        let (mut produce, mut other) = (Vec::new(), Vec::new());
+        let (mut out_frames, mut popped) = (0u64, 0u64);
+        let mut t = t0;
+        for i in 0..seconds * 500 {
+            t += 2 * MS;
+            let start = std::time::Instant::now();
+            if i % 5 == 0 {
+                let n0 = (i / 5) * 480;
+                let cap = t - 10 * MS;
+                fake.mic_block_with(n0, cap, &sound(n0, 1));
+                for (k, up) in ups.iter_mut().enumerate() {
+                    let f = AudioFrame {
+                        sample_index: n0,
+                        timestamp_ns: cap,
+                        samples: sound(n0, k as u64 + 2),
+                    };
+                    let (header, payload) = up.packetize(&f, Epoch(1), cap).unwrap();
+                    d.handle(RuntimeMsg::Packet {
+                        header,
+                        payload,
+                        arrival_ns: t,
+                    });
+                }
+                region.test_driver_write_speaker(&sound(n0, 99), t);
+            }
+            // The output device: one 2 ms callback per iteration.
+            if let Some(c) = fake.output.lock().as_mut() {
+                let n = c.slots().min(96);
+                if let Ok(ch) = c.read_chunk(n) {
+                    ch.commit_all();
+                }
+                popped += n as u64;
+            }
+            if let Some(r) = fake.reports.lock().as_mut() {
+                let _ = r.push(PlaybackReport {
+                    output_frames: out_frames,
+                    popped_frames: popped,
+                    play_ns: t + 10 * MS,
+                });
+            }
+            out_frames += 96;
+            let state = |d: &Dsp| {
+                d.coord
+                    .as_ref()
+                    .map(|c| (c.next_out_ns, c.pipe.pending_frame()))
+            };
+            let before = state(&d);
+            d.step(t);
+            let ns = start.elapsed().as_nanos() as u64;
+            // A wake that began, continued or finished a frame (one in the middle of a spread
+            // frame changes neither value but leaves the frame pending).
+            let produced = before != state(&d)
+                || d.coord
+                    .as_ref()
+                    .is_some_and(|c| c.pipe.pending_frame().is_some());
+            if i < 500 {
+                continue; // warm-up: buffers filling, AEC adapting
+            }
+            if produced {
+                produce.push(ns);
+            } else {
+                other.push(ns);
+            }
+        }
+        (produce, other)
+    }
+
+    /// Measures what one DSP iteration costs, which sizes the real-time budget (see
+    /// `engine::realtime`). Only meaningful in release mode:
+    /// `cargo test --release -p roommesh-core dsp_iteration_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark; run in release mode with --ignored --nocapture"]
+    fn dsp_iteration_cost() {
+        let us = |ns: u64| ns as f64 / 1e3;
+        for (how, per_wake) in [("at once", usize::MAX), ("spread", MICS_PER_WAKE)] {
+            for mics in [1, 4, 8] {
+                let (mut p, mut o) = iteration_costs(mics, 20, per_wake);
+                assert!(!p.is_empty() && !o.is_empty());
+                let all_max = percentile(&mut p, 100.0).max(percentile(&mut o, 100.0));
+                println!(
+                    "{how}, {mics} mic(s): room-mic wakes n={} p50 {:.0} us, p99 {:.0} us, max \
+                     {:.0} us | other wakes n={} p99 {:.0} us | worst wake {:.0} us",
+                    p.len(),
+                    us(percentile(&mut p, 50.0)),
+                    us(percentile(&mut p, 99.0)),
+                    us(percentile(&mut p, 100.0)),
+                    o.len(),
+                    us(percentile(&mut o, 99.0)),
+                    us(all_max),
+                );
+            }
+        }
+        let cfg = CoordinatorConfig::default();
+        let mut make: Vec<u64> = (0..30)
+            .map(|_| {
+                let s = std::time::Instant::now();
+                let a = crate::engine::coordinator::make_echo_canceller(&cfg);
+                let ns = s.elapsed().as_nanos() as u64;
+                drop(a);
+                ns
+            })
+            .collect();
+        println!(
+            "WebRTC AEC creation: p50 {:.0} us, max {:.0} us",
+            us(percentile(&mut make, 50.0)),
+            us(percentile(&mut make, 100.0))
+        );
+        let mut pipe: Vec<u64> = (0..10)
+            .map(|_| {
+                let s = std::time::Instant::now();
+                let mut p = CoordinatorPipeline::new(PeerId(1), Epoch(1), cfg.clone()).unwrap();
+                p.set_enabled_mics(&(1..=8).map(PeerId).collect::<Vec<_>>());
+                s.elapsed().as_nanos() as u64
+            })
+            .collect();
+        println!(
+            "8-mic coordinator pipeline creation: p50 {:.0} us, max {:.0} us",
+            us(percentile(&mut pipe, 50.0)),
+            us(percentile(&mut pipe, 100.0))
+        );
     }
 }
