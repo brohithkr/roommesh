@@ -3,6 +3,7 @@ pub mod coordinator;
 pub mod facade;
 pub mod meter;
 pub mod metrics;
+pub mod realtime;
 pub mod runtime;
 pub mod speaker;
 pub mod stream;
