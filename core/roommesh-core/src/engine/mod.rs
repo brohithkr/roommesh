@@ -1,6 +1,7 @@
 //! Coordinator/speaker engine runtime, events and metrics.
 pub mod coordinator;
 pub mod facade;
+pub mod health;
 pub mod meter;
 pub mod metrics;
 pub mod realtime;
