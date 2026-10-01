@@ -162,6 +162,11 @@ longer. Two settings in **Settings → Advanced** decide how long RoomMesh waits
 Meeting apps add 100–300 ms of their own, so an extra 50–100 ms here is hard to notice.
 Missing words are not.
 
+On the Mac itself, RoomMesh's audio thread runs with real-time scheduling, as macOS's own audio
+threads do. App Nap is turned off while audio is running (in a room, or while the noise meter
+in Settings is on). Without that, a menu-bar app with no window would have its timers delayed,
+and the room speaker would gap even with no network involved.
+
 ### Where the time goes (mic path, default settings)
 
 | Stage | Typical |
@@ -191,7 +196,33 @@ audio is arriving too late.
 4. Keep Wi-Fi turned on even on Ethernet-only Macs; the peer-to-peer link needs the radio.
 
 **Gaps or crackle in the room speaker.** Raise **Speaker delay** on the coordinator, and check
-the room-speaker Mac's row in **Settings → Advanced**.
+the room-speaker Mac's row in **Settings → Advanced**. If the gaps happen even when the
+coordinator is also the room speaker (no network involved), check **Audio health** on that Mac
+(below).
+
+**Reading Audio health** (**Settings → Advanced**, on each Mac). It counts where this Mac lost
+audio over the last 60 seconds and refreshes every second. **Reset counters** starts it over, so
+reset it, reproduce the problem, and then read the counters.
+- **Audio thread** should say *Real-time (audio workgroup)*. *Normal priority*, or "lost
+  real-time", means macOS isn't giving RoomMesh's audio thread priority. Expect gaps under load.
+- **Audio thread worst delay** is how late the audio thread woke up. Below about 5 ms is
+  harmless. Tens of milliseconds mean the Mac stalled RoomMesh, and that is what causes the
+  next three counters.
+- **Speaker underruns** (room-speaker Mac): the speaker's buffer ran dry and played silence. This
+  happens on this Mac itself; a longer Speaker delay doesn't fix it.
+- **Gaps in meeting audio on the speaker** (room-speaker Mac): meeting audio wasn't there when it
+  was due. With a separate coordinator, this is usually the network: raise **Speaker delay**.
+- **Late meeting audio dropped** (coordinator): meeting audio was read too late to schedule. The
+  coordinator itself stalled.
+- **Meeting audio restarts** (coordinator): the meeting app's audio into RoomMesh Speaker jumped,
+  for example when the call started or its output device changed. An occasional one is normal.
+- **Room mic silence after a stall** (coordinator): the meeting got silence because the
+  coordinator stalled.
+- **Missing mic audio from …** (coordinator): that Mac's mic audio arrived too late. Raise **Mic
+  latency** (see the first item above).
+
+All zeros while you hear gaps means the gaps aren't RoomMesh's: check the meeting app, or the
+remote side.
 
 **Meet won't unmute with RoomMesh Microphone selected** ("Could not start audio source"), while
 other microphones work. Quit and reopen the browser or meeting app. An app that was running
