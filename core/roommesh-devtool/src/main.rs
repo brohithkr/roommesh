@@ -22,16 +22,25 @@ commands:
   speaker-loopback  play a tone into \"RoomMesh Speaker\" and read it back from the speaker ring
   noise-probe       measure this room through the default microphone and the app's processing
                     (echo canceller + noise suppression + voice detection): 15 s quiet, 10 s talking
+  health-probe      run the app's audio engine as coordinator + room speaker on this Mac's
+                    devices (meeting audio: a quiet tone into \"RoomMesh Speaker\"; synthetic
+                    remote mics), then print its audio health counters
 
 options:
   --force           run a loopback even while the RoomMesh app looks live
   --talk            noise-probe: skip the quiet part and measure talking only (start right away)
   --quiet           noise-probe: measure the quiet part only
-  --seconds N       noise-probe: length of each measured part (default: 15 quiet, 10 talking)
+  --seconds N       noise-probe: length of each measured part (default: 15 quiet, 10 talking);
+                    health-probe: how long to measure (default 60)
+  --mics N          health-probe: synthetic remote mics to process (default 3, at most 16)
+  --load N          health-probe: N busy threads competing for the CPU (default 0)
+  --no-realtime     health-probe: run the audio thread at normal priority
+  --loud            health-probe: an audible tone instead of a very quiet one
   -h, --help        show this help
 
-The loopbacks drive the shared memory directly, so quit RoomMesh first; they refuse to run
-while the app's heartbeat is fresh or a client is capturing from RoomMesh Microphone.
+The loopbacks and health-probe drive the shared memory directly, so quit RoomMesh first; they
+refuse to run while the app's heartbeat is fresh or a client is capturing from RoomMesh Microphone.
+health-probe plays the tone on this Mac's default output (the room speaker).
 mic-loopback and noise-probe need microphone permission: run them from Terminal.app.
 exit status: 0 = PASS, 1 = FAIL or error, 2 = usage error";
 
@@ -454,6 +463,198 @@ fn cmd_noise_probe(mode: ProbeMode, seconds: Option<f32>) -> Outcome {
     Ok(true)
 }
 
+struct HealthProbe {
+    seconds: f32,
+    mics: u64,
+    load: usize,
+    realtime: bool,
+    loud: bool,
+}
+
+/// Runs the app's audio runtime (real devices, the driver's shared memory) as the coordinator
+/// and room speaker of a one-Mac room, with meeting audio played into RoomMesh Speaker and
+/// `mics` synthetic remote mics, and prints where audio was lost.
+fn cmd_health_probe(force: bool, p: HealthProbe) -> Outcome {
+    use roommesh_core::audio::frames::AudioFrame;
+    use roommesh_core::engine::runtime::{AudioRuntime, AudioSettings, RuntimeMsg, SystemAudio};
+    use roommesh_core::engine::uplink::MicUplink;
+    use roommesh_core::ids::{Epoch, PeerId, RoomId};
+    use roommesh_core::network::loopback::LoopbackNetwork;
+    use roommesh_core::room::events::LocalRoles;
+    use std::sync::atomic::AtomicBool;
+
+    let r = open()?;
+    ensure_app_not_live(&r, force)?;
+    drop(r);
+    if !p.realtime {
+        // Read by the audio thread when it starts (engine::realtime).
+        std::env::set_var("ROOMMESH_NO_REALTIME", "1");
+    }
+    // Meeting audio: a tone into RoomMesh Speaker, as a meeting app would play it.
+    let dev = find("RoomMesh Speaker", false)?;
+    let cfg: cpal::StreamConfig = dev
+        .default_output_config()
+        .map_err(|e| format!("RoomMesh Speaker has no default output config: {e}"))?
+        .config();
+    let ch = cfg.channels as usize;
+    let gain = if p.loud { 1.0 } else { 0.02 }; // the tone is 0.25 peak: -12 or -46 dBFS
+    let mut i = 0u64;
+    let meeting = dev
+        .build_output_stream::<f32, _, _>(
+            cfg,
+            move |d: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for f in d.chunks_mut(ch) {
+                    f.fill(gain * tone(i));
+                    i += 1;
+                }
+            },
+            |e| eprintln!("meeting stream error: {e}"),
+            None,
+        )
+        .map_err(|e| format!("cannot open an output stream on RoomMesh Speaker: {e}"))?;
+    meeting
+        .play()
+        .map_err(|e| format!("cannot start the RoomMesh Speaker stream: {e}"))?;
+
+    let local = PeerId(1);
+    let net = LoopbackNetwork::new();
+    let (tsink, _transport_events) = crossbeam_channel::unbounded();
+    let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+    let rt = AudioRuntime::spawn(
+        local,
+        Box::new(SystemAudio::new()),
+        net.transport(local, tsink),
+        Default::default(),
+        ev_tx,
+        AudioSettings::default(),
+    );
+    let remotes: Vec<PeerId> = (2..2 + p.mics).map(PeerId).collect();
+    rt.send(RuntimeMsg::SetEnabled(true));
+    rt.send(RuntimeMsg::Roles(LocalRoles {
+        room_id: Some(RoomId(1)),
+        epoch: Epoch(1),
+        coordinator: Some(local),
+        speaker: Some(local),
+        is_coordinator: true,
+        is_speaker: true,
+        mic_enabled: false, // this Mac's mic stays closed (no microphone permission needed)
+        enabled_mics: remotes.clone(),
+        noise_baseline_db: None,
+        members: std::iter::once(local)
+            .chain(remotes.iter().copied())
+            .collect(),
+    }));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Remote mics: one 10 ms packet per mic every 10 ms, captured 15 ms before it arrives.
+    let feeder = {
+        let (tx, stop) = (rt.sender(), stop.clone());
+        let remotes = remotes.clone();
+        std::thread::spawn(move || {
+            let mut ups: Vec<MicUplink> = remotes
+                .iter()
+                .map(|p| MicUplink::new(*p, 48_000).expect("opus encoder"))
+                .collect();
+            let start = Instant::now();
+            let mut k = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let now = now_ns();
+                for (m, up) in ups.iter_mut().enumerate() {
+                    let n0 = k * 480;
+                    let f = AudioFrame {
+                        sample_index: n0,
+                        timestamp_ns: now - 15_000_000,
+                        samples: (n0..n0 + 480)
+                            .map(|n| 0.1 * tone(n * (m as u64 + 2)))
+                            .collect(),
+                    };
+                    if let Ok((header, payload)) = up.packetize(&f, Epoch(1), f.timestamp_ns) {
+                        tx.send(RuntimeMsg::Packet {
+                            header,
+                            payload,
+                            arrival_ns: now,
+                        });
+                    }
+                }
+                k += 1;
+                let next = start + Duration::from_millis(10 * k);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+        })
+    };
+    let load: Vec<_> = (0..p.load)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..10_000 {
+                        x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005) + 1);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Let the devices open and the queues settle, then count from zero.
+    std::thread::sleep(Duration::from_secs(3));
+    rt.send(RuntimeMsg::ResetHealth);
+    std::thread::sleep(Duration::from_secs_f32(p.seconds) + Duration::from_millis(1_100));
+    let h = rt.shared().health.lock().clone();
+    stop.store(true, Ordering::Relaxed);
+    let _ = feeder.join();
+    for t in load {
+        let _ = t.join();
+    }
+    rt.shutdown();
+    drop(meeting);
+
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let c = &h.since_start;
+    println!(
+        "health-probe: {:.0} s, {} remote mic(s), {} load thread(s); audio thread: {}, \
+         demotions {}",
+        p.seconds,
+        p.mics,
+        p.load,
+        h.realtime.label(),
+        h.demotions
+    );
+    println!(
+        "  wakes {}: worst delay {:.2} ms, p99 {:.2} ms",
+        c.wakes,
+        ms(c.wake_worst_ns),
+        ms(c.wake_p99_ns)
+    );
+    println!(
+        "  speaker underruns {} ({:.1} ms); speaker gaps {:.1} ms; late meeting frames {}; \
+         meeting restarts {}; room-mic silence slots {}",
+        c.speaker_underruns,
+        ms(c.speaker_underrun_ns),
+        ms(c.speaker_missing_ns),
+        c.farend_late_frames,
+        c.farend_resets,
+        c.mic_silence_slots
+    );
+    let missing: Vec<String> = c
+        .mic_missing_ns
+        .iter()
+        .map(|(p, ns)| format!("{}={:.1}ms", p.to_hex(), ms(*ns)))
+        .collect();
+    println!(
+        "  missing mic audio: {}",
+        if missing.is_empty() {
+            "none".into()
+        } else {
+            missing.join(", ")
+        }
+    );
+    for e in ev_rx.try_iter() {
+        println!("  event: {e:?}");
+    }
+    Ok(true)
+}
+
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
@@ -463,6 +664,10 @@ fn main() -> ExitCode {
     let mut force = false;
     let mut mode = ProbeMode::Both;
     let mut seconds: Option<f32> = None;
+    let mut mics = 3u64;
+    let mut load = 0usize;
+    let mut realtime = true;
+    let mut loud = false;
     let mut cmd: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -478,6 +683,16 @@ fn main() -> ExitCode {
                 Some(v) if v > 0.0 && v <= 600.0 => seconds = Some(v),
                 _ => return usage_error("--seconds needs a number of seconds (1-600)"),
             },
+            "--mics" => match args.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) if v <= 16 => mics = v,
+                _ => return usage_error("--mics needs a number of mics (0-16)"),
+            },
+            "--load" => match args.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) if v <= 64 => load = v,
+                _ => return usage_error("--load needs a number of threads (0-64)"),
+            },
+            "--no-realtime" => realtime = false,
+            "--loud" => loud = true,
             s if s.starts_with('-') => return usage_error(&format!("unknown option '{s}'")),
             s if cmd.is_none() => cmd = Some(s.to_string()),
             s => return usage_error(&format!("unexpected argument '{s}'")),
@@ -493,6 +708,16 @@ fn main() -> ExitCode {
         "mic-loopback" => cmd_mic_loopback(force),
         "speaker-loopback" => cmd_speaker_loopback(force),
         "noise-probe" => cmd_noise_probe(mode, seconds),
+        "health-probe" => cmd_health_probe(
+            force,
+            HealthProbe {
+                seconds: seconds.unwrap_or(60.0),
+                mics,
+                load,
+                realtime,
+                loud,
+            },
+        ),
         other => return usage_error(&format!("unknown command '{other}'")),
     };
     match outcome {

@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 roommesh-core = { path = "../roommesh-core" }
 cpal = "0.18"
+crossbeam-channel = "0.5"

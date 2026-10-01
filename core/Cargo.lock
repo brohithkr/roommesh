@@ -1304,6 +1304,7 @@ name = "roommesh-devtool"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "crossbeam-channel",
  "roommesh-core",
 ]
 
