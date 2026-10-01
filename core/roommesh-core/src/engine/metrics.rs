@@ -396,6 +396,7 @@ mod tests {
             },
             jitter: Some(jitter),
             buffer_ms: Some(20.0),
+            missing_samples: 0,
         };
         b.apply_mic_status(&st, true);
         let p = b.snapshot().remove(0);

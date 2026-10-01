@@ -11,6 +11,7 @@ use crate::dsp::arbitration::{Arbiter, ArbitrationConfig, MicObservation, Select
 use crate::dsp::level::{measure, EnvelopeTracker};
 use crate::dsp::scoring::{MicFeatures, MicScorer};
 use crate::dsp::vad::Vad;
+use crate::engine::health::GapCounter;
 use crate::engine::stream::{StreamReceiver, CODEC_DELAY_NS};
 use crate::ids::{Epoch, PeerId, StreamId};
 use crate::network::realtime::{PacketKind, RtHeader};
@@ -72,7 +73,13 @@ pub struct MicStatus {
     pub aec: AecStats,
     pub jitter: Option<JitterStats>,
     pub buffer_ms: Option<f32>,
+    /// Samples this mic could not supply inside its flowing audio, since it was enabled (see
+    /// [`GapCounter`]; a mic that isn't streaming isn't missing anything).
+    pub missing_samples: u64,
 }
+
+/// A mic silent for longer than this has stopped (muted, left) rather than dropped out.
+const MIC_MAX_GAP_SAMPLES: u64 = SAMPLE_RATE as u64 / 2;
 
 pub struct ProducedFrame {
     pub samples: Vec<f32>,
@@ -98,6 +105,7 @@ struct MicChannel {
     last_level_db: f32,
     /// Samples of the last produced frame this mic could not supply (0 = fully covered).
     last_missing: usize,
+    gaps: GapCounter,
     status: MicStatus,
 }
 
@@ -116,6 +124,21 @@ pub struct CoordinatorPipeline {
     arbiter: Arbiter,
     mixer: Mixer,
     last_sel: Selection,
+    /// The output frame begun and not yet finished (see [`CoordinatorPipeline::begin_frame`]).
+    pending: Option<PendingFrame>,
+}
+
+/// An output frame in progress: its reference and the mics processed so far.
+struct PendingFrame {
+    out_ns: u64,
+    t_mic: u64,
+    reference: Vec<f32>,
+    farend_active: bool,
+    /// The mics enabled when the frame began, in processing order, and the next one's index.
+    order: Vec<PeerId>,
+    next: usize,
+    cleaned: BTreeMap<PeerId, Vec<f32>>,
+    feats: Vec<(PeerId, MicFeatures, bool)>,
 }
 
 impl CoordinatorPipeline {
@@ -134,6 +157,7 @@ impl CoordinatorPipeline {
             farend_last: None,
             mixer: Mixer::new(30.0),
             last_sel: Selection::default(),
+            pending: None,
         })
     }
     pub fn config(&self) -> &CoordinatorConfig {
@@ -169,6 +193,7 @@ impl CoordinatorPipeline {
                 env: EnvelopeTracker::new(50),
                 last_level_db: -90.0,
                 last_missing: FRAME_SAMPLES,
+                gaps: GapCounter::new(MIC_MAX_GAP_SAMPLES),
                 status: MicStatus {
                     peer: p,
                     score: 0.0,
@@ -178,6 +203,7 @@ impl CoordinatorPipeline {
                     aec: AecStats::default(),
                     jitter: None,
                     buffer_ms: None,
+                    missing_samples: 0,
                 },
             };
             self.mics.insert(p, ch);
@@ -260,7 +286,20 @@ impl CoordinatorPipeline {
         }
     }
 
+    /// Produces the output frame for `out_ns` at once: [`begin_frame`](Self::begin_frame),
+    /// every mic through [`process_mics`](Self::process_mics), [`finish_frame`](Self::finish_frame).
     pub fn produce(&mut self, out_ns: u64, now_ns: u64) -> ProducedFrame {
+        self.begin_frame(out_ns);
+        self.process_mics(usize::MAX, now_ns);
+        self.finish_frame().expect("a frame was begun")
+    }
+
+    /// Starts the output frame for `out_ns` (replacing an unfinished one): reads its AEC
+    /// reference. The mics are then processed by [`process_mics`](Self::process_mics), possibly
+    /// over several calls, and the frame mixed by [`finish_frame`](Self::finish_frame). Spread
+    /// over consecutive DSP wakes, this keeps each wake's work bounded (see `engine::realtime`);
+    /// done in one go it is exactly [`produce`](Self::produce).
+    pub fn begin_frame(&mut self, out_ns: u64) {
         let t_mic = out_ns.saturating_sub(self.cfg.mic_latency_ns);
         let mut reference = vec![0.0f32; FRAME_SAMPLES];
         self.reference.read(
@@ -270,12 +309,39 @@ impl CoordinatorPipeline {
         );
         let ref_db = measure(&reference).rms_db;
         self.ref_env.push(ref_db);
-        let farend_active = ref_db > -55.0;
+        self.pending = Some(PendingFrame {
+            out_ns,
+            t_mic,
+            farend_active: ref_db > -55.0,
+            reference,
+            order: self.mics.keys().copied().collect(),
+            next: 0,
+            cleaned: BTreeMap::new(),
+            feats: Vec::with_capacity(self.mics.len()),
+        });
+    }
 
-        // Pass 1: align, cancel echo, analyse every mic.
-        let mut cleaned: BTreeMap<PeerId, Vec<f32>> = BTreeMap::new();
-        let mut feats: Vec<(PeerId, MicFeatures, bool)> = Vec::with_capacity(self.mics.len());
-        for (peer, ch) in self.mics.iter_mut() {
+    /// The output time of the frame begun and not yet finished.
+    pub fn pending_frame(&self) -> Option<u64> {
+        self.pending.as_ref().map(|p| p.out_ns)
+    }
+
+    /// Pass 1 of the pending frame for up to `max` more mics: align, cancel echo, analyse.
+    /// Returns whether every mic of the frame is done (also when no frame is pending). Mics
+    /// disabled since the frame began are skipped; mics enabled since then join the next frame.
+    pub fn process_mics(&mut self, max: usize, now_ns: u64) -> bool {
+        let Some(pf) = self.pending.as_mut() else {
+            return true;
+        };
+        let mut done = 0;
+        while done < max && pf.next < pf.order.len() {
+            let peer = pf.order[pf.next];
+            pf.next += 1;
+            let Some(ch) = self.mics.get_mut(&peer) else {
+                continue;
+            };
+            done += 1;
+            let t_mic = pf.t_mic;
             let mut mic = vec![0.0f32; FRAME_SAMPLES];
             let st = match (ch.rx.as_mut(), ch.local.as_mut()) {
                 (Some(rx), _) => {
@@ -299,10 +365,11 @@ impl CoordinatorPipeline {
                 _ => continue,
             };
             ch.last_missing = st.missing;
+            ch.status.missing_samples += ch.gaps.observe(st.filled, st.missing);
             let present = st.missing < FRAME_SAMPLES / 2;
             let clip = measure(&mic).clip_ratio;
             // The AEC always runs so its render/capture streams stay in step.
-            ch.aec.process(&reference, &mut mic);
+            ch.aec.process(&pf.reference, &mut mic);
             ch.status.present = present;
             ch.status.aec = ch.aec.stats();
             if !present {
@@ -314,14 +381,14 @@ impl CoordinatorPipeline {
                 // later frame looks like high-SNR speech.
                 ch.status.speech_prob = 0.0;
                 ch.status.snr_db = 0.0;
-                feats.push((*peer, MicFeatures::default(), false));
-                cleaned.insert(*peer, mic);
+                pf.feats.push((peer, MicFeatures::default(), false));
+                pf.cleaned.insert(peer, mic);
                 continue;
             }
             let v = ch.vad.process(&mic);
             ch.env.push(v.level_db);
             ch.last_level_db = v.level_db;
-            let echo_leak = if farend_active && v.snr_db < 20.0 {
+            let echo_leak = if pf.farend_active && v.snr_db < 20.0 {
                 ch.env.correlation(&self.ref_env).max(0.0)
             } else {
                 0.0
@@ -338,9 +405,21 @@ impl CoordinatorPipeline {
             };
             ch.status.speech_prob = v.speech_prob;
             ch.status.snr_db = v.snr_db;
-            feats.push((*peer, f, present));
-            cleaned.insert(*peer, mic);
+            pf.feats.push((peer, f, present));
+            pf.cleaned.insert(peer, mic);
         }
+        pf.next >= pf.order.len()
+    }
+
+    /// Scores, arbitrates and mixes the pending frame from the mics processed so far (`None`
+    /// if no frame was begun).
+    pub fn finish_frame(&mut self) -> Option<ProducedFrame> {
+        let PendingFrame {
+            out_ns,
+            cleaned,
+            feats,
+            ..
+        } = self.pending.take()?;
         // Pass 2: score relative to the best speaking mic of this frame.
         let best_snr = feats
             .iter()
@@ -352,7 +431,10 @@ impl CoordinatorPipeline {
             if best_snr > f32::MIN {
                 f.relative_snr_db = (f.snr_db - best_snr).min(0.0);
             }
-            let ch = self.mics.get_mut(&peer).expect("mic channel");
+            // Disabled since it was processed: not part of this frame any more.
+            let Some(ch) = self.mics.get_mut(&peer) else {
+                continue;
+            };
             let score = if present { ch.scorer.score(&f) } else { 0.0 };
             ch.status.score = score;
             if present {
@@ -376,11 +458,11 @@ impl CoordinatorPipeline {
         self.mixer.mix(&cleaned, &mut samples);
         let selection_changed = sel != self.last_sel;
         self.last_sel = sel;
-        ProducedFrame {
+        Some(ProducedFrame {
             samples,
             selection: sel,
             selection_changed,
-        }
+        })
     }
 
     pub fn statuses(&self) -> Vec<MicStatus> {
@@ -751,5 +833,186 @@ mod tests {
             changes, 0,
             "active mic changed {changes} times in a silent room"
         );
+    }
+
+    /// Feeds both pipelines the same 10 ms of input for mics 1..=n at time `t` (mic 1 local).
+    fn feed(pipes: &mut [&mut CoordinatorPipeline], ups: &mut [MicUplink], n0: u64, t: u64) {
+        let sig = |salt: u64| -> Vec<f32> {
+            (0..480u64)
+                .map(|k| 0.3 * talker(n0 + k + salt * 37) + 0.002 * hash((n0 + k) ^ salt))
+                .collect()
+        };
+        let far: Vec<f32> = (0..480u64).map(|k| far(n0 + k)).collect();
+        let packets: Vec<_> = ups
+            .iter_mut()
+            .enumerate()
+            .map(|(i, up)| {
+                let f = AudioFrame {
+                    sample_index: n0,
+                    timestamp_ns: t,
+                    samples: sig(i as u64 + 2),
+                };
+                up.packetize(&f, Epoch(1), t).unwrap()
+            })
+            .collect();
+        for p in pipes.iter_mut() {
+            p.push_farend(&AudioFrame {
+                sample_index: n0,
+                timestamp_ns: t,
+                samples: far.clone(),
+            });
+            p.push_local_mic(&AudioFrame {
+                sample_index: n0,
+                timestamp_ns: t,
+                samples: sig(1),
+            });
+            for (h, pl) in &packets {
+                p.push_remote_mic(*h, pl.clone(), t + 5_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn spreading_a_frame_over_wakes_matches_producing_it_at_once() {
+        let cfg = || CoordinatorConfig {
+            use_webrtc_aec: false,
+            ..Default::default()
+        };
+        let mics: Vec<PeerId> = (1..=5).map(PeerId).collect();
+        let mut whole = CoordinatorPipeline::new(PeerId(1), Epoch(1), cfg()).unwrap();
+        let mut spread = CoordinatorPipeline::new(PeerId(1), Epoch(1), cfg()).unwrap();
+        whole.set_enabled_mics(&mics);
+        spread.set_enabled_mics(&mics);
+        let mut ups: Vec<MicUplink> = (2..=5)
+            .map(|p| MicUplink::new(PeerId(p), 64_000).unwrap())
+            .collect();
+        let mut selected = 0;
+        for k in 0..400u64 {
+            let t = T0 + k * FRAME_NS;
+            feed(&mut [&mut whole, &mut spread], &mut ups, k * 480, t);
+            let a = whole.produce(t, t);
+            spread.begin_frame(t);
+            assert_eq!(spread.pending_frame(), Some(t));
+            // 5 mics, 2 per wake: three wakes, 2 ms apart.
+            assert!(!spread.process_mics(2, t));
+            assert!(!spread.process_mics(2, t + 2_000_000));
+            assert!(spread.process_mics(2, t + 4_000_000));
+            let b = spread.finish_frame().expect("a finished frame");
+            assert_eq!(spread.pending_frame(), None);
+            assert_eq!(a.samples, b.samples, "frame {k}");
+            assert_eq!(a.selection, b.selection, "frame {k}");
+            assert_eq!(a.selection_changed, b.selection_changed, "frame {k}");
+            selected += usize::from(a.selection.primary.is_some());
+        }
+        assert!(selected > 100, "the comparison must cover real mixing");
+        // Identical but for the jitter buffers' mean wait: later mics really were pumped later.
+        let without_wait = |p: &CoordinatorPipeline| {
+            p.statuses()
+                .into_iter()
+                .map(|mut s| {
+                    if let Some(j) = s.jitter.as_mut() {
+                        j.mean_wait_ns = 0.0;
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(without_wait(&whole), without_wait(&spread));
+    }
+
+    #[test]
+    fn process_mics_reports_progress_and_finish_needs_a_frame() {
+        let mut pipe = CoordinatorPipeline::new(
+            PeerId(1),
+            Epoch(1),
+            CoordinatorConfig {
+                use_webrtc_aec: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(pipe.finish_frame().is_none(), "no frame begun");
+        assert!(pipe.process_mics(3, T0), "nothing to do");
+        pipe.set_enabled_mics(&(1..=8).map(PeerId).collect::<Vec<_>>());
+        pipe.begin_frame(T0);
+        assert!(!pipe.process_mics(3, T0));
+        assert!(!pipe.process_mics(3, T0));
+        assert!(pipe.process_mics(3, T0));
+        assert!(pipe.process_mics(3, T0), "done stays done");
+        assert!(pipe.finish_frame().is_some());
+        // A frame begun again replaces the pending one.
+        pipe.begin_frame(T0 + FRAME_NS);
+        assert!(!pipe.process_mics(3, T0));
+        pipe.begin_frame(T0 + 2 * FRAME_NS);
+        assert_eq!(pipe.pending_frame(), Some(T0 + 2 * FRAME_NS));
+        assert!(!pipe.process_mics(7, T0));
+        assert!(pipe.process_mics(1, T0));
+        // An unfinished frame can still be finished: unprocessed mics are left out.
+        pipe.begin_frame(T0 + 3 * FRAME_NS);
+        assert!(pipe.finish_frame().is_some());
+    }
+
+    #[test]
+    fn mics_disabled_or_added_mid_frame_are_handled() {
+        let mut pipe = CoordinatorPipeline::new(
+            PeerId(1),
+            Epoch(1),
+            CoordinatorConfig {
+                use_webrtc_aec: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pipe.set_enabled_mics(&[PeerId(1), PeerId(2), PeerId(3)]);
+        pipe.begin_frame(T0);
+        assert!(!pipe.process_mics(1, T0)); // mic 1 done
+        pipe.set_enabled_mics(&[PeerId(3), PeerId(4)]); // 1 and 2 go away, 4 is new
+        assert!(pipe.process_mics(5, T0), "only mic 3 is left of this frame");
+        let f = pipe.finish_frame().expect("frame");
+        assert_eq!(f.samples.len(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn a_remote_mic_dropout_inside_its_stream_is_counted_as_missing() {
+        let mut pipe = CoordinatorPipeline::new(
+            PeerId(1),
+            Epoch(1),
+            CoordinatorConfig {
+                use_webrtc_aec: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pipe.set_enabled_mics(&[PeerId(2)]);
+        let mut up = MicUplink::new(PeerId(2), 64_000).unwrap();
+        let missing = |p: &CoordinatorPipeline| p.statuses()[0].missing_samples;
+        let mut after_short = 0;
+        for k in 0..350u64 {
+            let t = T0 + k * FRAME_NS;
+            let f = AudioFrame {
+                sample_index: k * 480,
+                timestamp_ns: t,
+                samples: (0..480u64).map(|i| talker(k * 480 + i)).collect(),
+            };
+            let (h, p) = up.packetize(&f, Epoch(1), t).unwrap();
+            // Nothing arrives for 200 ms (a dropout), later for 1 s (the Mac stopped sending).
+            let outage = (100..120).contains(&k) || (200..300).contains(&k);
+            if !outage {
+                pipe.push_remote_mic(h, p, t + 3_000_000);
+            }
+            pipe.produce(t, t);
+            match k {
+                99 => assert_eq!(missing(&pipe), 0, "the stream's start isn't missing audio"),
+                199 => after_short = missing(&pipe),
+                _ => {}
+            }
+        }
+        assert!(
+            after_short > 0 && after_short <= 20 * 480,
+            "the 200 ms dropout: {after_short} samples"
+        );
+        // A stop and restart is not a dropout; only the stream's last, partial read counts.
+        let more = missing(&pipe) - after_short;
+        assert!(more < 480, "{more}");
     }
 }
